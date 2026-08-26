@@ -1,0 +1,40 @@
+# Build output
+/build/
+/cmake-build-*/
+/out/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# CMake and Qt generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+_autogen/
+.qmake.stash
+*.qmlc
+
+# IDE metadata
+.vscode/
+.idea/
+*.user
+*.user.*
+
+# Local model files and app data
+/models/
+/data/
+*.gguf
+*.engine
+*.plan
+*.safetensors
+
+# OS files
+.DS_Store
+Thumbs.db
