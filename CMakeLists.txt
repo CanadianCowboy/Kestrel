@@ -12,6 +12,8 @@ option(KESTREL_BUILD_TESTS "Build Kestrel tests" ON)
 add_library(kestrel_core
     src/core/conversation.cpp
     src/core/conversation.h
+    src/core/voicesession.cpp
+    src/core/voicesession.h
     src/runtime/modelbackend.h
     src/runtime/mockbackend.cpp
     src/runtime/mockbackend.h
