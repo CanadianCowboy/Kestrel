@@ -207,6 +207,12 @@ private:
     // purpose, because the backend keeps it as a cached prefix.
     [[nodiscard]] QString buildPrompt(const QString& userText) const;
 
+    // The conversation for this turn, as structured messages. The backend
+    // renders it, because only the backend knows the model's chat template --
+    // and a rendered string here would have to be thrown away by anything that
+    // later needs to address individual turns.
+    [[nodiscard]] std::vector<runtime::ChatMessage> buildMessages(const QString& userText) const;
+
     // Spins the UI event loop until the in-flight generation reports back, or
     // the timeout expires. Needed before swapping or destroying a backend,
     // because the worker is inside the old backend's generate() right now and

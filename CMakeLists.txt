@@ -101,6 +101,8 @@ add_library(kestrel_core
     src/runtime/backendregistry.h
     src/runtime/modelbackend.h
     src/runtime/mockbackend.cpp
+    src/runtime/chatformat.cpp
+    src/runtime/chatformat.h
     src/runtime/mockbackend.h
     src/runtime/llamacppbackend.cpp
     src/runtime/llamacppbackend.h

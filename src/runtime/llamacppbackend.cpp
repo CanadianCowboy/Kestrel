@@ -1,5 +1,7 @@
 #include "runtime/llamacppbackend.h"
 
+#include "runtime/chatformat.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -305,7 +307,14 @@ std::size_t LlamaCppBackend::applySystemPrefix() {
         llama_memory_clear(memory, /* data */ true);
         m_impl->prefixTokens.clear();
         if (!m_systemPrompt.empty()) {
-            tokenizeInto(llama_model_get_vocab(m_impl->model), m_systemPrompt, m_impl->prefixTokens);
+            // The cached prefix is the *rendered* system turn, not the raw
+            // text. Rendering the system message alone through the same
+            // template the conversation will use is what makes the two
+            // byte-identical, which is the whole basis of reusing it.
+            const std::vector<ChatMessage> systemOnly{
+                ChatMessage{Role::System, m_systemPrompt}};
+            const std::string rendered = renderChat(systemOnly, /* addAssistantCue */ false);
+            tokenizeInto(llama_model_get_vocab(m_impl->model), rendered, m_impl->prefixTokens);
             const auto prefixSize = static_cast<int32_t>(m_impl->prefixTokens.size());
             if (prefixSize > 0) {
                 llama_batch batch = llama_batch_init(prefixSize, 0, 1);
@@ -338,9 +347,65 @@ std::size_t LlamaCppBackend::applySystemPrefix() {
     return m_impl->prefixTokens.size();
 }
 
+bool LlamaCppBackend::hasChatTemplate() const {
+    if (m_impl == nullptr || m_impl->model == nullptr) {
+        return false;
+    }
+    return llama_model_chat_template(m_impl->model, nullptr) != nullptr;
+}
+
+std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>& messages,
+                                        bool addAssistantCue) const {
+    if (m_impl == nullptr || m_impl->model == nullptr) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    const char* tmpl = llama_model_chat_template(m_impl->model, nullptr);
+    if (tmpl == nullptr) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+
+    // The strings must outlive the render call, so they are kept in one place
+    // rather than referenced from temporaries.
+    std::vector<std::string> roles;
+    std::vector<std::string> contents;
+    roles.reserve(messages.size());
+    contents.reserve(messages.size());
+    for (const ChatMessage& message : messages) {
+        roles.emplace_back(toString(message.role));
+        contents.push_back(message.content);
+    }
+    std::vector<llama_chat_message> native;
+    native.reserve(messages.size());
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        native.push_back(llama_chat_message{roles[i].c_str(), contents[i].c_str()});
+    }
+
+    // Ask for the rendered size first. A null buffer is the documented way to
+    // ask, and the return is the total byte count, not an error.
+    const int32_t needed = llama_chat_apply_template(tmpl, native.data(), native.size(),
+                                                     addAssistantCue, nullptr, 0);
+    if (needed < 0) {
+        // llama.cpp does not recognise this template. Falling back is right:
+        // an unsupported template is not a reason to refuse to answer.
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    std::vector<char> buffer(static_cast<std::size_t>(needed) + 1);
+    const int32_t written = llama_chat_apply_template(tmpl, native.data(), native.size(),
+                                                      addAssistantCue, buffer.data(),
+                                                      static_cast<int32_t>(buffer.size()));
+    if (written < 0) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    return std::string(buffer.data(), static_cast<std::size_t>(written));
+}
+
 void LlamaCppBackend::generate(const GenerationRequest& request,
                                TokenCallback onToken,
                                CompletionCallback onComplete) {
+    if (request.messages.empty()) {
+        onComplete(false, "No messages to answer");
+        return;
+    }
     m_cancelled.store(false, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -358,10 +423,27 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // entries are already resident and are reused rather than recomputed.
     const std::size_t prefixLength = applySystemPrefix();
 
-    // Tokenize only this turn's prompt. The prefix is already in the context,
-    // so including it here would both redo the work and double-count it.
+    // Render the conversation the way this model was trained to be talked to.
+    const std::string prompt = renderChat(request.messages, /* addAssistantCue */ true);
+
+    // The prefix is only reusable if the rendered conversation literally starts
+    // with the text that was decoded as the prefix. That is true for every
+    // template that appends turns, and it is checked rather than assumed: a
+    // template which interleaves system text would otherwise silently corrupt
+    // the cache on every single turn.
+    std::size_t skipPrefix = 0;
+    if (prefixLength > 0) {
+        const std::vector<ChatMessage> systemOnly{
+            ChatMessage{Role::System, m_systemPrompt}};
+        const std::string renderedPrefix =
+            renderChat(systemOnly, /* addAssistantCue */ false);
+        if (prompt.compare(0, renderedPrefix.size(), renderedPrefix) == 0) {
+            skipPrefix = renderedPrefix.size();
+        }
+    }
+
     std::vector<llama_token> tokens;
-    if (tokenizeInto(vocab, request.prompt, tokens) <= 0) {
+    if (tokenizeInto(vocab, std::string_view(prompt).substr(skipPrefix), tokens) <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
         return;
     }
@@ -556,6 +638,14 @@ std::size_t LlamaCppBackend::cachedPrefixTokens() const {
 
 std::size_t LlamaCppBackend::kvCacheBytes() const {
     return 0;
+}
+
+std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>&, bool) const {
+    return {};
+}
+
+bool LlamaCppBackend::hasChatTemplate() const {
+    return false;
 }
 
 std::size_t LlamaCppBackend::applySystemPrefix() {

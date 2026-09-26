@@ -1,4 +1,5 @@
 #include "runtime/backendregistry.h"
+#include "runtime/chatformat.h"
 #include "runtime/cudadevice.h"
 #include "runtime/engineartifact.h"
 #include "runtime/llamacppbackend.h"
@@ -7,6 +8,8 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string>
+#include <utility>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -39,6 +42,15 @@ runtime::CudaProbe makeProbe(bool runtimeAvailable, std::vector<runtime::CudaDev
     probe.selectedDeviceIndex =
         runtime::resolveSelectedDeviceIndex(probe.devices, -1);
     return probe;
+}
+
+// A one-turn request, which is what most of these tests want to say. Written as
+// a helper so the assertions below read as behaviour rather than as brace
+// nesting, and so a future change to the request shape touches one place.
+runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
+                               int maxTokens = 32) {
+    return runtime::GenerationRequest(
+        {runtime::ChatMessage{runtime::Role::User, std::move(text)}}, temperature, maxTokens);
 }
 
 void testVersionAndByteFormatting() {
@@ -273,7 +285,7 @@ void testTensorRtBackendValidatesEngine() {
 
     // Generating without a loaded engine must fail cleanly, not crash.
     bool completed = false;
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
+    backend.generate(ask("hi", 0.7F, 16), [](std::string_view) {},
                      [&completed](bool success, std::string_view) { completed = !success; });
 
     assert(completed);
@@ -320,7 +332,7 @@ void testTensorRtBackendValidatesEngine() {
 
     // Generation is still refused, but with the reason the adapter owns.
     std::string generateError = "unset";
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
+    backend.generate(ask("hi", 0.7F, 16), [](std::string_view) {},
                      [&generateError](bool, std::string_view message) {
                          generateError = std::string(message);
                      });
@@ -433,7 +445,7 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
 
     bool completed = false;
     bool refused = false;
-    backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
+    backend.generate(ask("hi", 0.7F, 16), nullptr,
                      [&completed, &refused](bool success, std::string_view) {
                          // Without a loaded model every build must refuse. Note
                          // the callback runs while the backend holds its own
@@ -491,7 +503,7 @@ void testSharedSystemPromptPrefix() {
     mock.resetContextUsage();
     const std::size_t afterPrefixOnly = mock.status().contextUsed;
     assert(afterPrefixOnly == 0);
-    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32}, [](std::string_view) {},
+    mock.generate(ask("hello", 0.7F, 32), [](std::string_view) {},
                   [](bool, std::string_view) {});
     assert(mock.status().contextUsed >= mock.countTokens(prefix));
 }
@@ -555,7 +567,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string generated;
     bool completed = false;
     bool success = false;
-    backend.generate(runtime::GenerationRequest{"Continue this sentence in one short paragraph:\n\n\"The Kestrel flew", 0.7F, 32},
+    backend.generate(ask("Continue this sentence in one short paragraph: The Kestrel flew", 0.7F, 32),
                      [&generated](std::string_view token) { generated.append(token); },
                      [&](bool ok, std::string_view) {
                          success = ok;
@@ -605,7 +617,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string firstTurn;
     std::string firstError;
     bool firstOk = false;
-    backend.generate(runtime::GenerationRequest{"Name one bird.", 0.7F, 16},
+    backend.generate(ask("Name one bird.", 0.7F, 16),
                      [&firstTurn](std::string_view token) { firstTurn.append(token); },
                      [&firstOk, &firstError](bool ok, std::string_view error) {
                          firstOk = ok;
@@ -629,7 +641,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string secondTurn;
     std::string secondError;
     bool secondOk = false;
-    backend.generate(runtime::GenerationRequest{"Name a different bird.", 0.7F, 16},
+    backend.generate(ask("Name a different bird.", 0.7F, 16),
                      [&secondTurn](std::string_view token) { secondTurn.append(token); },
                      [&secondOk, &secondError](bool ok, std::string_view error) {
                          secondOk = ok;

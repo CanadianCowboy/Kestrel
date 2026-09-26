@@ -1,5 +1,7 @@
 #include "runtime/mockbackend.h"
 
+#include "runtime/chatformat.h"
+
 #include <algorithm>
 #include <sstream>
 #include <string>
@@ -61,10 +63,19 @@ void MockBackend::generate(const GenerationRequest& request,
                            TokenCallback onToken,
                            CompletionCallback onComplete) {
     m_cancelled.store(false, std::memory_order_release);
+
+    // Echo the most recent user turn, which is what the caller actually asked.
+    std::string question;
+    for (const ChatMessage& message : request.messages) {
+        if (message.role == Role::User && !message.content.empty()) {
+            question = message.content;
+        }
+    }
+
     const std::string response =
         "This is a local preview response. Kestrel's runtime boundary is ready for "
         "llama.cpp or TensorRT, and the focused workspace can be refined without a "
-        "model installed yet.\n\nYour prompt was: " + request.prompt;
+        "model installed yet.\n\nYou said: " + question;
 
     std::istringstream words(response);
     std::string word;
@@ -77,7 +88,8 @@ void MockBackend::generate(const GenerationRequest& request,
     // level.
     m_contextUsed = std::min(kContextLimit,
                              m_contextUsed + countTokens(m_systemPrompt) +
-                                 countTokens(request.prompt) + countTokens(response));
+                                 countTokens(renderPlainChat(request.messages, true)) +
+                                 countTokens(response));
 
     if (m_cancelled.load(std::memory_order_acquire)) {
         onComplete(false, "Generation stopped");

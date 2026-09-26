@@ -8,17 +8,19 @@ GenerationWorker::GenerationWorker(runtime::ModelBackend* backend, QObject* pare
     : QObject(parent), m_backend(backend) {}
 
 void GenerationWorker::start(quint64 requestId,
-                             const QString& prompt,
+                             const std::vector<runtime::ChatMessage>& messages,
                              float temperature,
                              int maxTokens) {
     m_cancelRequested.store(false, std::memory_order_release);
 
     // Queued so this returns immediately; the backend call happens on the
-    // worker thread once its event loop picks the call up.
+    // worker thread once its event loop picks the call up. The messages are
+    // copied into the lambda because the caller's vector outlives neither the
+    // queue nor this thread.
     QMetaObject::invokeMethod(
         this,
-        [this, requestId, prompt, temperature, maxTokens] {
-            runtime::GenerationRequest request{prompt.toStdString(), temperature, maxTokens};
+        [this, requestId, messages, temperature, maxTokens] {
+            runtime::GenerationRequest request{messages, temperature, maxTokens};
 
             // The callbacks run on the worker thread. Each hop back to the UI
             // thread is an explicit queued invocation: touching QML state from

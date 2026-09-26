@@ -3,6 +3,8 @@
 #include "runtime/mockbackend.h"
 
 #include <cassert>
+#include <string>
+#include <utility>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -48,6 +50,15 @@ void testConversationBasics() {
     assert(conversation.size() == 0);
 }
 
+// A one-turn request, which is what most of these tests want to say. Written as
+// a helper so the assertions below read as behaviour rather than as brace
+// nesting, and so a future change to the request shape touches one place.
+runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
+                               int maxTokens = 32) {
+    return runtime::GenerationRequest(
+        {runtime::ChatMessage{runtime::Role::User, std::move(text)}}, temperature, maxTokens);
+}
+
 void testMockBackend() {
     runtime::MockBackend backend;
     assert(backend.status().available);
@@ -55,7 +66,7 @@ void testMockBackend() {
 
     std::string streamed;
     bool completed = false;
-    backend.generate({"test", 0.7F, 32},
+    backend.generate(ask("test", 0.7F, 32),
                      [&streamed](std::string_view token) { streamed += token; },
                      [&completed](bool success, std::string_view) { completed = success; });
     assert(completed);
@@ -71,7 +82,7 @@ void testMockBackend() {
     assert(status.tokensPerSecond == 0.0);
 
     const std::size_t usedAfterFirst = status.contextUsed;
-    backend.generate({"again", 0.7F, 32}, [](std::string_view) {},
+    backend.generate(ask("again", 0.7F, 32), [](std::string_view) {},
                      [](bool, std::string_view) {});
     assert(backend.status().contextUsed > usedAfterFirst);
 }

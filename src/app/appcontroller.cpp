@@ -24,12 +24,44 @@ constexpr int kTitleLimit = 42;
 
 // The shared prefix: every turn starts with this text, so it is the one part of
 // the prompt the backend can decode once and keep resident instead of resending
-// with each request. It is deliberately short, because a long persona prompt is
-// exactly the cost this avoids paying per turn.
+// with each request.
+//
+// It is written to make the *shape* of an answer good rather than to make the
+// model sound knowledgeable. Two deliberate constraints:
+//
+//   * Structure is asked for explicitly, because an instruct model left to
+//     itself drifts into a single undifferentiated paragraph. Clear sentences,
+//     logical connective tissue, and a direct answer before the elaboration
+//     are all things the model can actually be steered towards.
+//   * Calibre is asked for explicitly, and in the same breath as the request
+//     for confidence. A model told to be authoritative with no instruction
+//     about doubt will manufacture certainty, which is the one failure a user
+//     cannot detect. So the prompt makes an unverified claim worse than no
+//     answer, and names the cases where it should stop and say so.
+//
+// Note what this cannot do: it shapes how a model answers, not what it knows.
+// A small local model asked to reason carefully will still reason within its
+// capacity, and the prompt should not be mistaken for a way around that.
 const QString kDefaultSystemPrompt = QStringLiteral(
-    "You are Kestrel, a local desktop assistant running on the user's own "
-    "machine. Answer briefly and plainly, and say when you are unsure instead "
-    "of guessing.");
+    "You are Kestrel, a local desktop assistant running entirely on the user's "
+    "own machine.\n"
+    "\n"
+    "Write well. Answer in complete, well-structured sentences, using clear "
+    "paragraphs where the material warrants them. Lead with the direct answer, "
+    "then give the reasoning that supports it. Use concrete nouns and active "
+    "verbs, connect claims to the evidence for them, and avoid filler, "
+    "hedging padding, and restating the question back.\n"
+    "\n"
+    "Be as confident as your evidence actually supports, and no more. Before "
+    "asserting something specific -- a number, a date, a name, an API, a "
+    "quotation -- check it against what you actually know. If you are not "
+    "sure, say so plainly and say what would settle it. If a question needs "
+    "information you do not have, ask for that rather than inventing an "
+    "answer. A correct refusal is a better result than a confident invention, "
+    "and the user is relying on this to make decisions.\n"
+    "\n"
+    "If you can genuinely verify something, say how you verified it. If you "
+    "cannot, do not imply that you did.");
 
 // How many prior turns are replayed to the model. Bounded because the prompt
 // grows with it, and the whole point of the shared prefix is lost if the
@@ -551,7 +583,7 @@ void AppController::startGeneration(const QString& userText) {
     // The voice timeline tracks the user's words; the model gets the assembled
     // conversation. The system prompt is not in it -- the backend holds that as
     // a cached prefix, and repeating it here would undo the caching.
-    m_worker->start(m_activeRequestId, buildPrompt(userText), 0.7F, 512);
+    m_worker->start(m_activeRequestId, buildMessages(userText), 0.7F, 512);
 }
 
 QString AppController::buildPrompt(const QString& userText) const {
@@ -585,6 +617,48 @@ QString AppController::buildPrompt(const QString& userText) const {
     }
     prompt += QStringLiteral("Assistant:");
     return prompt;
+}
+
+std::vector<runtime::ChatMessage> AppController::buildMessages(const QString& userText) const {
+    std::vector<runtime::ChatMessage> messages;
+    const ConversationEntry* entry = activeEntry();
+    if (entry != nullptr) {
+        const auto& history = entry->conversation.messages();
+        // Walk backwards so the limit keeps the most recent turns, which are
+        // the ones the current question actually depends on.
+        const std::size_t firstUsable =
+            history.size() > kHistoryTurns ? history.size() - kHistoryTurns : 0;
+        for (std::size_t i = firstUsable; i < history.size(); ++i) {
+            const core::Message& message = history[i];
+            // The empty assistant placeholder for this turn is already in the
+            // conversation and would only add a dangling label.
+            if (message.content.empty()) {
+                continue;
+            }
+            runtime::Role role = runtime::Role::User;
+            switch (message.role) {
+                case core::MessageRole::User:
+                    role = runtime::Role::User;
+                    break;
+                case core::MessageRole::Assistant:
+                    role = runtime::Role::Assistant;
+                    break;
+                case core::MessageRole::System:
+                    role = runtime::Role::System;
+                    break;
+                case core::MessageRole::Tool:
+                    role = runtime::Role::Tool;
+                    break;
+            }
+            messages.push_back(runtime::ChatMessage{role, message.content});
+        }
+    }
+    // The shared system prompt is not added here. It is the backend's cached
+    // prefix, and repeating it in the conversation would both undo the caching
+    // and let the renderer place it somewhere the model was not trained to
+    // expect it.
+    messages.push_back(runtime::ChatMessage{runtime::Role::User, userText.toStdString()});
+    return messages;
 }
 
 void AppController::finalizeStream(MessageStatus status, const QString& note) {
@@ -687,8 +761,8 @@ void AppController::resumeConversation() {
         const core::VoiceResponse* response = m_voice.find(m_activeResponse);
         const std::string_view remainder =
             response != nullptr ? response->unspokenText() : std::string_view{};
-        m_worker->start(m_activeRequestId, QString::fromStdString(std::string(remainder)),
-                        0.7F, 512);
+        m_worker->start(m_activeRequestId,
+                        {runtime::ChatMessage{runtime::Role::User, std::string(remainder)}}, 0.7F, 512);
         return;
     }
 

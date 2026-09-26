@@ -153,7 +153,7 @@ void testGenerationRunsOffCallingThread() {
                      });
 
     const std::thread::id callerThread = std::this_thread::get_id();
-    worker.start(1, QStringLiteral("hello"), 0.7F, 512);
+    worker.start(1, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
 
     check(pumpUntilFinished(collector, 10000), "completion signal is delivered");
 
@@ -193,7 +193,7 @@ void testCancelStopsInFlightGeneration() {
                          emit collector.finishedSignal();
                      });
 
-    worker.start(2, QStringLiteral("long prompt"), 0.7F, 512);
+    worker.start(2, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
 
     // Let a few tokens through so cancellation lands mid-generation rather
     // than before the backend even started.
@@ -273,7 +273,7 @@ void testWorkerFollowsTheSwappedBackend() {
                      });
 
     worker.setBackend(&replacement);
-    worker.start(1, QStringLiteral("hello"), 0.7F, 512);
+    worker.start(1, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
     check(pumpUntilFinished(collector, 10000), "the swapped backend completes");
 
     check(replacement.tokensEmitted() == 4, "the replacement backend generated");
