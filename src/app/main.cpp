@@ -1,4 +1,5 @@
 #include <QGuiApplication>
+#include <QEventLoop>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -19,6 +20,110 @@ namespace {
 // mechanical instead of a matter of memory, and it exercises the same
 // controller and QML bindings the window uses, so it also catches a QML load
 // failure that would otherwise only appear on launch.
+// The value following `flag`, or empty when the flag is absent, is last, or is
+// followed by another flag. A flag with no value must not silently swallow the
+// next one and report a nonsense path.
+QString valueAfter(const QStringList& arguments, const QString& flag) {
+    const int index = arguments.indexOf(flag);
+    if (index < 0 || index + 1 >= arguments.size()) {
+        return {};
+    }
+    const QString value = arguments.at(index + 1);
+    return value.startsWith(QStringLiteral("--")) ? QString() : value;
+}
+
+// Sends one message through the real window and reports whether a reply came
+// back, then exits. This is the only check that covers the whole path at once:
+// the QML scene loads, a message reaches the backend on its worker thread, and
+// the streamed tokens land in the model the UI renders from. Every unit test
+// below that layer can be green while the app as a whole is broken -- and one
+// was, for exactly this reason.
+//
+// Runs only when asked, and only with a real model loaded, because a smoke test
+// that passes against the mock proves nothing about the runtime.
+int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs) {
+    QTextStream out(stdout);
+    out << "Kestrel smoke test\n";
+    out << "  backend : " << controller.backendName() << "\n";
+    out << "  model   : " << controller.modelName() << "\n";
+    out.flush();
+
+    if (!controller.runtimeAvailable()) {
+        out << "  FAIL    no model is loaded, so there is nothing to exercise.\n"
+               "          Pass --model <path> to run this against a real model.\n";
+        out.flush();
+        return 2;
+    }
+
+    const QString prompt = QStringLiteral(
+        "In one short sentence, state what you are and that you are working.");
+    controller.sendMessage(prompt);
+
+    // Wait on the controller's own signal rather than sleeping, so this ends as
+    // soon as the reply is done. The timeout is a backstop: a backend that
+    // never finishes must fail the check rather than hang it.
+    QEventLoop loop;
+    QObject::connect(&controller, &kestrel::app::AppController::metricsChanged, &loop, [&] {
+        if (!controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    if (controller.generating()) {
+        out << "  FAIL    no reply within " << timeoutMs << " ms\n";
+        out.flush();
+        return 1;
+    }
+
+    kestrel::app::MessageModel* messages = controller.messages();
+    if (messages == nullptr || messages->rowCount() < 2) {
+        out << "  FAIL    the transcript does not contain a reply\n";
+        out.flush();
+        return 1;
+    }
+
+    const QString reply =
+        messages->data(messages->index(1, 0), kestrel::app::MessageModel::ContentRole)
+            .toString();
+    const QString status =
+        messages->data(messages->index(1, 0), kestrel::app::MessageModel::StatusRole).toString();
+    const QString note =
+        messages->data(messages->index(1, 0), kestrel::app::MessageModel::NoteRole).toString();
+
+    out << "  tokens  : " << controller.tokensGenerated() << "\n";
+    out << "  tok/s   : " << QString::number(controller.tokensPerSecond(), 'f', 1) << "\n";
+    out << "  context : " << controller.contextSummary() << "\n";
+    out << "  kv cache: " << controller.kvCacheSummary() << "\n";
+    out << "  status  : " << status << "\n";
+    out << "  reply   : " << reply.left(160) << "\n";
+    out.flush();
+
+    if (reply.trimmed().isEmpty()) {
+        out << "  FAIL    the reply is empty\n";
+        out.flush();
+        return 1;
+    }
+    // An empty reply still labelled streaming is what a hung app looks like, so
+    // the status column is checked as carefully as the text.
+    if (status != kestrel::app::toStatusString(kestrel::app::MessageStatus::Complete)) {
+        out << "  FAIL    the reply is not complete (status=" << status
+            << (note.isEmpty() ? QString() : ", note=" + note) << ")\n";
+        out.flush();
+        return 1;
+    }
+    if (controller.tokensGenerated() <= 0) {
+        out << "  FAIL    no tokens were counted, so throughput is unverified\n";
+        out.flush();
+        return 1;
+    }
+
+    out << "  OK      a reply reached the UI through the real backend\n";
+    out.flush();
+    return 0;
+}
+
 int printRuntime(const kestrel::app::AppController& controller) {
     QTextStream out(stdout);
     out << "Kestrel runtime report\n";
@@ -47,18 +152,6 @@ int printRuntime(const kestrel::app::AppController& controller) {
     // A model that was asked for and did not load is a failure, not a report.
     // This is what lets the load path be checked without opening a window.
     return controller.modelError().isEmpty() ? 0 : 1;
-}
-
-// The value following `flag`, or empty when the flag is absent, is last, or is
-// followed by another flag. A flag with no value must not silently swallow the
-// next one and report a nonsense path.
-QString valueAfter(const QStringList& arguments, const QString& flag) {
-    const int index = arguments.indexOf(flag);
-    if (index < 0 || index + 1 >= arguments.size()) {
-        return {};
-    }
-    const QString value = arguments.at(index + 1);
-    return value.startsWith(QStringLiteral("--")) ? QString() : value;
 }
 
 } // namespace
@@ -108,6 +201,13 @@ int main(int argc, char* argv[]) {
     if (engine.rootObjects().isEmpty()) {
         QTextStream(stderr) << "Kestrel failed to load its QML scene.\n";
         return 1;
+    }
+
+    // Deliberately after the scene loads: the point is to exercise the window,
+    // not just the controller. The timeout is generous because a real model's
+    // first token can take a while on a cold context.
+    if (arguments.contains(QStringLiteral("--smoke-test"))) {
+        return runSmokeTest(controller, 120000);
     }
 
     // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
