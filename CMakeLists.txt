@@ -262,9 +262,18 @@ if(KESTREL_BUILD_UI)
                     get_filename_component(_kestrel_qt_prefix "${_kestrel_qt_lib}" DIRECTORY)
                     # Both Qt-linked test binaries need this, not just the one
                     # that existed when the fix-up was written.
+                    #
+                    # PATH is set with ENVIRONMENT_MODIFICATION, not by putting
+                    # $ENV{PATH} into ENVIRONMENT. ENVIRONMENT is a CMake list,
+                    # so CMake splits it on every `;` -- and a Windows PATH is
+                    # nothing but `;`. That silently truncated the inherited
+                    # PATH to its first entry, taking the CUDA bin directory
+                    # with it, which is the one directory this fix-up exists to
+                    # find. path_list_prepend leaves the inherited list intact.
                     foreach(_kestrel_qt_test kestrel_app_tests kestrel_qml_tests)
                         set_tests_properties(${_kestrel_qt_test} PROPERTIES
-                            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PATH=${_kestrel_qt_prefix}/bin;$ENV{PATH}")
+                            ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+                            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_kestrel_qt_prefix}/bin")
                     endforeach()
                 endif()
             endif()
@@ -309,8 +318,11 @@ if(KESTREL_BUILD_TESTS)
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
     # implicitly on Windows.
+    # Same reason as the Qt fix-up above: a Windows PATH interpolated into
+    # ENVIRONMENT is truncated at the first `;`, which would drop everything
+    # after cudart's own directory.
     if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND AND WIN32)
         set_tests_properties(kestrel_runtime_tests PROPERTIES
-            ENVIRONMENT "PATH=${CUDAToolkit_BIN_DIR};$ENV{PATH}")
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
     endif()
 endif()
