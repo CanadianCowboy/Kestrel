@@ -69,6 +69,8 @@ add_library(kestrel_core
     src/core/voicesession.h
     src/runtime/cudadevice.cpp
     src/runtime/cudadevice.h
+    src/runtime/modelbackend.cpp
+    src/runtime/modelbackend.h
     ${KESTREL_CUDA_DISCOVERY_SOURCE}
     src/runtime/engineartifact.cpp
     src/runtime/engineartifact.h
@@ -125,6 +127,11 @@ if(KESTREL_BUILD_UI)
             src/app/appcontroller.h
             src/app/generationworker.cpp
             src/app/generationworker.h
+            src/app/conversationentry.h
+            src/app/messagemodel.cpp
+            src/app/messagemodel.h
+            src/app/conversationmodel.cpp
+            src/app/conversationmodel.h
         )
 
         qt_add_qml_module(kestrel

@@ -1,9 +1,16 @@
 #include "runtime/mockbackend.h"
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 
 namespace kestrel::runtime {
+
+namespace {
+
+constexpr std::size_t kContextLimit = 4096;
+
+} // namespace
 
 BackendKind MockBackend::kind() const noexcept {
     return BackendKind::Mock;
@@ -16,14 +23,27 @@ RuntimeStatus MockBackend::status() const {
         "Mock runtime",
         "Kestrel demo model",
         "UI preview mode",
+        // Advisory only. The app measures real throughput from delivered
+        // tokens; reporting a made-up rate here would be a number nothing
+        // produced.
         0.0,
-        0,
-        4096,
+        m_contextUsed,
+        kContextLimit,
     };
 }
 
 bool MockBackend::loadModel(const std::string&, std::string&) {
     return true;
+}
+
+std::size_t MockBackend::countTokens(std::string_view text) const {
+    // The mock has no vocabulary, so the shared approximation is the honest
+    // answer rather than pretending to a tokenizer it does not have.
+    return ModelBackend::countTokens(text);
+}
+
+void MockBackend::resetContextUsage() {
+    m_contextUsed = 0;
 }
 
 void MockBackend::generate(const GenerationRequest& request,
@@ -40,6 +60,11 @@ void MockBackend::generate(const GenerationRequest& request,
     while (words >> word && !m_cancelled.load(std::memory_order_acquire)) {
         onToken(word + " ");
     }
+
+    // Context grows by the prompt plus whatever this turn produced, capped at
+    // the window so the UI cannot show an impossible fill level.
+    m_contextUsed = std::min(kContextLimit,
+                             m_contextUsed + countTokens(request.prompt) + countTokens(response));
 
     if (m_cancelled.load(std::memory_order_acquire)) {
         onComplete(false, "Generation stopped");

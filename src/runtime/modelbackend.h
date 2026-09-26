@@ -25,6 +25,8 @@ struct RuntimeStatus {
     std::string backendName;
     std::string modelName;
     std::string detail;
+    // Backend-reported throughput. The app measures its own live figure from
+    // delivered tokens, so this is advisory rather than authoritative.
     double tokensPerSecond = 0.0;
     std::size_t contextUsed = 0;
     std::size_t contextLimit = 0;
@@ -58,6 +60,19 @@ public:
                           TokenCallback onToken,
                           CompletionCallback onComplete) = 0;
     virtual void cancel() = 0;
+
+    // Counts tokens in `text` using this backend's tokenizer.
+    //
+    // A backend that has loaded a real model must override this so context
+    // accounting is exact. The default is a documented approximation, which
+    // keeps a usable number flowing for backends with no tokenizer while
+    // making it obvious in the source that the figure is not exact rather
+    // than letting a caller assume it is.
+    [[nodiscard]] virtual std::size_t countTokens(std::string_view text) const;
+
+    // Clears accumulated per-session accounting, e.g. the running context
+    // occupancy. Called when the conversation is cleared or switched.
+    virtual void resetContextUsage();
 };
 
 } // namespace kestrel::runtime

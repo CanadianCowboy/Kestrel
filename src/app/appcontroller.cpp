@@ -3,80 +3,93 @@
 #include "app/generationworker.h"
 #include "runtime/backendregistry.h"
 
+#include <QClipboard>
+#include <QDateTime>
+#include <QGuiApplication>
 #include <QVariantMap>
 
+#include <algorithm>
 #include <string_view>
 
 namespace kestrel::app {
 
 namespace {
 
-QString fromStd(const std::string& text) {
-    return QString::fromStdString(text);
-}
-
-// Rough characters-per-token ratio for English text. Used only for the
-// context-fill indicator, which is explicitly an estimate rather than a
-// tokenizer count; a real backend's own accounting is preferred when it
-// reports a non-zero value.
-constexpr int kApproxCharsPerToken = 4;
+constexpr int kTitleLimit = 42;
 
 // Minimum gap between metricsChanged emissions while streaming. Emitting on
 // every token would flood the binding with updates faster than the UI repaints.
 constexpr qint64 kMetricsIntervalMs = 100;
 
+QString deriveTitle(const QString& text) {
+    const QString line = text.section(QLatin1Char('\n'), 0, 0).simplified();
+    if (line.size() <= kTitleLimit) {
+        return line;
+    }
+    return line.left(kTitleLimit - 1).trimmed() + QChar(0x2026);
+}
+
 } // namespace
 
 AppController::AppController(QObject* parent)
     : QObject(parent), m_backend(runtime::selectBackend(runtime::BackendKind::Mock)) {
+    m_messageModel = new MessageModel(this);
+    m_conversationModel = new ConversationModel(&m_entries, this);
+
     m_probe = runtime::probeCuda();
+    rebuildDiagnostics();
 
     m_worker = new GenerationWorker(m_backend.get());
     m_worker->moveToThread(&m_generationThread);
     m_generationThread.start();
 
-    // The worker emits from its own thread, so these connections are queued
-    // and the slots below run on the UI thread where the QML state lives.
+    // The worker emits from its own thread, so these connections are queued and
+    // the slots run on the UI thread where the QML state lives.
     connect(m_worker, &GenerationWorker::tokenReady,
             this, &AppController::onGenerationToken, Qt::QueuedConnection);
     connect(m_worker, &GenerationWorker::finished,
             this, &AppController::onGenerationFinished, Qt::QueuedConnection);
 
-    rebuildDiagnostics();
+    ConversationEntry* entry = createConversation();
+    m_conversationModel->refilter();
+    setActiveConversation(entry->id);
 }
 
 AppController::~AppController() {
-    // Order matters: cancel so a blocked generate() returns, then stop the
-    // event loop, then wait. Only once the thread is idle is it safe to
-    // destroy an object whose affinity was that thread.
+    // Order matters: cancel so a blocked generate() returns, then stop the event
+    // loop, then wait. Only once the thread is idle is it safe to destroy an
+    // object whose affinity was that thread.
     m_worker->cancel();
     m_generationThread.quit();
     m_generationThread.wait();
     delete m_worker;
 }
 
-QVariantList AppController::messages() const {
-    return m_messages;
+MessageModel* AppController::messages() const noexcept {
+    return m_messageModel;
+}
+
+ConversationModel* AppController::conversations() const noexcept {
+    return m_conversationModel;
+}
+
+int AppController::activeConversationId() const noexcept {
+    return m_activeId;
 }
 
 QString AppController::conversationTitle() const {
-    return m_conversationTitle;
-}
-
-QString AppController::backendName() const {
-    return fromStd(m_backend->status().backendName);
-}
-
-QString AppController::modelName() const {
-    return fromStd(m_backend->status().modelName);
-}
-
-QString AppController::runtimeDetail() const {
-    return fromStd(m_backend->status().detail);
+    if (const ConversationEntry* entry = activeEntry()) {
+        return QString::fromStdString(entry->conversation.title());
+    }
+    return {};
 }
 
 bool AppController::generating() const noexcept {
     return m_generating;
+}
+
+bool AppController::canRegenerate() const noexcept {
+    return m_canRegenerate;
 }
 
 bool AppController::sidebarOpen() const noexcept {
@@ -85,6 +98,35 @@ bool AppController::sidebarOpen() const noexcept {
 
 bool AppController::diagnosticsOpen() const noexcept {
     return m_diagnosticsOpen;
+}
+
+QString AppController::searchQuery() const {
+    return m_searchQuery;
+}
+
+QString AppController::backendName() const {
+    return QString::fromStdString(m_backend->status().backendName);
+}
+
+QString AppController::modelName() const {
+    return QString::fromStdString(m_backend->status().modelName);
+}
+
+QString AppController::runtimeDetail() const {
+    return QString::fromStdString(m_backend->status().detail);
+}
+
+bool AppController::runtimeAvailable() const {
+    const runtime::RuntimeStatus status = m_backend->status();
+    return status.available && status.modelLoaded;
+}
+
+int AppController::contextUsed() const {
+    return static_cast<int>(m_backend->status().contextUsed);
+}
+
+int AppController::contextLimit() const {
+    return static_cast<int>(m_backend->status().contextLimit);
 }
 
 double AppController::tokensPerSecond() const noexcept {
@@ -100,18 +142,8 @@ QString AppController::contextSummary() const {
     if (status.contextLimit == 0) {
         return QStringLiteral("not reported by this backend");
     }
-
-    int characters = 0;
-    for (const QVariant& entry : m_messages) {
-        characters +=
-            entry.toMap().value(QStringLiteral("content")).toString().size();
-    }
-    const auto generated =
-        static_cast<std::size_t>(characters / kApproxCharsPerToken);
-    const std::size_t used = status.contextUsed + generated;
-
     return QStringLiteral("%1 / %2 tokens")
-        .arg(static_cast<qulonglong>(used))
+        .arg(static_cast<qulonglong>(status.contextUsed))
         .arg(static_cast<qulonglong>(status.contextLimit));
 }
 
@@ -138,12 +170,7 @@ bool AppController::canResume() const noexcept {
 }
 
 bool AppController::canBargeIn() const noexcept {
-    const core::VoiceResponse* response = m_voice.find(m_activeResponse);
-    if (response == nullptr) {
-        return false;
-    }
-    return response->state() == core::ResponseState::Generating ||
-           response->state() == core::ResponseState::Speaking;
+    return canPause();
 }
 
 bool AppController::gpuAvailable() const {
@@ -155,7 +182,7 @@ QString AppController::gpuName() const {
     if (device == nullptr) {
         return QStringLiteral("No GPU detected");
     }
-    return fromStd(device->name);
+    return QString::fromStdString(device->name);
 }
 
 QString AppController::gpuSummary() const {
@@ -171,9 +198,9 @@ QString AppController::gpuSummary() const {
 QString AppController::gpuDetail() const {
     const runtime::CudaDeviceInfo* device = m_probe.selectedDevice();
     if (device == nullptr) {
-        return fromStd(m_probe.runtime.detail);
+        return QString::fromStdString(m_probe.runtime.detail);
     }
-    return fromStd(runtime::describeDevice(*device));
+    return QString::fromStdString(runtime::describeDevice(*device));
 }
 
 QString AppController::computeCapability() const {
@@ -181,8 +208,7 @@ QString AppController::computeCapability() const {
     if (device == nullptr) {
         return QString();
     }
-    return QStringLiteral("sm_%1")
-        .arg(QString::fromStdString(device->computeCapability()));
+    return QStringLiteral("sm_%1").arg(QString::fromStdString(device->computeCapability()));
 }
 
 int AppController::gpuDeviceCount() const {
@@ -201,30 +227,21 @@ void AppController::setSidebarOpen(bool open) {
     emit sidebarOpenChanged();
 }
 
+void AppController::setSearchQuery(const QString& query) {
+    if (m_searchQuery == query) {
+        return;
+    }
+    m_searchQuery = query;
+    m_conversationModel->setSearchQuery(query);
+    emit searchQueryChanged();
+}
+
 void AppController::setDiagnosticsOpen(bool open) {
     if (m_diagnosticsOpen == open) {
         return;
     }
     m_diagnosticsOpen = open;
     emit diagnosticsOpenChanged();
-}
-
-void AppController::appendMessage(const QString& role, const QString& content) {
-    QVariantMap message;
-    message.insert(QStringLiteral("role"), role);
-    message.insert(QStringLiteral("content"), content);
-    m_messages.append(message);
-}
-
-void AppController::appendToLastAssistantMessage(const QString& text) {
-    if (m_messages.isEmpty()) {
-        return;
-    }
-    QVariantMap assistant = m_messages.last().toMap();
-    assistant.insert(QStringLiteral("content"),
-                     assistant.value(QStringLiteral("content")).toString() + text);
-    m_messages.replace(m_messages.size() - 1, assistant);
-    emit messagesChanged();
 }
 
 void AppController::resetMetrics() {
@@ -239,72 +256,15 @@ void AppController::publishMetrics() {
     if (m_generationClock.isValid()) {
         const qint64 elapsed = m_generationClock.elapsed();
         if (elapsed > 0) {
-            m_tokensPerSecond =
-                static_cast<double>(m_tokensGenerated) * 1000.0 / static_cast<double>(elapsed);
+            m_tokensPerSecond = static_cast<double>(m_tokensGenerated) * 1000.0 /
+                                static_cast<double>(elapsed);
         }
     }
     emit metricsChanged();
 }
 
-void AppController::sendMessage(const QString& text) {
-    const QString trimmed = text.trimmed();
-    if (trimmed.isEmpty()) {
-        return;
-    }
-
-    // A new prompt arriving mid-response is a barge-in: the machine preserves
-    // what was already spoken, invalidates the in-flight generation so late
-    // tokens are rejected as stale, and lets the new response take over.
-    if (m_generating) {
-        m_voice.interrupt(m_activeResponse, trimmed.toStdString());
-        // Replacement: the interrupted response is abandoned rather than
-        // resumed, so the new prompt owns the single active timeline.
-        const auto replacement =
-            m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement);
-        if (replacement.has_value() && *replacement != core::kInvalidGenerationId) {
-            // Defensive: Replacement currently always discards, so this branch
-            // should stay unreachable. If the machine ever changes to preserve
-            // the response, its new generation token is adopted here.
-            m_activeGeneration = *replacement;
-        }
-        m_worker->cancel();
-        emit voiceChanged();
-    }
-
-    appendMessage(QStringLiteral("user"), trimmed);
-    appendMessage(QStringLiteral("assistant"), QString());
-
-    if (m_messages.size() == 2) {
-        m_conversationTitle = trimmed.left(34);
-        emit conversationTitleChanged();
-    }
-    emit messagesChanged();
-
-    resetMetrics();
-    m_generationClock.start();
-
-    m_activeResponse = m_voice.queueResponse(trimmed.toStdString());
-    m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
-    if (m_activeGeneration == core::kInvalidGenerationId) {
-        // Another response is still holding the single active timeline. The
-        // text stays visible; the user can retry once it settles.
-        appendToLastAssistantMessage(
-            QStringLiteral("Kestrel is still finishing an earlier response."));
-        emit voiceChanged();
-        return;
-    }
-
-    m_generating = true;
-    m_activeRequestId = m_nextRequestId++;
-    emit generatingChanged();
-    emit voiceChanged();
-
-    m_worker->start(m_activeRequestId, trimmed, 0.7F, 512);
-}
-
 void AppController::onGenerationToken(quint64 requestId, const QString& token) {
-    // Ignore anything that is not the response the UI is currently showing.
-    if (requestId != m_activeRequestId) {
+    if (requestId != m_activeRequestId || m_userPaused || m_userStopped) {
         return;
     }
 
@@ -318,7 +278,7 @@ void AppController::onGenerationToken(quint64 requestId, const QString& token) {
         return;
     }
 
-    appendToLastAssistantMessage(token);
+    m_messageModel->appendToLastMessage(token);
     ++m_tokensGenerated;
 
     if (m_generationClock.elapsed() - m_lastMetricsPublish >= kMetricsIntervalMs) {
@@ -335,47 +295,120 @@ void AppController::onGenerationFinished(quint64 requestId,
     }
 
     publishMetrics();
-    m_generating = false;
     m_generationClock.invalidate();
-    emit generatingChanged();
 
-    const core::VoiceResponse* response = m_voice.find(m_activeResponse);
-    if (response != nullptr &&
-        response->state() == core::ResponseState::Paused) {
-        // Paused deliberately: the worker was stopped so playback could halt,
-        // but the response is preserved for resume() and must not complete.
+    if (m_userPaused) {
+        // Paused deliberately: the worker was stopped so delivery could halt,
+        // but the response is preserved for resume() and must not finalize.
+        m_generating = false;
+        emit generatingChanged();
         emit voiceChanged();
         return;
     }
 
+    if (m_userStopped) {
+        finalizeStream(MessageStatus::Stopped, {});
+        return;
+    }
+
     if (!success) {
-        if (!error.isEmpty() && error != QStringLiteral("Generation stopped")) {
+        if (!error.isEmpty()) {
             m_voice.fail(m_activeResponse, error.toStdString());
-            appendToLastAssistantMessage(
-                QStringLiteral("\n\n[Generation failed: %1]").arg(error));
         }
-        emit voiceChanged();
+        finalizeStream(MessageStatus::Failed, error);
         return;
     }
 
     m_voice.finishGeneration(m_activeResponse, m_activeGeneration);
 
-    // There is no audio engine yet, so playback is treated as delivered as
-    // soon as generation finishes. That is the text-only fallback the
-    // VoiceSession contract describes for exactly this situation.
+    // There is no audio engine yet, so playback is treated as delivered as soon
+    // as generation finishes. That is the text-only fallback VoiceSession
+    // defines for exactly this situation.
     m_voice.complete(m_activeResponse);
+    finalizeStream(MessageStatus::Complete, {});
     emit voiceChanged();
+}
+
+void AppController::startGeneration(const QString& prompt) {
+    m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
+    m_generating = true;
+    m_userStopped = false;
+    m_userPaused = false;
+
+    resetMetrics();
+    m_generationClock.start();
+
+    m_activeResponse = m_voice.queueResponse(prompt.toStdString());
+    m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
+    m_activeRequestId = m_nextRequestId++;
+
+    emit generatingChanged();
+    emit voiceChanged();
+    refreshCanRegenerate();
+    touchActiveConversation();
+
+    if (m_activeGeneration == core::kInvalidGenerationId) {
+        // Another response still owns the single active timeline.
+        finalizeStream(MessageStatus::Failed,
+                       QStringLiteral("An earlier response is still active."));
+        return;
+    }
+
+    m_worker->start(m_activeRequestId, prompt, 0.7F, 512);
+}
+
+void AppController::finalizeStream(MessageStatus status, const QString& note) {
+    m_messageModel->setLastMessageStatus(status, note);
+    m_generating = false;
+    m_userPaused = false;
+    m_userStopped = false;
+    m_generationClock.invalidate();
+    emit generatingChanged();
+    touchActiveConversation();
+    emit runtimeChanged();
+    emit metricsChanged();
+    emit voiceChanged();
+    refreshCanRegenerate();
+}
+
+void AppController::sendMessage(const QString& text) {
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty() || !runtimeAvailable()) {
+        return;
+    }
+    ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) {
+        return;
+    }
+
+    if (m_generating) {
+        // A new prompt mid-response is a barge-in: preserve what was already
+        // delivered, invalidate the in-flight generation so late tokens are
+        // rejected as stale, and hand the timeline to the new prompt.
+        m_voice.interrupt(m_activeResponse, trimmed.toStdString());
+        m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement);
+        m_userStopped = true;
+        m_worker->cancel();
+        emit voiceChanged();
+    }
+
+    const bool firstMessage = entry->conversation.size() == 0;
+    m_messageModel->appendMessage(core::MessageRole::User, trimmed, MessageStatus::Complete);
+    if (firstMessage) {
+        entry->conversation.setTitle(deriveTitle(trimmed).toStdString());
+        emit activeConversationChanged();
+    }
+
+    startGeneration(trimmed);
 }
 
 void AppController::stopGeneration() {
     if (!m_generating) {
         return;
     }
+    m_userStopped = true;
     m_worker->cancel();
     m_voice.cancel(m_activeResponse);
-    m_generating = false;
-    m_generationClock.invalidate();
-    emit generatingChanged();
     emit voiceChanged();
 }
 
@@ -387,6 +420,7 @@ void AppController::pauseConversation() {
     // response itself is preserved: resume() reopens generation for whatever
     // text had not been produced yet.
     m_voice.pause(m_activeResponse, QStringLiteral("user paused").toStdString());
+    m_userPaused = true;
     m_worker->cancel();
     emit voiceChanged();
 }
@@ -397,12 +431,14 @@ void AppController::resumeConversation() {
     }
     const auto generation = m_voice.resume(m_activeResponse);
     if (!generation.has_value()) {
-        // Refused because another response owns the timeline.
         emit voiceChanged();
         return;
     }
 
     m_activeGeneration = *generation;
+    m_userPaused = false;
+    m_generationClock.invalidate();
+
     if (*generation != core::kInvalidGenerationId) {
         resetMetrics();
         m_generationClock.start();
@@ -416,30 +452,120 @@ void AppController::resumeConversation() {
         const core::VoiceResponse* response = m_voice.find(m_activeResponse);
         const std::string_view remainder =
             response != nullptr ? response->unspokenText() : std::string_view{};
-        const QString prompt = QString::fromStdString(std::string(remainder));
-        m_worker->start(m_activeRequestId, prompt, 0.7F, 512);
+        m_worker->start(m_activeRequestId, QString::fromStdString(std::string(remainder)),
+                        0.7F, 512);
         return;
     }
 
     // Everything the response needed was already generated; nothing to restart.
     m_voice.complete(m_activeResponse);
-    emit voiceChanged();
+    finalizeStream(MessageStatus::Complete, {});
 }
 
 void AppController::newConversation() {
-    m_worker->cancel();
-    m_messages.clear();
-    m_conversationTitle = QStringLiteral("New conversation");
-    m_activeResponse = core::kInvalidResponseId;
-    m_activeGeneration = core::kInvalidGenerationId;
-    m_generating = false;
-    m_generationClock.invalidate();
-    m_voice = core::VoiceSession{};
-    resetMetrics();
-    emit messagesChanged();
-    emit conversationTitleChanged();
-    emit generatingChanged();
-    emit voiceChanged();
+    if (m_generating) {
+        stopGeneration();
+    }
+    if (ConversationEntry* current = activeEntry();
+        current != nullptr && current->conversation.size() == 0) {
+        setSearchQuery({});
+        return; // an empty conversation is already waiting
+    }
+
+    ConversationEntry* entry = createConversation();
+    setSearchQuery({});
+    m_conversationModel->refilter();
+    setActiveConversation(entry->id);
+}
+
+void AppController::selectConversation(int id) {
+    if (id == m_activeId || findEntry(id) == nullptr) {
+        return;
+    }
+    if (m_generating) {
+        stopGeneration();
+    }
+    setActiveConversation(id);
+}
+
+void AppController::renameConversation(int id, const QString& title) {
+    const QString trimmed = title.simplified();
+    ConversationEntry* entry = findEntry(id);
+    if (entry == nullptr || trimmed.isEmpty()
+        || trimmed == QString::fromStdString(entry->conversation.title())) {
+        return;
+    }
+    entry->conversation.setTitle(trimmed.toStdString());
+    m_conversationModel->notifyEntryChanged(id);
+    if (id == m_activeId) {
+        emit activeConversationChanged();
+    }
+}
+
+void AppController::deleteConversation(int id) {
+    const auto it = std::find_if(m_entries.begin(), m_entries.end(),
+                                 [id](const auto& entry) { return entry->id == id; });
+    if (it == m_entries.end()) {
+        return;
+    }
+
+    const bool wasActive = (id == m_activeId);
+    if (wasActive && m_generating) {
+        stopGeneration();
+    }
+    if (wasActive) {
+        m_messageModel->setEntry(nullptr);
+    }
+
+    const auto index = static_cast<std::size_t>(std::distance(m_entries.begin(), it));
+    m_entries.erase(it);
+    m_conversationModel->refilter();
+
+    if (!wasActive) {
+        return;
+    }
+    if (m_entries.empty()) {
+        ConversationEntry* entry = createConversation();
+        m_conversationModel->refilter();
+        setActiveConversation(entry->id);
+    } else {
+        const std::size_t next = std::min(index, m_entries.size() - 1);
+        setActiveConversation(m_entries[next]->id);
+    }
+}
+
+void AppController::regenerateLastResponse() {
+    if (m_generating) {
+        return;
+    }
+    ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) {
+        return;
+    }
+    const auto& messages = entry->conversation.messages();
+    if (messages.empty() || messages.back().role != core::MessageRole::Assistant) {
+        return;
+    }
+
+    QString prompt;
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        if (it->role == core::MessageRole::User) {
+            prompt = QString::fromStdString(it->content);
+            break;
+        }
+    }
+    if (prompt.isEmpty()) {
+        return;
+    }
+
+    m_messageModel->removeLastMessage();
+    startGeneration(prompt);
+}
+
+void AppController::copyToClipboard(const QString& text) const {
+    if (QClipboard* clipboard = QGuiApplication::clipboard()) {
+        clipboard->setText(text);
+    }
 }
 
 void AppController::refreshRuntime() {
@@ -452,10 +578,137 @@ void AppController::rebuildDiagnostics() {
     m_runtimeDiagnostics.clear();
     for (const runtime::RuntimeDiagnostic& row : runtime::runtimeDiagnostics(m_probe)) {
         QVariantMap entry;
-        entry.insert(QStringLiteral("label"), fromStd(row.label));
-        entry.insert(QStringLiteral("value"), fromStd(row.value));
+        entry.insert(QStringLiteral("label"), QString::fromStdString(row.label));
+        entry.insert(QStringLiteral("value"), QString::fromStdString(row.value));
         entry.insert(QStringLiteral("ok"), row.ok);
         m_runtimeDiagnostics.append(entry);
+    }
+}
+
+ConversationEntry* AppController::findEntry(int id) noexcept {
+    for (const auto& entry : m_entries) {
+        if (entry->id == id) {
+            return entry.get();
+        }
+    }
+    return nullptr;
+}
+
+ConversationEntry* AppController::activeEntry() noexcept {
+    return findEntry(m_activeId);
+}
+
+const ConversationEntry* AppController::activeEntry() const noexcept {
+    for (const auto& entry : m_entries) {
+        if (entry->id == m_activeId) {
+            return entry.get();
+        }
+    }
+    return nullptr;
+}
+
+ConversationEntry* AppController::createConversation() {
+    auto entry = std::make_unique<ConversationEntry>();
+    entry->id = m_nextId++;
+    entry->updatedAt = QDateTime::currentDateTime();
+    ConversationEntry* raw = entry.get();
+    m_entries.insert(m_entries.begin(), std::move(entry)); // newest first
+    return raw;
+}
+
+void AppController::setActiveConversation(int id) {
+    m_activeId = id;
+    m_messageModel->setEntry(findEntry(id));
+    emit activeConversationChanged();
+    refreshCanRegenerate();
+}
+
+void AppController::touchActiveConversation() {
+    if (ConversationEntry* entry = activeEntry()) {
+        entry->updatedAt = QDateTime::currentDateTime();
+        m_conversationModel->notifyEntryChanged(entry->id);
+    }
+}
+
+void AppController::refreshCanRegenerate() {
+    bool can = false;
+    if (!m_generating) {
+        if (const ConversationEntry* entry = activeEntry()) {
+            const auto& messages = entry->conversation.messages();
+            can = !messages.empty() && messages.back().role == core::MessageRole::Assistant
+                  && std::any_of(messages.begin(), messages.end(), [](const core::Message& m) {
+                         return m.role == core::MessageRole::User;
+                     });
+        }
+    }
+    if (can != m_canRegenerate) {
+        m_canRegenerate = can;
+        emit canRegenerateChanged();
+    }
+}
+
+void AppController::seedDemoContent(bool startLiveStream) {
+    const int placeholderId = m_activeId;
+    const QDateTime now = QDateTime::currentDateTime();
+
+    const auto addMessage = [](ConversationEntry* entry, core::MessageRole role,
+                               const char* text, MessageStatus status,
+                               const QString& note = {}) {
+        entry->conversation.addMessage(role, text);
+        entry->extras.push_back({status, note});
+    };
+
+    ConversationEntry* flight = createConversation();
+    flight->conversation.setTitle("Why kestrels hover so well");
+    addMessage(flight, core::MessageRole::User,
+               "Why can kestrels hover in place while hunting?", MessageStatus::Complete);
+    addMessage(flight, core::MessageRole::Assistant,
+               "Kestrels hover by flying into the wind at exactly the speed it pushes them "
+               "back, so their ground speed drops to zero. Constant micro-adjustments of the "
+               "wings and fanned tail cancel the gusts, and the head stays almost perfectly "
+               "still, which is what lets them track voles in the grass below.",
+               MessageStatus::Complete);
+    flight->updatedAt = now.addDays(-2);
+
+    ConversationEntry* cmake = createConversation();
+    cmake->conversation.setTitle("Optional TensorRT backend in CMake");
+    addMessage(cmake, core::MessageRole::User,
+               "What's a clean way to keep the TensorRT backend optional in CMake?",
+               MessageStatus::Complete);
+    addMessage(cmake, core::MessageRole::Assistant,
+               "Gate it behind an option such as KESTREL_ENABLE_TENSORRT, resolve the SDK "
+               "with find_path and find_library inside the adapter target, and",
+               MessageStatus::Stopped);
+    cmake->updatedAt = now.addDays(-1);
+
+    ConversationEntry* vram = createConversation();
+    vram->conversation.setTitle("VRAM headroom for a 4096 context");
+    addMessage(vram, core::MessageRole::User,
+               "How much VRAM headroom should I keep for a 4096-token context window?",
+               MessageStatus::Complete);
+    addMessage(vram, core::MessageRole::Assistant,
+               "Budget the weights first, then the KV cache, which grows roughly linearly "
+               "with context length. For a 7B model at FP16 that is on the order of half a "
+               "gigabyte at 4096 tokens, so keeping about one gigabyte free above the "
+               "weights leaves room for the cache, activations, and fragmentation.",
+               MessageStatus::Complete);
+    vram->updatedAt = now.addSecs(-3600);
+
+    // Retire the constructor's placeholder if it is still empty.
+    if (ConversationEntry* placeholder = findEntry(placeholderId);
+        placeholder != nullptr && placeholder->conversation.size() == 0) {
+        m_messageModel->setEntry(nullptr);
+        std::erase_if(m_entries, [placeholderId](const auto& entry) {
+            return entry->id == placeholderId;
+        });
+    }
+
+    m_conversationModel->refilter();
+    setActiveConversation(m_entries.front()->id);
+
+    if (startLiveStream) {
+        newConversation();
+        sendMessage("Give me a one-line status message I can show while the model warms up.");
     }
 }
 

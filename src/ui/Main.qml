@@ -236,7 +236,7 @@ ApplicationWindow {
                         Item { Layout.fillHeight: true; Layout.minimumHeight: 24 }
 
                         Column {
-                            visible: appController.messages.length === 0
+                            visible: messageList.count === 0
                             Layout.alignment: Qt.AlignHCenter
                             spacing: 16
                             Text { text: "✦"; color: window.accent; font.pixelSize: 32; anchors.horizontalCenter: parent.horizontalCenter }
@@ -258,33 +258,57 @@ ApplicationWindow {
 
                         ListView {
                             id: messageList
-                            visible: appController.messages.length > 0
+                            visible: count > 0
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             model: appController.messages
                             spacing: 20
                             clip: true
                             delegate: Item {
+                                id: messageRow
+                                required property string author
+                                required property string content
+                                required property string status
+                                required property string note
                                 width: messageList.width
                                 height: bubble.implicitHeight + 4
+                                readonly property bool fromAssistant: author === "assistant"
                                 Rectangle {
                                     id: bubble
-                                    width: Math.min(parent.width * 0.78, messageText.implicitWidth + 30)
-                                    height: messageText.implicitHeight + 24
+                                    width: Math.min(parent.width * 0.78, bubbleColumn.implicitWidth + 30)
+                                    height: bubbleColumn.implicitHeight + 24
                                     radius: 15
-                                    anchors.left: modelData.role === "assistant" ? parent.left : undefined
-                                    anchors.right: modelData.role === "user" ? parent.right : undefined
-                                    color: modelData.role === "assistant" ? "#15181d" : "#243b34"
-                                    border.color: modelData.role === "assistant" ? window.line : "#385b4e"
-                                    Text {
-                                        id: messageText
+                                    anchors.left: messageRow.fromAssistant ? parent.left : undefined
+                                    anchors.right: messageRow.fromAssistant ? undefined : parent.right
+                                    color: messageRow.fromAssistant ? "#15181d" : "#243b34"
+                                    border.color: messageRow.fromAssistant ? window.line : "#385b4e"
+                                    Column {
+                                        id: bubbleColumn
                                         anchors.fill: parent
                                         anchors.margins: 15
-                                        text: modelData.content
-                                        color: window.ink
-                                        font.pixelSize: 14
-                                        lineHeight: 1.35
-                                        wrapMode: Text.Wrap
+                                        spacing: 6
+                                        Text {
+                                            width: parent.width
+                                            text: messageRow.content
+                                            color: window.ink
+                                            font.pixelSize: 14
+                                            lineHeight: 1.35
+                                            wrapMode: Text.Wrap
+                                        }
+                                        // Terminal states stay visible rather than
+                                        // being discarded, so a stopped or failed
+                                        // response is still readable and recoverable.
+                                        Text {
+                                            width: parent.width
+                                            visible: messageRow.status === "stopped"
+                                                         || messageRow.status === "failed"
+                                            text: messageRow.status === "failed"
+                                                  ? "Generation failed" + (messageRow.note ? ": " + messageRow.note : "")
+                                                  : "Stopped"
+                                            color: "#8a6a74"
+                                            font.pixelSize: 11
+                                            wrapMode: Text.Wrap
+                                        }
                                     }
                                 }
                             }
