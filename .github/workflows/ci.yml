@@ -85,7 +85,12 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          modules: 'qtquickcontrols2'
+          # No `modules` list on purpose. Quick Controls 2 is part of the base
+          # Qt 6 installation rather than a separately installable module, and
+          # asking aqtinstall for it fails the step on every platform with
+          # "The packages ['qtquickcontrols2'] were not found". The input is for
+          # genuinely separate modules such as qtcharts, and nothing this
+          # project links against is one.
           cache: true
 
       - name: Configure
