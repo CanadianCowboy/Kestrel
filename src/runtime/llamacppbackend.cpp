@@ -491,13 +491,13 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     llama_batch_free(step);
     llama_sampler_free(chain);
 
-    // Context grows by the resident prefix plus this turn's prompt and output,
+    // Context usage is the resident prefix plus this turn's prompt and output,
     // capped at the model's real window so the UI cannot show an impossible
     // fill level.
     if (contextLimit > 0) {
         m_contextUsed = std::min<std::size_t>(
             static_cast<std::size_t>(contextLimit),
-            m_contextUsed + prefixLength + promptSize + produced);
+            prefixLength + promptSize + produced);
     }
     refreshStatus();
 

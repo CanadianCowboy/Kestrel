@@ -491,9 +491,13 @@ void testSharedSystemPromptPrefix() {
     mock.resetContextUsage();
     const std::size_t afterPrefixOnly = mock.status().contextUsed;
     assert(afterPrefixOnly == 0);
-    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32}, [](std::string_view) {},
+    std::string response;
+    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32},
+                  [&response](std::string_view token) { response.append(token); },
                   [](bool, std::string_view) {});
-    assert(mock.status().contextUsed >= mock.countTokens(prefix));
+    assert(mock.status().contextUsed == mock.countTokens(prefix) +
+                                            mock.countTokens("hello") +
+                                            mock.countTokens(response));
 }
 
 /// Exercises the real llama.cpp generation path.
