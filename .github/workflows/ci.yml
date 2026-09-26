@@ -243,3 +243,43 @@ jobs:
             echo "::error::expected a non-zero exit with no CUDA device"
             exit 1
           fi
+
+  # A misspelt setting in .coderabbit.yaml is the one configuration error that
+  # looks exactly like it is working: YAML accepts any key, and CodeRabbit
+  # reads a key it does not know as absent rather than as an error. Two such
+  # keys shipped in this repository -- `include_drafts`, which is really
+  # `auto_review.drafts`, and `resolve_merge_conflicts`, which the schema
+  # spells in the singular -- and both had been believed to be in effect.
+  # scripts/validate_coderabbit_config.py compares the config against
+  # CodeRabbit's published schema, which is vendored in the repository so that
+  # a failure here can only mean the config is wrong.
+  coderabbit-config:
+    name: CodeRabbit config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the YAML parser
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Every key must be one CodeRabbit knows
+        run: python scripts/validate_coderabbit_config.py
+
+      # The step above shows the check accepting a good config, which on its own
+      # is also what a check that cannot fail looks like. So the check is run
+      # here against a config carrying the exact key that got this wrong, and
+      # it has to reject it. A validator that has only ever agreed with
+      # everything is not evidence of anything.
+      - name: The check can still fail
+        run: |
+          sed 's/^    resolve_merge_conflict:/    resolve_merge_conflicts:/' \
+            .coderabbit.yaml > bad.yaml
+          if python scripts/validate_coderabbit_config.py --config bad.yaml; then
+            echo "::error::the schema check accepted a key CodeRabbit does not have"
+            exit 1
+          fi
+          echo "rejected as it should"
