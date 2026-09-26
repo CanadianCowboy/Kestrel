@@ -405,29 +405,55 @@ void testBackendDrivenTokenCounting() {
 
 // With no SDK linked, the GGUF backend has to say so instead of appearing
 // healthy. The registry depends on this to avoid selecting a dead backend.
+//
+// The checks are explicit rather than assert() because this test has to hold
+// under two configurations, and a bare assert in a Release build disappears
+// while in Debug it reports nothing useful about a cross-configuration value.
 void testLlamaCppBackendReportsUnavailableWithoutSdk() {
     runtime::LlamaCppBackend backend;
     const runtime::RuntimeStatus status = backend.status();
-    assert(!status.modelLoaded);
+    if (status.modelLoaded) {
+        std::printf("  FAIL  a fresh backend reported a model as loaded\n");
+        std::abort();
+    }
 
     std::string error;
-    assert(!backend.loadModel("model.gguf", error));
+    if (backend.loadModel("model.gguf", error)) {
+        std::printf("  FAIL  a bogus path loaded as a model\n");
+        std::abort();
+    }
     // The message must tell the user how to fix it, not just that it failed.
     // In an SDK-linked build the failure is a real load attempt instead, so
     // accept either explanation rather than pinning one configuration.
-    assert(!error.empty());
-    assert(error.find("KESTREL_ENABLE_LLAMA_CPP") != std::string::npos
-           || error.find("could not load") != std::string::npos);
+    if (error.empty() || (error.find("KESTREL_ENABLE_LLAMA_CPP") == std::string::npos
+                          && error.find("could not load") == std::string::npos)) {
+        std::printf("  FAIL  unhelpful load error: \"%s\"\n", error.c_str());
+        std::abort();
+    }
 
     bool completed = false;
+    bool refused = false;
     backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
-                     [&completed, &backend](bool success, std::string_view) {
-                         // Without a loaded model every build must refuse.
-                         assert(!success);
-                         assert(!backend.status().modelLoaded);
+                     [&completed, &refused](bool success, std::string_view) {
+                         // Without a loaded model every build must refuse. Note
+                         // the callback runs while the backend holds its own
+                         // lock, so it must not call back into the backend;
+                         // that is checked after generate() returns.
+                         refused = !success;
                          completed = true;
                      });
-    assert(completed);
+    if (!completed) {
+        std::printf("  FAIL  generate never reported completion\n");
+        std::abort();
+    }
+    if (!refused) {
+        std::printf("  FAIL  generate succeeded with no model loaded\n");
+        std::abort();
+    }
+    if (backend.status().modelLoaded) {
+        std::printf("  FAIL  a refused generate left a model marked loaded\n");
+        std::abort();
+    }
 }
 
 // Exercises the real llama.cpp generation path.
@@ -457,12 +483,21 @@ void testLlamaCppGeneratesFromRealModel() {
     assert(loaded.contextLimit > 0);
 
     // The tokenizer must be real: it is the whole point of moving counting
-    // behind the backend. A fixed 4-char ratio would pass a > 0 check, so
-    // compare against the shared approximation to confirm they differ.
+    // behind the backend. A fixed chars-per-token ratio cannot tell two
+    // equal-length strings apart, so compare a run of one letter against a
+    // sentence of exactly the same length: only a real vocabulary separates
+    // them. Deriving the length avoids a hand-counted constant that silently
+    // stops matching.
     const std::string prompt = "The quick brown fox jumps over the lazy dog";
     const std::size_t exact = backend.countTokens(prompt);
     assert(exact > 0);
-    assert(exact != runtime::ModelBackend::countTokens(prompt));
+    const std::string sentence = "The quick brown fox jumps over cat";
+    const std::string run(sentence.size(), 'a');
+    assert(backend.countTokens(run) != backend.countTokens(sentence));
+    // A backend with no tokenizer reports the shared approximation for both,
+    // which is the behaviour this check exists to rule out.
+    runtime::MockBackend mock;
+    assert(mock.countTokens(run) == mock.countTokens(sentence));
 
 
     std::string generated;
@@ -477,11 +512,12 @@ void testLlamaCppGeneratesFromRealModel() {
 
     assert(completed);
     assert(success);
-    // NOTE: generation currently returns 0 characters for this model;
-    // that is an open finding, so it is reported rather than asserted.
+    // Generation must actually emit text. This is the assertion that was
+    // quietly passing before: an empty response reported itself as a success.
     if (generated.empty()) {
-        std::printf("  WARN  generated 0 characters (sampler/EOG path unresolved)");
+        std::printf("  FAIL  generated 0 characters\n");
         std::fflush(stdout);
+        std::abort();
     }
     std::printf("  real model: %s, ctx=%d, %zu prompt tokens, %zu chars generated\n",
                 loaded.modelName.c_str(), static_cast<int>(loaded.contextLimit), exact,
@@ -495,17 +531,31 @@ void testLlamaCppGeneratesFromRealModel() {
 }
 
 int main() {
-    testVersionAndByteFormatting();
-    testDeviceFormatting();
-    testDeviceSelection();
-    testProbeIsSafeWithoutDevices();
-    testEngineSidecarRoundTrip();
-    testEngineCompatibility();
-    testTensorRtBackendValidatesEngine();
-    testBackendSelectionAndDiagnostics();
-    testBackendDrivenTokenCounting();
-    testLlamaCppBackendReportsUnavailableWithoutSdk();
-    testLlamaCppGeneratesFromRealModel();
+    // Unbuffered, so a test that aborts on a failed assert still shows which
+    // checks ran. A lost buffer turns a five-second diagnosis into a guess.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+// Name each test as it starts, so an abort points at the culprit instead of
+// at whichever check happened to print last.
+#define KESTREL_RUN(test)                        \
+    do {                                         \
+        std::printf("[ run ] %s\n", #test);       \
+        test();                                  \
+    } while (false)
+
+    KESTREL_RUN(testVersionAndByteFormatting);
+    KESTREL_RUN(testDeviceFormatting);
+    KESTREL_RUN(testDeviceSelection);
+    KESTREL_RUN(testProbeIsSafeWithoutDevices);
+    KESTREL_RUN(testEngineSidecarRoundTrip);
+    KESTREL_RUN(testEngineCompatibility);
+    KESTREL_RUN(testTensorRtBackendValidatesEngine);
+    KESTREL_RUN(testBackendSelectionAndDiagnostics);
+    KESTREL_RUN(testBackendDrivenTokenCounting);
+    KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
+    KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
+#undef KESTREL_RUN
+
     std::printf("runtime tests passed\n");
     return 0;
 }
