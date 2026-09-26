@@ -25,6 +25,39 @@ void ensureBackendInitialised() {
     (void)initialised;
 }
 
+// Tokenizes `text` into `out`, returning the number of tokens written or 0.
+//
+// llama_tokenize reports "this text needs N tokens" with a *negative* return
+// value when the buffer it was given is too small to hold them, and its header
+// documents the probe call (null buffer, capacity 0) as the way to learn N in
+// advance. That probe overflows by construction, so it always comes back
+// negative. Reading the negative as a failure is what made this backend report
+// that it could not tokenize any prompt at all, and therefore generate nothing.
+int tokenizeInto(const llama_vocab* vocab,
+                 std::string_view text,
+                 std::vector<llama_token>& out) {
+    const char* data = text.data();
+    const auto length = static_cast<int32_t>(text.size());
+
+    int capacity = llama_tokenize(vocab, data, length, nullptr, 0,
+                                  /* add_special */ true, /* parse_special */ true);
+    if (capacity < 0) {
+        capacity = -capacity;
+    }
+    if (capacity == 0) {
+        return 0;
+    }
+
+    out.resize(static_cast<std::size_t>(capacity));
+    const int written = llama_tokenize(vocab, data, length, out.data(), capacity,
+                                       /* add_special */ true, /* parse_special */ true);
+    if (written < 0) {
+        return 0;
+    }
+    out.resize(static_cast<std::size_t>(written));
+    return written;
+}
+
 } // namespace
 
 struct LlamaCppBackend::Impl {
@@ -157,20 +190,9 @@ std::size_t LlamaCppBackend::countTokensImpl(std::string_view text) const {
     if (m_impl == nullptr || m_impl->model == nullptr) {
         return 0;
     }
-    const llama_vocab* vocab = llama_model_get_vocab(m_impl->model);
-
-    // Ask the library how many tokens it needs, then tokenize for real. The
-    // two-call pattern avoids guessing an upper bound that would silently
-    // truncate a long prompt.
-    const int needed = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()),
-                                      nullptr, 0, true, true);
-    if (needed <= 0) {
-        return 0;
-    }
-    std::vector<llama_token> tokens(static_cast<std::size_t>(needed));
-    const int written = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()),
-                                       tokens.data(), needed, true, true);
-    return written > 0 ? static_cast<std::size_t>(written) : 0;
+    std::vector<llama_token> tokens;
+    return static_cast<std::size_t>(
+        tokenizeInto(llama_model_get_vocab(m_impl->model), text, tokens));
 }
 
 void LlamaCppBackend::resetContextUsage() {
@@ -194,27 +216,17 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     llama_context* context = m_impl->context;
     const llama_vocab* vocab = llama_model_get_vocab(model);
 
-    // Tokenize the prompt. Ask for the size first so a long prompt is never
-    // silently truncated against a guessed buffer.
-    const std::string& prompt = request.prompt;
-    const int promptTokens = llama_tokenize(vocab, prompt.data(),
-                                            static_cast<int32_t>(prompt.size()), nullptr, 0,
-                                            true, true);
-    if (promptTokens <= 0) {
+    // Tokenize the prompt against the model's own vocabulary. The helper asks
+    // the library how many tokens are needed before allocating, so a long
+    // prompt is never silently truncated against a guessed buffer size.
+    std::vector<llama_token> tokens;
+    if (tokenizeInto(vocab, request.prompt, tokens) <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
         return;
     }
-
-    std::vector<llama_token> tokens;
-    tokens.reserve(static_cast<std::size_t>(promptTokens) + request.maxTokens + 8);
-    tokens.resize(static_cast<std::size_t>(promptTokens));
-    if (llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()),
-                       tokens.data(), promptTokens, true, true) != promptTokens) {
-        onComplete(false, "llama.cpp tokenized the prompt inconsistently");
-        return;
-    }
-
     const std::size_t promptSize = tokens.size();
+    // Room for the continuation, so the vector does not reallocate per token.
+    tokens.reserve(promptSize + static_cast<std::size_t>(request.maxTokens > 0 ? request.maxTokens : 256));
 
     // Sampler chain. Composition order matters, so it is built once per request.
     llama_sampler_chain_params chainParams = llama_sampler_chain_default_params();
@@ -235,9 +247,10 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         llama_sampler_chain_add(chain, llama_sampler_init_dist(1234));
     }
 
-    // Decode the prompt in one batch, then sample one token at a time.
-    llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(promptSize));
-    if (llama_decode(context, batch) != 0) {
+    // Decode the prompt in one batch. llama_batch_get_one assigns positions
+    // 0..n-1, which is exactly right for a fresh prompt.
+    llama_batch promptBatch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(promptSize));
+    if (llama_decode(context, promptBatch) != 0) {
         llama_sampler_free(chain);
         onComplete(false, "llama.cpp failed to decode the prompt");
         return;
@@ -245,6 +258,12 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
 
     const auto contextLimit = static_cast<int>(llama_n_ctx(context));
     const int maxTokens = request.maxTokens > 0 ? request.maxTokens : contextLimit;
+
+    // Continuation tokens need explicit positions. llama_batch_get_one always
+    // numbers a batch from 0, so using it for a one-token continuation would
+    // tell the model every generated token sat at position 0, corrupting the
+    // KV cache and producing degenerate output.
+    llama_batch step = llama_batch_init(1, 0, 1);
     std::string piece;
     std::size_t produced = 0;
     bool sawStop = false;
@@ -263,8 +282,14 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
             break;
         }
 
-        const llama_token next =
-            llama_sampler_sample(chain, context, static_cast<int32_t>(tokens.size()) - 1);
+        // -1 means "sample from the logits of the most recent decode", which is
+        // the documented idiom and avoids depending on an index into the batch.
+        const llama_token next = llama_sampler_sample(chain, context, -1);
+        // Feed the token back so stateful samplers (penalties, DRY) can see the
+        // history they are meant to penalise.
+        llama_sampler_accept(chain, next);
+
+
         if (llama_vocab_is_eog(vocab, next)) {
             break;
         }
@@ -281,14 +306,25 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
             onToken(piece);
         }
 
-        batch = llama_batch_get_one(&tokens[tokens.size() - 1], 1);
-        if (llama_decode(context, batch) != 0) {
+        // One token, at its true position in the sequence. n_seq_id is a
+        // pointer into the batch's per-token storage, not a count field, and
+        // llama_batch_init leaves every member uninitialised -- including the
+        // logits pointer, which the next decode would otherwise read.
+        step.n_tokens = 1;
+        step.token[0] = next;
+        step.pos[0] = static_cast<llama_pos>(tokens.size() - 1);
+        *step.n_seq_id = 1;
+        step.seq_id[0][0] = 0;
+        step.logits[0] = 1;
+        if (llama_decode(context, step) != 0) {
+            llama_batch_free(step);
             llama_sampler_free(chain);
             onComplete(false, "llama.cpp failed while decoding a generated token");
             return;
         }
     }
 
+    llama_batch_free(step);
     llama_sampler_free(chain);
 
     // Context grows by the prompt plus what this turn produced, capped at the

@@ -41,6 +41,11 @@ using CompletionCallback = std::function<void(bool success, std::string_view err
 //     always called from a worker thread, never from the UI thread.
 //   * The onToken and onComplete callbacks run on that same worker thread.
 //     Callers marshal them back to the UI thread themselves.
+//   * Callbacks are invoked with the backend's internal lock still held, so a
+//     callback must not call back into the same backend (status(),
+//     countTokens(), loadModel()). That re-enters a non-recursive mutex, which
+//     is undefined behaviour rather than a slow path. Hand the work to another
+//     thread and inspect the result there.
 //   * cancel() is the only method that may be called from the UI thread
 //     while generate() is running on a worker. Implementations must make it
 //     safe under that concurrency: an atomic flag, or a driver call the
