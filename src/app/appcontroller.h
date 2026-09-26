@@ -95,6 +95,16 @@ public:
     explicit AppController(QObject* parent = nullptr);
     ~AppController() override;
 
+    // Test seam: adopt a backend supplied by the caller instead of selecting
+    // one. The controller takes ownership, so the caller must release its own
+    // handle rather than leave it to free memory this object now owns.
+    //
+    // The constructor cannot take a backend because QML creates this object,
+    // but the send path (controller -> worker -> backend -> message model) is
+    // exactly the part with no coverage, and it cannot be covered without
+    // choosing which backend drives it.
+    void setBackendForTesting(runtime::ModelBackend* backend);
+
     [[nodiscard]] MessageModel* messages() const noexcept;
     [[nodiscard]] ConversationModel* conversations() const noexcept;
     [[nodiscard]] int activeConversationId() const noexcept;

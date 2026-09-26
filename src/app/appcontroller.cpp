@@ -287,6 +287,22 @@ QString AppController::systemPrompt() const {
     return m_systemPrompt;
 }
 
+/// Installs a caller-owned backend, taking ownership of it, after the
+/// in-flight generation has finished. Test-only seam: the real backend
+/// is chosen by availability, and callers must release() their handle.
+void AppController::setBackendForTesting(runtime::ModelBackend* backend) {
+    if (backend == nullptr) {
+        return;
+    }
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    m_backend.reset(backend);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    rebuildDiagnostics();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
 /// Trims and stores changed instruction text, updates the backend, and publishes metrics.
 void AppController::setSystemPrompt(const QString& text) {
     const QString trimmed = text.trimmed();
