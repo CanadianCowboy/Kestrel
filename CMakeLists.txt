@@ -28,6 +28,29 @@ endif()
 option(KESTREL_ENABLE_TENSORRT "Link the TensorRT SDK" OFF)
 set(KESTREL_TENSORRT_ROOT "" CACHE PATH "Root of an unpacked TensorRT SDK")
 
+# llama.cpp is the portable GGUF path. Like CUDA it defaults on and degrades
+# automatically: a build with no llama.cpp present still compiles and simply
+# reports the backend unavailable.
+option(KESTREL_ENABLE_LLAMA_CPP "Link llama.cpp for GGUF inference" ON)
+set(KESTREL_LLAMA_CPP_ROOT "" CACHE PATH "Root of a llama.cpp install or build tree")
+
+# Resolution order: a CMake package config first, then an explicit root. Never
+# found by accident, because a wrong llama.cpp would produce subtly wrong
+# tokens rather than a link error.
+set(KESTREL_LLAMA_CPP_ENABLED OFF)
+if(KESTREL_ENABLE_LLAMA_CPP)
+    find_package(llama QUIET CONFIG)
+    if(llama_FOUND)
+        set(KESTREL_LLAMA_CPP_ENABLED ON)
+        message(STATUS "Kestrel: llama.cpp found via its CMake package")
+    elseif(KESTREL_LLAMA_CPP_ROOT AND EXISTS "${KESTREL_LLAMA_CPP_ROOT}/include/llama.h")
+        set(KESTREL_LLAMA_CPP_ENABLED ON)
+        message(STATUS "Kestrel: llama.cpp headers found at ${KESTREL_LLAMA_CPP_ROOT}")
+    else()
+        message(STATUS "Kestrel: llama.cpp not found; the GGUF backend will report unavailable")
+    endif()
+endif()
+
 # --- CUDA discovery source selection -----------------------------------------
 # Exactly one of these two is compiled. Both define probeCuda(); only the CUDA
 # one may include a CUDA header. See src/runtime/cudadevice.h.
@@ -114,6 +137,37 @@ if(KESTREL_TENSORRT_ENABLED)
         )
     endif()
     target_compile_definitions(kestrel_core PUBLIC KESTREL_TENSORRT_ENABLED=1)
+endif()
+
+if(KESTREL_LLAMA_CPP_ENABLED)
+    target_compile_definitions(kestrel_core PRIVATE KESTREL_HAS_LLAMA_CPP=1)
+    if(TARGET llama)
+        target_link_libraries(kestrel_core PRIVATE llama)
+    else()
+        target_include_directories(kestrel_core PRIVATE "${KESTREL_LLAMA_CPP_ROOT}/include")
+        # llama.cpp ships several import libraries. Link whichever are present so
+        # a build tree that omits the CUDA backend still links, rather than
+        # failing on a hardcoded ggml-cuda name.
+        if(WIN32)
+            set(_kestrel_llama_libs "")
+            foreach(_comp llama ggml ggml-base ggml-cpu ggml-cuda)
+                if(EXISTS "${KESTREL_LLAMA_CPP_ROOT}/lib/${_comp}.lib")
+                    list(APPEND _kestrel_llama_libs "${KESTREL_LLAMA_CPP_ROOT}/lib/${_comp}.lib")
+                endif()
+            endforeach()
+            target_link_libraries(kestrel_core PRIVATE ${_kestrel_llama_libs})
+        elseif(APPLE)
+            target_link_libraries(kestrel_core PRIVATE
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.dylib"
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.dylib"
+            )
+        else()
+            target_link_libraries(kestrel_core PRIVATE
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.so"
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.so"
+            )
+        endif()
+    endif()
 endif()
 
 if(KESTREL_BUILD_UI)

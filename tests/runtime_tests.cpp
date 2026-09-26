@@ -1,11 +1,13 @@
 #include "runtime/backendregistry.h"
 #include "runtime/cudadevice.h"
 #include "runtime/engineartifact.h"
+#include "runtime/llamacppbackend.h"
 #include "runtime/mockbackend.h"
 #include "runtime/tensorrtbackend.h"
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -273,6 +275,7 @@ void testTensorRtBackendValidatesEngine() {
     bool completed = false;
     backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
                      [&completed](bool success, std::string_view) { completed = !success; });
+
     assert(completed);
 
     const std::filesystem::path dir =
@@ -366,15 +369,193 @@ void testBackendSelectionAndDiagnostics() {
 
 } // namespace
 
+// Token counting is backend-driven so a loaded model reports exact numbers
+// rather than an estimate. These cover the shared fallback and the contract
+// backends inherit when they have no tokenizer.
+void testBackendDrivenTokenCounting() {
+    // Empty input costs nothing. A caller that treats 0 as "free" would
+    // otherwise under-count the whole prompt.
+    assert(runtime::MockBackend{}.countTokens("") == 0);
+
+    // The approximation must never report zero for non-empty text.
+    const std::string oneChar = "x";
+    assert(runtime::MockBackend{}.countTokens(oneChar) >= 1);
+
+    // Roughly four characters per token, so 400 characters is about 100
+    // tokens. The bound is deliberately loose: the exact value is a property
+    // of a real vocabulary, not of this fallback.
+    const std::string fourHundred(400, 'a');
+    const std::size_t estimate = runtime::MockBackend{}.countTokens(fourHundred);
+    assert(estimate >= 50 && estimate <= 200);
+
+    // Longer text must cost strictly more, or context accounting would not
+    // grow with the conversation.
+    const std::string eightHundred(800, 'a');
+    assert(runtime::MockBackend{}.countTokens(eightHundred) > estimate);
+
+    // A backend with no model must not claim a prompt is free.
+    runtime::LlamaCppBackend llama;
+    assert(llama.countTokens("") == 0);
+    assert(llama.countTokens(fourHundred) >= 1);
+
+    // Resetting usage must not throw and must leave the backend usable.
+    llama.resetContextUsage();
+    assert(llama.countTokens(fourHundred) >= 1);
+}
+
+// With no SDK linked, the GGUF backend has to say so instead of appearing
+// healthy. The registry depends on this to avoid selecting a dead backend.
+//
+// The checks are explicit rather than assert() because this test has to hold
+// under two configurations, and a bare assert in a Release build disappears
+// while in Debug it reports nothing useful about a cross-configuration value.
+void testLlamaCppBackendReportsUnavailableWithoutSdk() {
+    runtime::LlamaCppBackend backend;
+    const runtime::RuntimeStatus status = backend.status();
+    if (status.modelLoaded) {
+        std::printf("  FAIL  a fresh backend reported a model as loaded\n");
+        std::abort();
+    }
+
+    std::string error;
+    if (backend.loadModel("model.gguf", error)) {
+        std::printf("  FAIL  a bogus path loaded as a model\n");
+        std::abort();
+    }
+    // The message must tell the user how to fix it, not just that it failed.
+    // In an SDK-linked build the failure is a real load attempt instead, so
+    // accept either explanation rather than pinning one configuration.
+    if (error.empty() || (error.find("KESTREL_ENABLE_LLAMA_CPP") == std::string::npos
+                          && error.find("could not load") == std::string::npos)) {
+        std::printf("  FAIL  unhelpful load error: \"%s\"\n", error.c_str());
+        std::abort();
+    }
+
+    bool completed = false;
+    bool refused = false;
+    backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
+                     [&completed, &refused](bool success, std::string_view) {
+                         // Without a loaded model every build must refuse. Note
+                         // the callback runs while the backend holds its own
+                         // lock, so it must not call back into the backend;
+                         // that is checked after generate() returns.
+                         refused = !success;
+                         completed = true;
+                     });
+    if (!completed) {
+        std::printf("  FAIL  generate never reported completion\n");
+        std::abort();
+    }
+    if (!refused) {
+        std::printf("  FAIL  generate succeeded with no model loaded\n");
+        std::abort();
+    }
+    if (backend.status().modelLoaded) {
+        std::printf("  FAIL  a refused generate left a model marked loaded\n");
+        std::abort();
+    }
+}
+
+// Exercises the real llama.cpp generation path.
+//
+// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
+// a multi-hundred-megabyte model download to run the suite. When it is set,
+// this is the only test that proves the backend actually generates rather than
+// merely linking.
+void testLlamaCppGeneratesFromRealModel() {
+    const char* modelPath = std::getenv("KESTREL_TEST_GGUF");
+    if (modelPath == nullptr || *modelPath == '\0') {
+        std::printf("  skip  real GGUF generation (set KESTREL_TEST_GGUF to run)\n");
+        return;
+    }
+
+    runtime::LlamaCppBackend backend;
+    std::string error;
+
+
+    if (!backend.loadModel(modelPath, error)) {
+        std::printf("  FAIL  could not load %s: %s\n", modelPath, error.c_str());
+        std::abort();
+    }
+
+    const runtime::RuntimeStatus loaded = backend.status();
+    assert(loaded.modelLoaded);
+    assert(loaded.contextLimit > 0);
+
+    // The tokenizer must be real: it is the whole point of moving counting
+    // behind the backend. A fixed chars-per-token ratio cannot tell two
+    // equal-length strings apart, so compare a run of one letter against a
+    // sentence of exactly the same length: only a real vocabulary separates
+    // them. Deriving the length avoids a hand-counted constant that silently
+    // stops matching.
+    const std::string prompt = "The quick brown fox jumps over the lazy dog";
+    const std::size_t exact = backend.countTokens(prompt);
+    assert(exact > 0);
+    const std::string sentence = "The quick brown fox jumps over cat";
+    const std::string run(sentence.size(), 'a');
+    assert(backend.countTokens(run) != backend.countTokens(sentence));
+    // A backend with no tokenizer reports the shared approximation for both,
+    // which is the behaviour this check exists to rule out.
+    runtime::MockBackend mock;
+    assert(mock.countTokens(run) == mock.countTokens(sentence));
+
+
+    std::string generated;
+    bool completed = false;
+    bool success = false;
+    backend.generate(runtime::GenerationRequest{"Continue this sentence in one short paragraph:\n\n\"The Kestrel flew", 0.7F, 32},
+                     [&generated](std::string_view token) { generated.append(token); },
+                     [&](bool ok, std::string_view) {
+                         success = ok;
+                         completed = true;
+                     });
+
+    assert(completed);
+    assert(success);
+    // Generation must actually emit text. This is the assertion that was
+    // quietly passing before: an empty response reported itself as a success.
+    if (generated.empty()) {
+        std::printf("  FAIL  generated 0 characters\n");
+        std::fflush(stdout);
+        std::abort();
+    }
+    std::printf("  real model: %s, ctx=%d, %zu prompt tokens, %zu chars generated\n",
+                loaded.modelName.c_str(), static_cast<int>(loaded.contextLimit), exact,
+                generated.size());
+    std::printf("  sample: %.90s\n", generated.c_str());
+
+    // Context accounting must have moved, and must respect the real window.
+    const runtime::RuntimeStatus after = backend.status();
+    assert(after.contextUsed > 0);
+    assert(after.contextUsed <= after.contextLimit);
+}
+
 int main() {
-    testVersionAndByteFormatting();
-    testDeviceFormatting();
-    testDeviceSelection();
-    testProbeIsSafeWithoutDevices();
-    testEngineSidecarRoundTrip();
-    testEngineCompatibility();
-    testTensorRtBackendValidatesEngine();
-    testBackendSelectionAndDiagnostics();
+    // Unbuffered, so a test that aborts on a failed assert still shows which
+    // checks ran. A lost buffer turns a five-second diagnosis into a guess.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+// Name each test as it starts, so an abort points at the culprit instead of
+// at whichever check happened to print last.
+#define KESTREL_RUN(test)                        \
+    do {                                         \
+        std::printf("[ run ] %s\n", #test);       \
+        test();                                  \
+    } while (false)
+
+    KESTREL_RUN(testVersionAndByteFormatting);
+    KESTREL_RUN(testDeviceFormatting);
+    KESTREL_RUN(testDeviceSelection);
+    KESTREL_RUN(testProbeIsSafeWithoutDevices);
+    KESTREL_RUN(testEngineSidecarRoundTrip);
+    KESTREL_RUN(testEngineCompatibility);
+    KESTREL_RUN(testTensorRtBackendValidatesEngine);
+    KESTREL_RUN(testBackendSelectionAndDiagnostics);
+    KESTREL_RUN(testBackendDrivenTokenCounting);
+    KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
+    KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
+#undef KESTREL_RUN
+
     std::printf("runtime tests passed\n");
     return 0;
 }
