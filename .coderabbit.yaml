@@ -1,0 +1,108 @@
+# CodeRabbit review configuration for Kestrel.
+# Reference: https://docs.coderabbit.ai/reference/configuration
+
+language: en-US
+
+reviews:
+  # Kestrel is a small codebase where boundary violations are the real risk,
+  # so err toward thoroughness rather than noise-suppression.
+  profile: assertive
+
+  high_level_summary: true
+  request_changes_workflow: true
+
+  auto_review:
+    enabled: true
+    # Draft PRs are work in progress; reviewing them wastes cycles and posts
+    # findings that the author is about to invalidate.
+    include_drafts: false
+
+  # Exclude generated and vendored trees from review entirely.
+  path_filters:
+    - "!**/build/**"
+    - "!**/build-*/**"
+    - "!**/.cache/**"
+    - "!**/tools/**"
+    - "!**/_autogen/**"
+
+  path_instructions:
+    # The CUDA/TensorRT boundary is the single most load-bearing rule in the
+    # codebase and is invisible to a generic reviewer.
+    - path: "src/runtime/cudadiscovery_cuda.cpp"
+      instructions: |
+        This is the ONLY translation unit permitted to include a CUDA header.
+        If a review finds a CUDA include here, that is correct. If it finds a
+        CUDA header included anywhere else, flag it as a blocking issue.
+        Also check: CUDA 13 removed `clockRate` and `memoryClockRate` from
+        `cudaDeviceProp`; device clocks must come from the
+        cudaDeviceGetAttribute API. Report errors with cudaGetErrorName()
+        rather than a hand-maintained error table.
+
+    - path: "src/runtime/cudadevice.*"
+      instructions: |
+        This header must stay free of CUDA types so that callers, the UI, and
+        the no-toolkit stub all compile without a CUDA Toolkit present. Flag
+        any CUDA type or header that leaks into this interface.
+        Version formatters are easy to get subtly wrong: TensorRT encodes
+        versions as major*1000 + minor*100 + patch, so 8601 is "8.6.1", not
+        "8.60". Check any arithmetic here carefully.
+
+    - path: "src/runtime/engineartifact.*"
+      instructions: |
+        A missing .kestrel-engine record is UNKNOWN, not invalid. Blocking on
+        absent metadata would fail honestly unannotated engines, so treat
+        absence as permissible and reserve hard failures for genuine
+        mismatches (wrong SM architecture, driver older than the engine's
+        toolkit, TensorRT version mismatch). Each incompatibility should
+        report a specific, actionable remedy.
+
+    - path: "src/runtime/tensorrtbackend.*"
+      instructions: |
+        Remains behind the KESTREL_ENABLE_TENSORRT opt-in because the SDK is
+        not vendored. Flag any change that would make the SDK resolve without
+        an explicit KESTREL_TENSORRT_ROOT. Deserialization and execution are
+        the documented seam; keep that boundary intact.
+
+    - path: "src/app/**"
+      instructions: |
+        The UI must never block. Flag any synchronous backend call, model
+        load, or generation call reachable from a slot or signal handler on
+        the UI thread. Work belongs on a worker thread and must return to the
+        UI thread via queued signals. Also flag property or signal names that
+        overstate runtime state, since the UI is expected to report real
+        device facts rather than optimistic defaults.
+
+    - path: "src/ui/**.qml"
+      instructions: |
+        `containsMouse` exists only on MouseArea; using it on other types is a
+        ReferenceError at runtime. Note that customizing a Button's
+        `contentItem`/`background` is silently discarded under Qt's native
+        Windows style, which is why main.cpp pins the Basic style -- flag any
+        change that removes that pin. Keep the UI honest: it must not hardcode
+        a status that discovery actually determines.
+
+    - path: "CMakeLists.txt"
+      instructions: |
+        KESTREL_ENABLE_CUDA must degrade to the portable stub when no CUDA
+        Toolkit is found, so contributors without a GPU are never blocked.
+        KESTREL_ENABLE_TENSORRT must stay opt-in and resolvable only through
+        an explicit KESTREL_TENSORRT_ROOT. Flag any new REQUIRED dependency.
+        On Windows, a CUDA-enabled build links the cudart import library, so
+        cudart's DLL must be resolvable at test time; CMake does not do that
+        implicitly.
+
+    - path: "tests/**"
+      instructions: |
+        Never put side-effecting I/O (probe output, file writes) inside
+        assert(): it compiles away under NDEBUG and silently stops
+        exercising the code. Report such findings even when the test passes.
+        Check fixtures for unit mistakes as well as code mistakes -- a wrong
+        expected value hides a real bug just as effectively as a wrong
+        implementation.
+
+    - path: "**"
+      instructions: |
+        Reject changes that commit machine-specific absolute paths, local
+        build output, dependency caches, or the gitignored /tools/ helper
+        scripts. Also reject blocking calls on the UI thread, and any change
+        that weakens the documented architectural boundaries.

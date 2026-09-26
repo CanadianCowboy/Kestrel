@@ -493,6 +493,14 @@ Before opening a change:
 
 For runtime changes, include the relevant GPU, driver, CUDA, TensorRT, compiler, and model/engine versions in the development notes. Do not include personal paths or sensitive data.
 
+### Pull request workflow
+
+Open changes as pull requests against `main`; `.github/PULL_REQUEST_TEMPLATE.md` carries the validation checklist above.
+
+CodeRabbit reviews every pull request automatically. `.coderabbit.yaml` encodes the architectural boundaries that a generic reviewer cannot infer, most importantly that `src/runtime/cudadiscovery_cuda.cpp` is the only translation unit allowed to include a CUDA header and that no change may block the UI thread. If CodeRabbit flags something that is wrong for a stated reason, say so in the thread rather than silently ignoring it.
+
 ## License
 
-No project license has been selected yet. Until a license is added to the repository, contributors should treat the code as unavailable for redistribution outside the project's explicit permissions.
+MIT, with an express patent grant modeled on Apache-2.0 Section 3. The MIT terms govern in full; the patent grant is additive, so you keep MIT's permissiveness while every contributor grants you patent rights with the usual termination-on-litigation clause.
+
+Note that this is a custom variant, not a license GitHub's license picker will recognize automatically, so downstream compliance tooling may not detect it. Apache-2.0 is the battle-tested license that already combines permissive terms with a patent grant; switch to it if recognition by automated tooling matters more than MIT's exact wording.
