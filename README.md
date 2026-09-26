@@ -203,6 +203,40 @@ which is the quickest way to confirm a build picked up the GPU you expect:
 It prints the active backend, the probed device, and a diagnostics table that
 also explains why an unavailable backend is unavailable.
 
+### Smoke-testing a real model
+
+`--print-runtime` reports what was found; `--smoke-test` exercises it. It
+drives the real window rather than the controller, so it is the only check that
+covers the whole path at once: the QML scene loads, a message reaches the
+backend on its worker thread, and the streamed tokens land in the model the UI
+renders from.
+
+```powershell
+.\build\kestrel.exe --smoke-test --model D:\models\qwen.gguf
+```
+
+It exits with a meaning, which is the point of the exit codes:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | A reply came back from the requested model |
+| `1` | The model was asked for and did not load, did not finish loading in time, or did not answer |
+| `2` | No model is loaded, so there is nothing to exercise |
+
+The refusal matters as much as the pass. The built-in preview backend answers
+instantly and reports itself available, so a check that only asks "is the
+runtime available" passes against a canned reply. The run is refused unless a
+model path is actually loaded, and a load that was requested has to finish
+without an error before the message is sent.
+
+```powershell
+.\build\kestrel.exe --smoke-test   # exits 2
+```
+
+That refusal is the cheap negative control. It is worth running after changing
+anything in the startup path, because it is the difference between a check that
+fails when the model is broken and one that passes anyway.
+
 Generated directories such as `build/`, `build-*`, and `cmake-build-*` are ignored by Git. It is safe to delete and recreate them when changing generators or toolchains.
 
 ## Windows toolchain notes
