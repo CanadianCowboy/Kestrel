@@ -430,6 +430,55 @@ not evidence of a problem, so it warns instead of blocking.
 offline tooling; the desktop process only ever reads records and must never
 modify an engine.
 
+### Building an engine
+
+`kestrel-engine-build` does the conversion and writes the record. It is a
+separate executable rather than an app mode, because building an engine is a
+long, machine-specific operation and the desktop process must never write to
+engines.
+
+```bash
+# Convert a model and write its build record.
+kestrel-engine-build --model model.onnx --output model.plan
+
+# Annotate an engine that was built elsewhere, without converting anything.
+kestrel-engine-build --engine model.plan --record-only
+```
+
+The record is always written from the GPU and CUDA actually present on the
+machine running the tool, never from values passed on the command line. A
+record that does not describe reality is worse than no record, because
+validation would then wave a mismatched engine through. After writing, the tool
+reads the record back and runs the same compatibility check the app uses, so
+the validation path is exercised end to end even without a real engine
+present.
+
+Conversion requires a TensorRT SDK. Without one the tool still writes records
+for `--record-only` and explains how to enable conversion.
+
+## Generation and voice architecture
+
+Generation never runs on the UI thread. `AppController` hands the request to
+`GenerationWorker`, which lives on its own `QThread`; tokens and completion come
+back as queued signals and are applied to QML-visible state on the UI thread.
+
+Cancellation is the one deliberate exception to "everything is queued". It is
+called directly from the UI thread and only performs atomic stores, because the
+worker's event loop is blocked inside `generate()` and would not service a
+queued call until generation had already finished, which is exactly too late.
+`ModelBackend` documents this contract: a backend must poll its cancellation
+flag between tokens, and must make `cancel()` safe to call from another thread.
+
+Because there is no audio engine yet, `VoiceSession` drives the visible
+timeline and playback is treated as delivered as soon as generation finishes.
+That is the text-only fallback the state machine defines for exactly this
+situation. Pause stops delivery while preserving the response for `resume()`,
+which reopens generation for whatever text was still owed; sending a new
+message mid-response is a barge-in, which abandons the interrupted response
+and hands the timeline to the new prompt. The pause/resume control is only
+shown when the state machine says the transition is legal, so it can never be a
+button that silently does nothing.
+
 ## Safety and privacy principles
 
 Kestrel is intended to be local-first, but contributors must not assume that “local” automatically means safe. Future tools must:
@@ -459,9 +508,10 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 - [x] Add CUDA device discovery and capability reporting
 - [x] Integrate TensorRT headers and libraries through CMake options
 - [x] Validate engine artifacts against the live device before deserializing
-- [ ] Implement asynchronous token generation and cancellation
-- [ ] Expose GPU memory and throughput metrics to the UI
+- [x] Implement asynchronous token generation and cancellation
+- [x] Expose GPU memory and throughput metrics to the UI
 - [x] Define and document the model conversion workflow
+- [x] Provide the offline engine-build tool and build record
 
 ### Application
 
