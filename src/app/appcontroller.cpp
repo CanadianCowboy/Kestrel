@@ -386,7 +386,12 @@ void AppController::sendMessage(const QString& text) {
         // delivered, invalidate the in-flight generation so late tokens are
         // rejected as stale, and hand the timeline to the new prompt.
         m_voice.interrupt(m_activeResponse, trimmed.toStdString());
-        m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement);
+        // Replacement abandons the interrupted response, so there is no
+        // replacement generation to adopt. The value is still consumed rather
+        // than discarded so a future intent that does return one cannot slip
+        // through unnoticed.
+        static_cast<void>(
+            m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement));
         m_userStopped = true;
         m_worker->cancel();
         emit voiceChanged();
