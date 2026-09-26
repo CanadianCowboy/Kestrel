@@ -248,18 +248,19 @@ void testListViewGivesRowsRealHeight(QQmlEngine& engine) {
         "}\n",
         QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/listprobe.qml")));
 
-    if (component.isError() || !component.create()) {
+    // Created once, and owned from the first create(): calling it in the
+    // condition below and then again for `scene` would leave the first scene
+    // unowned and running its own ListView and delegates, outside any window,
+    // for the rest of the process -- and a failure would not say which call it
+    // came from.
+    std::unique_ptr<QObject> scene(component.isError() ? nullptr : component.create());
+    if (!scene) {
         std::cout << "  FAIL cannot build the list: " << component.errorString().toStdString() << "\n";
         ++g_failures;
         return;
     }
-    std::unique_ptr<QObject> scene(component.create());
-    if (!scene) {
-        ++g_failures;
-        return;
-    }
-    // The document's root is a ListView, so it is an Item; create() hands back
-    // a QObject* and setParentItem lives on QQuickItem.
+    // The document's root is an Item; create() hands back a QObject* and
+    // setParentItem lives on QQuickItem.
     auto* sceneItem = qobject_cast<QQuickItem*>(scene.get());
     if (sceneItem == nullptr) {
         std::cout << "  FAIL the probe root is not an Item\n";
