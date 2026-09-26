@@ -11,7 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QT_VERSION: '6.9.0'
+  # Declared at job scope instead of workflow scope. `env` is not one of the
+  # contexts available in a job's `name` -- referencing it there makes the
+  # whole workflow uncompilable, which GitHub reports as a run that failed in
+  # zero seconds with no jobs. `matrix` is allowed there, so the version lives
+  # in the matrix and this reads it back, rather than being written down twice.
 
 jobs:
   # The portable core must build everywhere, with no optional dependency
@@ -66,12 +70,17 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
   desktop:
-    name: Desktop (Qt ${{ env.QT_VERSION }}) / ${{ matrix.os }}
+    name: Desktop (Qt ${{ matrix.qt }}) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # The one place the Qt version is written down. It has to reach the
+        # job name, and `matrix` is one of the few contexts available there.
+        qt: ['6.9.0']
+    env:
+      QT_VERSION: ${{ matrix.qt }}
     steps:
       - uses: actions/checkout@v4
 
