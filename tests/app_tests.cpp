@@ -12,6 +12,7 @@
 #include <QStringList>
 #include <QThread>
 #include <QTimer>
+#include <QUrl>
 
 #include <atomic>
 #include <iostream>
@@ -217,10 +218,73 @@ void testCancelStopsInFlightGeneration() {
 
 #include "app_tests.moc"
 
+// A QML FileDialog speaks in URLs, and the controller converts them to local
+// paths. That conversion is the fragile step in loading a model from disk, so
+// it is pinned here rather than only exercised by hand.
+void testFileDialogUrlBecomesALocalPath() {
+    std::cout << "file dialog URLs convert to local paths\n";
+
+    // Windows, percent-encoded, as QtQuick.Dialogs hands it over.
+    const QUrl windowsUrl(QStringLiteral("file:///C:/kestrel-deps/models/my%20model.gguf"));
+    check(windowsUrl.toLocalFile() == QStringLiteral("C:/kestrel-deps/models/my model.gguf"),
+          "a percent-encoded Windows URL decodes to a real path");
+
+    // POSIX, for the CI build of the same app.
+    const QUrl posixUrl(QStringLiteral("file:///home/user/models/qwen.gguf"));
+    check(posixUrl.toLocalFile() == QStringLiteral("/home/user/models/qwen.gguf"),
+          "a POSIX URL keeps its leading slash");
+
+    // A remote URL has no local path at all. The controller must report that as
+    // an error rather than hand an empty string to the model loader.
+    check(QUrl(QStringLiteral("https://example.com/model.gguf")).toLocalFile().isEmpty(),
+          "a remote URL yields no local path, so it is refused");
+
+    check(QUrl(QStringLiteral("qwen.gguf")).toLocalFile().isEmpty(),
+          "a bare filename is not treated as a usable path");
+}
+
+// After the user loads a model, the worker must generate through the new
+// backend rather than the one it was constructed with.
+void testWorkerFollowsTheSwappedBackend() {
+    std::cout << "worker uses the swapped backend\n";
+
+    SlowBackend original(4, 0);
+    SlowBackend replacement(4, 0);
+    QThread thread;
+    GenerationWorker worker(&original);
+    worker.moveToThread(&thread);
+    thread.start();
+
+    Collector collector;
+    QObject::connect(&worker, &GenerationWorker::tokenReady, &collector,
+                     [&collector](quint64, const QString& token) {
+                         collector.tokens.append(token);
+                     });
+    QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                     [&collector](quint64, bool success, const QString& error) {
+                         collector.success = success;
+                         collector.error = error;
+                         collector.finished = true;
+                         emit collector.finishedSignal();
+                     });
+
+    worker.setBackend(&replacement);
+    worker.start(1, QStringLiteral("hello"), 0.7F, 512);
+    check(pumpUntilFinished(collector, 10000), "the swapped backend completes");
+
+    check(replacement.tokensEmitted() == 4, "the replacement backend generated");
+    check(original.tokensEmitted() == 0, "the original backend was not used");
+
+    thread.quit();
+    thread.wait();
+}
+
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     testGenerationRunsOffCallingThread();
     testCancelStopsInFlightGeneration();
+    testFileDialogUrlBecomesALocalPath();
+    testWorkerFollowsTheSwappedBackend();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

@@ -2,10 +2,15 @@
 
 #include "app/generationworker.h"
 #include "runtime/backendregistry.h"
+#include "runtime/llamacppbackend.h"
 
 #include <QClipboard>
 #include <QDateTime>
+#include <QEventLoop>
+#include <QFileInfo>
 #include <QGuiApplication>
+#include <QTimer>
+#include <QUrl>
 #include <QVariantMap>
 
 #include <algorithm>
@@ -30,6 +35,11 @@ const QString kDefaultSystemPrompt = QStringLiteral(
 // grows with it, and the whole point of the shared prefix is lost if the
 // per-turn text swamps the part that is cached.
 constexpr std::size_t kHistoryTurns = 8;
+
+// How long the UI will wait for an in-flight generation to unwind before a
+// backend swap proceeds anyway. Generous enough for a real decode, short
+// enough that a wedged backend cannot freeze the window.
+constexpr int kBackendSwapTimeoutMs = 15000;
 
 // Minimum gap between metricsChanged emissions while streaming. Emitting on
 // every token would flood the binding with updates faster than the UI repaints.
@@ -284,6 +294,118 @@ void AppController::setSystemPrompt(const QString& text) {
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
     emit systemPromptChanged();
     publishMetrics();
+}
+
+bool AppController::canLoadModel() const {
+    // Ask a throwaway instance rather than caching a flag: whether a real model
+    // can be loaded is a build-time fact, but a cached copy would go stale the
+    // moment the answer is refactored into a runtime check.
+    return runtime::LlamaCppBackend{}.status().available;
+}
+
+QString AppController::modelPath() const {
+    return m_modelPath;
+}
+
+QString AppController::modelError() const {
+    return m_modelError;
+}
+
+void AppController::loadModelFromUrl(const QString& url) {
+    const QString path = QUrl(url).toLocalFile();
+    if (path.isEmpty()) {
+        // A dialog can hand back an empty selection, and a non-file URL (a
+        // remote location) has no local path at all. Both are user error, not
+        // a crash, so say so rather than passing "" to the loader.
+        m_modelError = tr("That is not a local file. Choose a GGUF from disk.");
+        emit modelErrorChanged();
+        return;
+    }
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        m_modelError = tr("No such file: %1").arg(path);
+        emit modelErrorChanged();
+        return;
+    }
+    // Checking the extension first turns a typo into a clear message instead of
+    // an opaque loader failure deep inside llama.cpp.
+    if (info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) != 0) {
+        m_modelError = tr("%1 is not a GGUF file.").arg(info.fileName());
+        emit modelErrorChanged();
+        return;
+    }
+
+    // Build and load the candidate before touching the running backend, so a
+    // failed attempt leaves the app exactly as it was. Loading a model takes
+    // seconds; finding out afterwards that it was the wrong file should not
+    // cost the user their current one.
+    auto candidate = std::make_unique<runtime::LlamaCppBackend>();
+    if (!candidate->status().available) {
+        m_modelError = QString::fromStdString(candidate->status().detail);
+        emit modelErrorChanged();
+        return;
+    }
+
+    std::string error;
+    if (!candidate->loadModel(path.toStdString(), error)) {
+        m_modelError = QString::fromStdString(error);
+        emit modelErrorChanged();
+        return;
+    }
+
+    // The new model is proven loadable. Now it is safe to tear the old one
+    // down -- but only once the worker has left it.
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    if (m_generating) {
+        m_modelError = tr("A response is still running. Stop it and try again.");
+        emit modelErrorChanged();
+        return;
+    }
+
+    m_modelPath = path;
+    m_modelError.clear();
+    m_backend = std::move(candidate);
+    m_worker->setBackend(m_backend.get());
+    // The new context holds none of the old prefix's entries, so re-declare it
+    // and let the backend rebuild the cache on the next turn.
+    m_backend->clearSharedPrefix();
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    rebuildDiagnostics();
+    emit modelErrorChanged();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
+void AppController::usePreviewBackend() {
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    if (m_generating) {
+        m_modelError = tr("A response is still running. Stop it and try again.");
+        emit modelErrorChanged();
+        return;
+    }
+    m_modelPath.clear();
+    m_modelError.clear();
+    m_backend = runtime::selectBackend(runtime::BackendKind::Mock);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    rebuildDiagnostics();
+    emit modelErrorChanged();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
+void AppController::waitForIdleGeneration(int timeoutMs) {
+    if (!m_generating) {
+        return;
+    }
+    stopGeneration();
+    QEventLoop loop;
+    const QMetaObject::Connection done =
+        connect(this, &AppController::onGenerationFinished, &loop, &QEventLoop::quit);
+    QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+    loop.exec();
+    disconnect(done);
 }
 
 void AppController::setSearchQuery(const QString& query) {
