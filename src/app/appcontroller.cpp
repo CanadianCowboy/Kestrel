@@ -298,6 +298,11 @@ void AppController::setBackendForTesting(runtime::ModelBackend* backend) {
     m_backend.reset(backend);
     m_worker->setBackend(m_backend.get());
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    // The snapshot must be refreshed here for the same reason every other
+    // backend swap does it: the getters read the cache, so a test that
+    // installs a backend and then asks what is loaded would otherwise be told
+    // about the backend that was replaced.
+    refreshCachedRuntime();
     rebuildDiagnostics();
     emit runtimeChanged();
     emit metricsChanged();
