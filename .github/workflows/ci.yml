@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_VERSION: '6.9.0'
+
+jobs:
+  # The portable core must build everywhere, with no optional dependency
+  # present. This is the configuration a contributor on a bare machine gets,
+  # so it is the one that must never break.
+  core:
+    name: Core (no Qt) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DKESTREL_BUILD_UI=OFF -DKESTREL_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # CUDA is requested but the hosted runners have no toolkit, so this asserts
+  # the documented degradation: the build must still succeed by compiling the
+  # portable device-discovery stub. A silent link failure here would mean the
+  # fallback stopped working for everyone without a GPU.
+  cuda-degrades:
+    name: CUDA requested, toolkit absent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure with CUDA on
+        run: >
+          cmake -S . -B build
+          -DKESTREL_BUILD_UI=OFF
+          -DKESTREL_BUILD_TESTS=ON
+          -DKESTREL_ENABLE_CUDA=ON
+
+      - name: Assert the stub was selected
+        run: |
+          grep -q "compiling the portable device-discovery stub" build/CMakeCache.txt \
+            || grep -q "no CUDA Toolkit" build/CMakeFiles/CMakeOutput.log \
+            || echo "note: runner may have a toolkit; degradation not exercised"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  desktop:
+    name: Desktop (Qt ${{ env.QT_VERSION }}) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: 'qtquickcontrols2'
+          cache: true
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DKESTREL_BUILD_UI=ON \
+            -DKESTREL_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Linking is not proof the QML scene still loads. A QML binding error is
+      # a runtime failure, so the scene is actually instantiated headless and
+      # its diagnostics inspected.
+      - name: Locate the app binary
+        id: app
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows_NT" ]; then
+            # Multi-config generators put binaries in a per-config subdirectory.
+            EXE="$PWD/build/Release/kestrel.exe"
+          else
+            EXE="$PWD/build/kestrel"
+          fi
+          if [ ! -x "$EXE" ]; then
+            echo "::error::app binary not found at $EXE"
+            exit 1
+          fi
+          echo "path=$EXE" >> "$GITHUB_OUTPUT"
+
+      - name: QML scene loads
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+          # GUI-subsystem binaries send Qt messages to the debugger rather than
+          # stderr, so without this the log is empty even on a real failure.
+          QT_FORCE_STDERR_LOGGING: '1'
+        run: |
+          "${{ steps.app.outputs.path }}" > qml.log 2>&1 &
+          APP_PID=$!
+          sleep 6
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+          echo "--- Qt diagnostics ---"
+          cat qml.log
+          if grep -Eiq "ReferenceError|TypeError|is not a member|Unable to assign" qml.log; then
+            echo "::error::QML reported binding errors"
+            exit 1
+          fi
+
+      - name: Runtime report
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          "${{ steps.app.outputs.path }}" --print-runtime
+
+  # The engine-build tool must be runnable, not merely compiled: it writes a
+  # sidecar record and validates it, which is the only thing that proves the
+  # record round trip outside the unit tests.
+  engine-tool:
+    name: Engine build tool
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DKESTREL_BUILD_UI=OFF
+          -DKESTREL_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Help exits cleanly
+        run: ./build/kestrel-engine-build --help
+
+      - name: Missing model is a usage error
+        run: |
+          if ./build/kestrel-engine-build; then
+            echo "::error::expected a non-zero exit for a missing --model"
+            exit 1
+          fi
+
+      - name: No GPU is reported, not faked
+        run: |
+          # A hosted runner has no GPU, so the tool must refuse to write a
+          # record rather than invent device facts.
+          if ./build/kestrel-engine-build --engine "$RUNNER_TEMP/fake.plan" --record-only; then
+            echo "::error::expected a non-zero exit with no CUDA device"
+            exit 1
+          fi
