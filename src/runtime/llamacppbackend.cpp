@@ -35,12 +35,13 @@ void ensureBackendInitialised() {
 // that it could not tokenize any prompt at all, and therefore generate nothing.
 int tokenizeInto(const llama_vocab* vocab,
                  std::string_view text,
-                 std::vector<llama_token>& out) {
+                 std::vector<llama_token>& out,
+                 bool addSpecial = true) {
     const char* data = text.data();
     const auto length = static_cast<int32_t>(text.size());
 
     int capacity = llama_tokenize(vocab, data, length, nullptr, 0,
-                                  /* add_special */ true, /* parse_special */ true);
+                                  /* add_special */ addSpecial, /* parse_special */ true);
     if (capacity < 0) {
         capacity = -capacity;
     }
@@ -50,7 +51,7 @@ int tokenizeInto(const llama_vocab* vocab,
 
     out.resize(static_cast<std::size_t>(capacity));
     const int written = llama_tokenize(vocab, data, length, out.data(), capacity,
-                                       /* add_special */ true, /* parse_special */ true);
+                                       /* add_special */ addSpecial, /* parse_special */ true);
     if (written < 0) {
         return 0;
     }
@@ -396,7 +397,7 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // Tokenize only this turn's prompt. The prefix is already in the context,
     // so including it here would both redo the work and double-count it.
     std::vector<llama_token> tokens;
-    if (tokenizeInto(vocab, request.prompt, tokens) <= 0) {
+    if (tokenizeInto(vocab, request.prompt, tokens, /* addSpecial */ prefixLength == 0) <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
         return;
     }

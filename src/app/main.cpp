@@ -80,17 +80,25 @@ int main(int argc, char* argv[]) {
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    // Load a model named on the command line before the window opens, so the
-    // first frame already shows the real runtime instead of flashing "no model"
-    // and then loading. It also makes the load path reachable without driving a
-    // native file dialog, which is what a scripted check has to do.
     const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
-    if (!modelArgument.isEmpty()) {
-        controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
-    }
-
-    if (arguments.contains(QStringLiteral("--print-runtime"))) {
+    const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
+    if (reportRuntime && modelArgument.isEmpty()) {
         return printRuntime(controller);
+    }
+    if (!modelArgument.isEmpty()) {
+        if (reportRuntime) {
+            QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
+                             &app, [&] { app.exit(printRuntime(controller)); },
+                             Qt::QueuedConnection);
+        }
+        // The controller loads on a worker and publishes the result on the UI
+        // thread. Start once the event loop can receive that completion.
+        QTimer::singleShot(0, &controller, [&controller, modelArgument] {
+            controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
+        });
+    }
+    if (reportRuntime) {
+        return app.exec();
     }
 
     // Development aid: KESTREL_DEMO=static seeds reviewable conversations,
