@@ -15,6 +15,10 @@
 # (Visual Studio, Qt, CUDA) and are intentionally not shared.
 /tools/
 
+# Third-party dependency caches (JunctionBox and friends). These are
+# machine-specific and must never be committed.
+.cache/
+
 # CMake and Qt generated files
 CMakeCache.txt
 CMakeFiles/
