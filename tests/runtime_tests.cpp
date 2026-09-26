@@ -1,6 +1,7 @@
 #include "runtime/backendregistry.h"
 #include "runtime/cudadevice.h"
 #include "runtime/engineartifact.h"
+#include "runtime/llamacppbackend.h"
 #include "runtime/mockbackend.h"
 #include "runtime/tensorrtbackend.h"
 
@@ -366,6 +367,67 @@ void testBackendSelectionAndDiagnostics() {
 
 } // namespace
 
+// Token counting is backend-driven so a loaded model reports exact numbers
+// rather than an estimate. These cover the shared fallback and the contract
+// backends inherit when they have no tokenizer.
+void testBackendDrivenTokenCounting() {
+    // Empty input costs nothing. A caller that treats 0 as "free" would
+    // otherwise under-count the whole prompt.
+    assert(runtime::MockBackend{}.countTokens("") == 0);
+
+    // The approximation must never report zero for non-empty text.
+    const std::string oneChar = "x";
+    assert(runtime::MockBackend{}.countTokens(oneChar) >= 1);
+
+    // Roughly four characters per token, so 400 characters is about 100
+    // tokens. The bound is deliberately loose: the exact value is a property
+    // of a real vocabulary, not of this fallback.
+    const std::string fourHundred(400, 'a');
+    const std::size_t estimate = runtime::MockBackend{}.countTokens(fourHundred);
+    assert(estimate >= 50 && estimate <= 200);
+
+    // Longer text must cost strictly more, or context accounting would not
+    // grow with the conversation.
+    const std::string eightHundred(800, 'a');
+    assert(runtime::MockBackend{}.countTokens(eightHundred) > estimate);
+
+    // A backend with no model must not claim a prompt is free.
+    runtime::LlamaCppBackend llama;
+    assert(llama.countTokens("") == 0);
+    assert(llama.countTokens(fourHundred) >= 1);
+
+    // Resetting usage must not throw and must leave the backend usable.
+    llama.resetContextUsage();
+    assert(llama.countTokens(fourHundred) >= 1);
+}
+
+// With no SDK linked, the GGUF backend has to say so instead of appearing
+// healthy. The registry depends on this to avoid selecting a dead backend.
+void testLlamaCppBackendReportsUnavailableWithoutSdk() {
+    runtime::LlamaCppBackend backend;
+    const runtime::RuntimeStatus status = backend.status();
+    assert(!status.modelLoaded);
+
+    std::string error;
+    assert(!backend.loadModel("model.gguf", error));
+    // The message must tell the user how to fix it, not just that it failed.
+    // In an SDK-linked build the failure is a real load attempt instead, so
+    // accept either explanation rather than pinning one configuration.
+    assert(!error.empty());
+    assert(error.find("KESTREL_ENABLE_LLAMA_CPP") != std::string::npos
+           || error.find("could not load") != std::string::npos);
+
+    bool completed = false;
+    backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
+                     [&completed, &backend](bool success, std::string_view) {
+                         // Without a loaded model every build must refuse.
+                         assert(!success);
+                         assert(!backend.status().modelLoaded);
+                         completed = true;
+                     });
+    assert(completed);
+}
+
 int main() {
     testVersionAndByteFormatting();
     testDeviceFormatting();
@@ -375,6 +437,8 @@ int main() {
     testEngineCompatibility();
     testTensorRtBackendValidatesEngine();
     testBackendSelectionAndDiagnostics();
+    testBackendDrivenTokenCounting();
+    testLlamaCppBackendReportsUnavailableWithoutSdk();
     std::printf("runtime tests passed\n");
     return 0;
 }
