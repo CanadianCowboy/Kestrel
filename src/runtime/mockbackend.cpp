@@ -29,7 +29,7 @@ bool MockBackend::loadModel(const std::string&, std::string&) {
 void MockBackend::generate(const GenerationRequest& request,
                            TokenCallback onToken,
                            CompletionCallback onComplete) {
-    m_cancelled = false;
+    m_cancelled.store(false, std::memory_order_release);
     const std::string response =
         "This is a local preview response. Kestrel's runtime boundary is ready for "
         "llama.cpp or TensorRT, and the focused workspace can be refined without a "
@@ -37,11 +37,11 @@ void MockBackend::generate(const GenerationRequest& request,
 
     std::istringstream words(response);
     std::string word;
-    while (words >> word && !m_cancelled) {
+    while (words >> word && !m_cancelled.load(std::memory_order_acquire)) {
         onToken(word + " ");
     }
 
-    if (m_cancelled) {
+    if (m_cancelled.load(std::memory_order_acquire)) {
         onComplete(false, "Generation stopped");
     } else {
         onComplete(true, {});
@@ -49,7 +49,7 @@ void MockBackend::generate(const GenerationRequest& request,
 }
 
 void MockBackend::cancel() {
-    m_cancelled = true;
+    m_cancelled.store(true, std::memory_order_release);
 }
 
 } // namespace kestrel::runtime

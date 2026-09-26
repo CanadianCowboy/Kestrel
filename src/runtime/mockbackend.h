@@ -2,6 +2,8 @@
 
 #include "runtime/modelbackend.h"
 
+#include <atomic>
+
 namespace kestrel::runtime {
 
 class MockBackend final : public ModelBackend {
@@ -15,7 +17,9 @@ public:
     void cancel() override;
 
 private:
-    bool m_cancelled = false;
+    // Written by cancel() on the UI thread while generate() polls it on the
+    // worker thread, so this must be atomic rather than a plain bool.
+    std::atomic<bool> m_cancelled{false};
 };
 
 } // namespace kestrel::runtime

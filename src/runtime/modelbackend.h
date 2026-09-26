@@ -33,6 +33,20 @@ struct RuntimeStatus {
 using TokenCallback = std::function<void(std::string_view token)>;
 using CompletionCallback = std::function<void(bool success, std::string_view error)>;
 
+// Threading contract for every ModelBackend implementation:
+//
+//   * generate() blocks until the response finishes or is cancelled. It is
+//     always called from a worker thread, never from the UI thread.
+//   * The onToken and onComplete callbacks run on that same worker thread.
+//     Callers marshal them back to the UI thread themselves.
+//   * cancel() is the only method that may be called from the UI thread
+//     while generate() is running on a worker. Implementations must make it
+//     safe under that concurrency: an atomic flag, or a driver call the
+//     backend's own API permits from another thread. A plain bool is a data
+//     race, not a working implementation.
+//   * Cancellation is cooperative. generate() must poll its flag between
+//     tokens so that cancel() takes effect promptly; a backend parked in one
+//     long GPU call cannot be interrupted until that call returns.
 class ModelBackend {
 public:
     virtual ~ModelBackend() = default;
