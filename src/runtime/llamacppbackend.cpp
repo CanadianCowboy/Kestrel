@@ -66,12 +66,15 @@ struct LlamaCppBackend::Impl {
     std::string modelPath;
 };
 
+// Initialises the process-global llama.cpp library once and starts this
+// backend with empty model/context state.
 LlamaCppBackend::LlamaCppBackend() {
     ensureBackendInitialised();
     m_impl = std::make_unique<Impl>();
     m_status.detail = "llama.cpp linked; no model loaded";
 }
 
+// Frees any loaded context and model before this backend is destroyed.
 LlamaCppBackend::~LlamaCppBackend() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_impl) {
@@ -86,15 +89,19 @@ LlamaCppBackend::~LlamaCppBackend() {
     }
 }
 
+// Identifies this as the llama.cpp backend.
 BackendKind LlamaCppBackend::kind() const noexcept {
     return BackendKind::LlamaCpp;
 }
 
+// Returns a snapshot of the current status under lock.
 RuntimeStatus LlamaCppBackend::status() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_status;
 }
 
+// Loads the GGUF model at `modelPath`, replacing any previously loaded model
+// and context. Returns false with `error` set on failure.
 bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -151,6 +158,8 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     return true;
 }
 
+// Recomputes m_status from the current model/context state. Caller must
+// hold m_mutex.
 void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
@@ -173,6 +182,8 @@ void LlamaCppBackend::refreshStatus() {
     m_status.available = true;
 }
 
+// Returns the token count for `text`, using the real tokenizer when a model
+// is loaded and falling back to the shared approximation otherwise.
 std::size_t LlamaCppBackend::countTokens(std::string_view text) const {
     if (text.empty()) {
         return 0;
@@ -185,6 +196,8 @@ std::size_t LlamaCppBackend::countTokens(std::string_view text) const {
     return ModelBackend::countTokens(text);
 }
 
+// Tokenizes `text` with the loaded model's vocabulary, or returns 0 if no
+// model is loaded.
 std::size_t LlamaCppBackend::countTokensImpl(std::string_view text) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_impl == nullptr || m_impl->model == nullptr) {
@@ -195,12 +208,15 @@ std::size_t LlamaCppBackend::countTokensImpl(std::string_view text) const {
         tokenizeInto(llama_model_get_vocab(m_impl->model), text, tokens));
 }
 
+// Clears the tracked context usage back to zero.
 void LlamaCppBackend::resetContextUsage() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_contextUsed = 0;
     refreshStatus();
 }
 
+// Generates a completion for `request`, streaming each produced token to
+// `onToken` and reporting the final outcome to `onComplete`.
 void LlamaCppBackend::generate(const GenerationRequest& request,
                                TokenCallback onToken,
                                CompletionCallback onComplete) {
@@ -353,42 +369,52 @@ void LlamaCppBackend::cancel() {
 
 struct LlamaCppBackend::Impl {};
 
+// No llama.cpp state to initialise or release when the library isn't linked.
 LlamaCppBackend::LlamaCppBackend() = default;
 LlamaCppBackend::~LlamaCppBackend() = default;
 
+// Identifies this as the llama.cpp backend, even though it is unavailable.
 BackendKind LlamaCppBackend::kind() const noexcept {
     return BackendKind::LlamaCpp;
 }
 
+// Returns the fixed "unavailable" status for a build without llama.cpp.
 RuntimeStatus LlamaCppBackend::status() const {
     return m_status;
 }
 
+// Always fails: llama.cpp is not linked in this build.
 bool LlamaCppBackend::loadModel(const std::string&, std::string& error) {
     error = "llama.cpp is not linked in this build. Configure with "
             "-DKESTREL_ENABLE_LLAMA_CPP=ON -DKESTREL_LLAMA_CPP_ROOT=<path> and rebuild.";
     return false;
 }
 
+// Always fails: llama.cpp is not linked in this build.
 void LlamaCppBackend::generate(const GenerationRequest&, TokenCallback,
                                CompletionCallback onComplete) {
     onComplete(false, "llama.cpp is not linked in this build");
 }
 
+// No tokenizer is available, so this falls back to the shared approximation.
 std::size_t LlamaCppBackend::countTokens(std::string_view text) const {
     return ModelBackend::countTokens(text);
 }
 
+// Clears the tracked context usage back to zero.
 void LlamaCppBackend::resetContextUsage() {
     m_contextUsed = 0;
 }
 
+// No live model/context state to refresh in this stub.
 void LlamaCppBackend::refreshStatus() {}
 
+// Always 0: no tokenizer is available without llama.cpp.
 std::size_t LlamaCppBackend::countTokensImpl(std::string_view) const {
     return 0;
 }
 
+// Records a cancellation request; there is nothing running to stop.
 void LlamaCppBackend::cancel() {
     m_cancelled.store(true, std::memory_order_release);
 }

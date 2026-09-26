@@ -48,6 +48,8 @@ void testConversationBasics() {
     assert(conversation.size() == 0);
 }
 
+// Exercises the mock backend's generation, context accounting, and the
+// (deliberate) absence of a fabricated throughput figure.
 void testMockBackend() {
     runtime::MockBackend backend;
     assert(backend.status().available);

@@ -22,7 +22,10 @@ namespace kestrel::runtime {
 // store, matching the ModelBackend contract.
 class LlamaCppBackend final : public ModelBackend {
 public:
+    // Initialises the llama.cpp library (when linked) and constructs empty
+    // model/context state; no model is loaded yet.
     LlamaCppBackend();
+    // Releases any loaded context and model.
     ~LlamaCppBackend() override;
 
     LlamaCppBackend(const LlamaCppBackend&) = delete;
@@ -39,6 +42,7 @@ public:
     // Real tokenizer when a model is loaded. Falls back to the shared
     // approximation otherwise, so callers always get a usable number.
     [[nodiscard]] std::size_t countTokens(std::string_view text) const override;
+    // Clears the tracked context usage back to zero.
     void resetContextUsage() override;
 
 private:
@@ -46,8 +50,11 @@ private:
     // wrapper so this header never mentions a llama type.
     struct Impl;
 
+    // Recomputes m_status from the current model/context state.
     // Caller must hold m_mutex.
     void refreshStatus();
+    // Tokenizes `text` with the loaded model's vocabulary, or returns 0 if no
+    // model is loaded. Caller must hold m_mutex.
     [[nodiscard]] std::size_t countTokensImpl(std::string_view text) const;
 
     mutable std::mutex m_mutex;
