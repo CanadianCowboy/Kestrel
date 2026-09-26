@@ -2,7 +2,9 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QQuickWindow>
 #include <QTextStream>
+#include <QTimer>
 
 #include "app/appcontroller.h"
 #include "runtime/backendregistry.h"
@@ -44,18 +46,28 @@ int main(int argc, char* argv[]) {
     QGuiApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("Kestrel"));
     app.setOrganizationName(QStringLiteral("Kestrel"));
+    app.setApplicationVersion(QStringLiteral("0.1.0"));
 
     // Kestrel draws its own controls: every Button in the QML overrides
     // contentItem and background. The native Windows style silently ignores
-    // those overrides, which drops the intended soft-glass look and makes Qt
-    // emit customization warnings. Basic is the non-native style that honours
-    // them, and it has to be selected before the QML is loaded.
+    // those overrides, which drops the intended look and makes Qt emit
+    // customization warnings. Basic is the non-native style that honours
+    // them, and it must be selected before the QML is loaded.
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
     kestrel::app::AppController controller;
+
     const QStringList arguments = QGuiApplication::arguments();
     if (arguments.contains(QStringLiteral("--print-runtime"))) {
         return printRuntime(controller);
+    }
+
+    // Development aid: KESTREL_DEMO=static seeds reviewable conversations,
+    // KESTREL_DEMO=live additionally starts a streaming response, so the UI
+    // can be exercised and captured without manual interaction.
+    const QString demoMode = qEnvironmentVariable("KESTREL_DEMO");
+    if (!demoMode.isEmpty()) {
+        controller.seedDemoContent(demoMode == QLatin1String("live"));
     }
 
     QQmlApplicationEngine engine;
@@ -66,5 +78,19 @@ int main(int argc, char* argv[]) {
         QTextStream(stderr) << "Kestrel failed to load its QML scene.\n";
         return 1;
     }
+
+    // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
+    // window shortly after startup and exits. Works together with
+    // QT_QPA_PLATFORM=offscreen for display-less UI review.
+    const QString screenshotPath = qEnvironmentVariable("KESTREL_SCREENSHOT");
+    if (!screenshotPath.isEmpty()) {
+        QTimer::singleShot(1600, &app, [&engine, &app, screenshotPath] {
+            if (auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0))) {
+                window->grabWindow().save(screenshotPath);
+            }
+            app.quit();
+        });
+    }
+
     return app.exec();
 }
