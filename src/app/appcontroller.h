@@ -95,6 +95,15 @@ public:
     explicit AppController(QObject* parent = nullptr);
     ~AppController() override;
 
+    // Test seam: adopt a backend supplied by the caller instead of selecting
+    // one. Ownership remains with the parameter until the worker is idle.
+    //
+    // The constructor cannot take a backend because QML creates this object,
+    // but the send path (controller -> worker -> backend -> message model) is
+    // exactly the part with no coverage, and it cannot be covered without
+    // choosing which backend drives it.
+    void setBackendForTesting(std::unique_ptr<runtime::ModelBackend> backend);
+
     [[nodiscard]] MessageModel* messages() const noexcept;
     [[nodiscard]] ConversationModel* conversations() const noexcept;
     [[nodiscard]] int activeConversationId() const noexcept;
@@ -156,7 +165,7 @@ public:
     Q_INVOKABLE void deleteConversation(int id);
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
-    /// Loads a GGUF from disk and switches the app onto it. Takes the URL a
+    /// Loads a GGUF on a worker thread and switches the app onto it when ready. Takes the URL a
     /// FileDialog hands back rather than a raw path, because QML file dialogs
     /// speak in URLs and converting here is far more reliable than string
     /// surgery on the percent-encoded form.
@@ -185,6 +194,7 @@ signals:
     void systemPromptChanged();
     /// Notifies observers that a model-switch attempt updated or cleared the error.
     void modelErrorChanged();
+    void modelLoadFinished();
     void metricsChanged();
     void voiceChanged();
 
@@ -232,6 +242,8 @@ private:
     // The controller owns the thread so shutdown order is explicit: cancel the
     // work, stop the loop, wait for it, and only then destroy the worker.
     QThread m_generationThread;
+    std::unique_ptr<QThread> m_modelLoadThread;
+    bool m_discardModelLoad = false;
     GenerationWorker* m_worker = nullptr;
 
     std::vector<std::unique_ptr<ConversationEntry>> m_entries;

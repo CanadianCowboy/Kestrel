@@ -7,22 +7,30 @@
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QDir>
 #include <QEventLoop>
 #include <QObject>
 #include <QStringList>
 #include <QThread>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QUrl>
 
 #include <atomic>
 #include <iostream>
+#include <mutex>
+#include <vector>
 #include <thread>
 
+#include "app/appcontroller.h"
 #include "app/generationworker.h"
+#include "app/messagemodel.h"
+#include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
 
 namespace {
 
+using kestrel::app::AppController;
 using kestrel::app::GenerationWorker;
 using kestrel::runtime::BackendKind;
 using kestrel::runtime::GenerationRequest;
@@ -45,9 +53,13 @@ public:
 
     bool loadModel(const std::string&, std::string&) override { return true; }
 
-    void generate(const GenerationRequest&,
+    void generate(const GenerationRequest& request,
                   kestrel::runtime::TokenCallback onToken,
                   kestrel::runtime::CompletionCallback onComplete) override {
+        {
+            std::lock_guard<std::mutex> lock(m_requestsMutex);
+            m_requests.push_back(request);
+        }
         m_generateThread = std::this_thread::get_id();
         m_cancelled.store(false, std::memory_order_release);
         for (int i = 0; i < m_tokenCount; ++i) {
@@ -71,7 +83,14 @@ public:
         return m_tokensEmitted.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] std::vector<GenerationRequest> requests() const {
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        return m_requests;
+    }
+
 private:
+    mutable std::mutex m_requestsMutex;
+    std::vector<GenerationRequest> m_requests;
     int m_tokenCount;
     int m_delayMs;
     std::atomic<bool> m_cancelled{false};
@@ -291,13 +310,151 @@ void testWorkerFollowsTheSwappedBackend() {
     thread.wait();
 }
 
+// The path a user actually takes: type a message, the controller assembles a
+// prompt, the worker generates on its own thread, and the reply streams back
+// into the message model. Every layer of that had a test except the glue, and
+// the glue is where a real user lives.
+void testSendMessageProducesAReply() {
+    std::cout << "sendMessage streams a reply back into the model\n";
+
+    kestrel::app::AppController controller;
+    // The mock, deliberately: the backend's own generation is covered against
+    // a real GGUF elsewhere. This test is about the wiring, so it uses the one
+    // backend whose output is deterministic enough to assert on exactly.
+    //
+    // Transfer ownership directly so failure cannot leave two owners.
+    auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    controller.setBackendForTesting(std::move(backend));
+
+    check(controller.messages() != nullptr, "the message model is exposed");
+    check(controller.messages()->rowCount() == 0, "a new conversation starts empty");
+
+    controller.sendMessage(QStringLiteral("Hello there"));
+    check(controller.generating(), "sending a message starts generation");
+
+    // Pump the real event loop until the stream finishes, exactly as the UI
+    // would. A bounded wait, so a wedged backend fails the test rather than
+    // hanging CI.
+    QEventLoop loop;
+    QObject::connect(&controller, &AppController::metricsChanged, &loop, [&] {
+        if (!controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    check(!controller.generating(), "generation finished");
+    check(controller.messages()->rowCount() == 2, "the user message and the reply are both present");
+
+    kestrel::app::MessageModel* messages = controller.messages();
+    const QString reply = messages->data(messages->index(1, 0),
+                                         kestrel::app::MessageModel::ContentRole).toString();
+    check(!reply.isEmpty(), "the reply has content");
+
+    // The status column is what the UI renders a spinner or an error note
+    // from, so an empty reply that still says "streaming" would look like a
+    // hung app rather than a failure.
+    const auto status = messages->data(messages->index(1, 0),
+                                       kestrel::app::MessageModel::StatusRole).toString();
+    check(status == kestrel::app::toStatusString(kestrel::app::MessageStatus::Complete),
+          "the reply is marked complete, not left streaming");
+
+    // The prompt the controller assembled must carry the conversation, or the
+    // model would have no memory of the message that was just sent.
+    check(controller.contextLimit() > 0, "the context window is reported");
+    check(controller.contextUsed() > 0, "context usage advanced after the turn");
+}
+
+// Pause after text is delivered, then inspect the request actually received by
+// the backend. This covers both the history boundary and the continuation form.
+void testResumeUsesPartialAssistantPrompt() {
+    std::cout << "resume sends an open assistant turn\n";
+    AppController controller;
+    auto backend = std::make_unique<SlowBackend>(4, 0);
+    auto* observed = backend.get();
+    controller.setBackendForTesting(std::move(backend));
+    bool paused = false;
+    const auto pauseConnection = QObject::connect(
+        &controller, &AppController::metricsChanged, &controller, [&] {
+            if (!paused && controller.generating() && controller.tokensGenerated() > 0) {
+                paused = true;
+                controller.pauseConversation();
+            }
+        });
+    auto waitForIdle = [&] {
+        QEventLoop loop;
+        QObject::connect(&controller, &AppController::generatingChanged, &loop, [&] {
+            if (!controller.generating()) {
+                loop.quit();
+            }
+        });
+        QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+        if (controller.generating()) {
+            loop.exec();
+        }
+        check(!controller.generating(), "worker reaches idle");
+    };
+    controller.sendMessage(QStringLiteral("unique current turn"));
+    waitForIdle();
+    QObject::disconnect(pauseConnection);
+    check(paused && controller.canResume(), "partial response can resume");
+    const QString suffix = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::ContentRole).toString();
+    check(!suffix.isEmpty(), "resume has an unspoken suffix");
+    controller.resumeConversation();
+    waitForIdle();
+    const auto requests = observed->requests();
+    check(requests.size() == 2, "resume starts a second generation");
+    if (requests.size() == 2) {
+        check(requests[0].prompt == "User: unique current turn\nAssistant:",
+              "history contains the current user turn exactly once");
+        check(requests[1].prompt == "Assistant: " + suffix.toStdString(),
+              "suffix stays in an open assistant turn without another cue");
+    }
+}
+
+void testModelLoadReportsAsynchronously() {
+    std::cout << "model loading reports back on the controller thread\n";
+    QTemporaryFile file(QDir::tempPath() + QStringLiteral("/kestrel model-XXXXXX.gguf"));
+    check(file.open(), "temporary invalid GGUF is created");
+    file.close();
+    AppController controller;
+    const QString originalBackend = controller.backendName();
+    bool finished = false;
+    bool onUiThread = false;
+    QEventLoop loop;
+    QObject::connect(&controller, &AppController::modelLoadFinished, &loop, [&] {
+        finished = true;
+        onUiThread = QThread::currentThread() == controller.thread();
+        loop.quit();
+    });
+    controller.loadModelFromUrl(QUrl::fromLocalFile(file.fileName()).toString());
+    check(!finished && controller.modelError().isEmpty(),
+          "loading returns before publishing its result");
+    QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+    loop.exec();
+    check(finished, "model load completion is delivered");
+    check(onUiThread, "model load completion runs on the UI thread");
+    check(!controller.modelError().isEmpty(), "invalid model reports a load error");
+    check(controller.backendName() == originalBackend && controller.modelPath().isEmpty(),
+          "failed load preserves the current backend");
+}
+
 /// Runs the Qt worker and file-URL tests; returns nonzero if any check fails.
 int main(int argc, char** argv) {
+    // Unbuffered, so a crash still shows how far the run got. A lost buffer
+    // turns a five-second diagnosis into a guess about which test died.
+    std::cout << std::unitbuf;
+
     QCoreApplication app(argc, argv);
     testGenerationRunsOffCallingThread();
     testCancelStopsInFlightGeneration();
     testFileDialogUrlBecomesALocalPath();
     testWorkerFollowsTheSwappedBackend();
+    testSendMessageProducesAReply();
+    testResumeUsesPartialAssistantPrompt();
+    testModelLoadReportsAsynchronously();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

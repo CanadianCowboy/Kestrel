@@ -90,6 +90,9 @@ AppController::~AppController() {
     // Order matters: cancel so a blocked generate() returns, then stop the event
     // loop, then wait. Only once the thread is idle is it safe to destroy an
     // object whose affinity was that thread.
+    if (m_modelLoadThread) {
+        m_modelLoadThread->wait();
+    }
     m_worker->cancel();
     m_generationThread.quit();
     m_generationThread.wait();
@@ -287,6 +290,28 @@ QString AppController::systemPrompt() const {
     return m_systemPrompt;
 }
 
+/// Retains ownership while waiting for the in-flight generation to finish.
+void AppController::setBackendForTesting(std::unique_ptr<runtime::ModelBackend> backend) {
+    if (backend == nullptr) {
+        return;
+    }
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    if (m_generating) {
+        return;
+    }
+    m_backend = std::move(backend);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    // The snapshot must be refreshed here for the same reason every other
+    // backend swap does it: the getters read the cache, so a test that
+    // installs a backend and then asks what is loaded would otherwise be told
+    // about the backend that was replaced.
+    refreshCachedRuntime();
+    rebuildDiagnostics();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
 /// Trims and stores changed instruction text, updates the backend, and publishes metrics.
 void AppController::setSystemPrompt(const QString& text) {
     const QString trimmed = text.trimmed();
@@ -319,78 +344,76 @@ QString AppController::modelError() const {
     return m_modelError;
 }
 
-/// Loads a local GGUF URL synchronously before attempting to replace the backend.
+/// Loads a candidate off the UI thread, then installs it through a queued signal.
 /// Keeps the current backend on validation/load failure or if generation remains active.
 void AppController::loadModelFromUrl(const QString& url) {
-    const QString path = QUrl(url).toLocalFile();
-    if (path.isEmpty()) {
-        // A dialog can hand back an empty selection, and a non-file URL (a
-        // remote location) has no local path at all. Both are user error, not
-        // a crash, so say so rather than passing "" to the loader.
-        m_modelError = tr("That is not a local file. Choose a GGUF from disk.");
-        emit modelErrorChanged();
+    if (m_modelLoadThread) {
         return;
     }
-
-    const QFileInfo info(path);
-    if (!info.exists() || !info.isFile()) {
-        m_modelError = tr("No such file: %1").arg(path);
-        emit modelErrorChanged();
-        return;
-    }
-    // Checking the extension first turns a typo into a clear message instead of
-    // an opaque loader failure deep inside llama.cpp.
-    if (info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) != 0) {
-        m_modelError = tr("%1 is not a GGUF file.").arg(info.fileName());
-        emit modelErrorChanged();
-        return;
-    }
-
-    // Build and load the candidate before touching the running backend, so a
-    // failed attempt leaves the app exactly as it was. Loading a model takes
-    // seconds; finding out afterwards that it was the wrong file should not
-    // cost the user their current one.
-    auto candidate = std::make_unique<runtime::LlamaCppBackend>();
-    if (!candidate->status().available) {
-        m_modelError = QString::fromStdString(candidate->status().detail);
-        emit modelErrorChanged();
-        return;
-    }
-
-    std::string error;
-    if (!candidate->loadModel(path.toStdString(), error)) {
-        m_modelError = QString::fromStdString(error);
-        emit modelErrorChanged();
-        return;
-    }
-
-    // The new model is proven loadable. Now it is safe to tear the old one
-    // down -- but only once the worker has left it.
-    waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating) {
-        m_modelError = tr("A response is still running. Stop it and try again.");
-        emit modelErrorChanged();
-        return;
-    }
-
-    m_modelPath = path;
-    m_modelError.clear();
-    m_backend = std::move(candidate);
-    m_worker->setBackend(m_backend.get());
-    // The new context holds none of the old prefix's entries, so re-declare it
-    // and let the backend rebuild the cache on the next turn.
-    m_backend->clearSharedPrefix();
-    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
-    refreshCachedRuntime();
-    rebuildDiagnostics();
-    emit modelErrorChanged();
-    emit runtimeChanged();
-    emit metricsChanged();
+    struct LoadResult {
+        QString path;
+        QString error;
+        std::unique_ptr<runtime::LlamaCppBackend> candidate;
+    };
+    auto result = std::make_shared<LoadResult>();
+    m_discardModelLoad = false;
+    m_modelLoadThread.reset(QThread::create([url, result] {
+        result->path = QUrl(url).toLocalFile();
+        if (result->path.isEmpty()) {
+            result->error = tr("That is not a local file. Choose a GGUF from disk.");
+            return;
+        }
+        const QFileInfo info(result->path);
+        if (!info.exists() || !info.isFile()) {
+            result->error = tr("No such file: %1").arg(result->path);
+            return;
+        }
+        if (info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) != 0) {
+            result->error = tr("%1 is not a GGUF file.").arg(info.fileName());
+            return;
+        }
+        result->candidate = std::make_unique<runtime::LlamaCppBackend>();
+        if (!result->candidate->status().available) {
+            result->error = QString::fromStdString(result->candidate->status().detail);
+            return;
+        }
+        std::string error;
+        if (!result->candidate->loadModel(result->path.toStdString(), error)) {
+            result->error = QString::fromStdString(error);
+        }
+    }));
+    connect(m_modelLoadThread.get(), &QThread::finished, this, [this, result] {
+        m_modelLoadThread->wait();
+        if (!m_discardModelLoad && result->error.isEmpty()) {
+            waitForIdleGeneration(kBackendSwapTimeoutMs);
+            if (m_generating) {
+                result->error = tr("A response is still running. Stop it and try again.");
+            }
+        }
+        if (!m_discardModelLoad) {
+            m_modelError = result->error;
+            if (m_modelError.isEmpty()) {
+                m_modelPath = result->path;
+                m_backend = std::move(result->candidate);
+                m_worker->setBackend(m_backend.get());
+                m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+                refreshCachedRuntime();
+                rebuildDiagnostics();
+                emit runtimeChanged();
+                emit metricsChanged();
+            }
+            emit modelErrorChanged();
+        }
+        m_modelLoadThread.reset();
+        emit modelLoadFinished();
+    }, Qt::QueuedConnection);
+    m_modelLoadThread->start();
 }
 
 /// Cancels generation and switches to the mock backend only once idle.
 /// Preserves the declared system prompt and reports a timeout through modelError().
 void AppController::usePreviewBackend() {
+    m_discardModelLoad = true;
     waitForIdleGeneration(kBackendSwapTimeoutMs);
     if (m_generating) {
         m_modelError = tr("A response is still running. Stop it and try again.");
@@ -701,8 +724,11 @@ void AppController::resumeConversation() {
         const core::VoiceResponse* response = m_voice.find(m_activeResponse);
         const std::string_view remainder =
             response != nullptr ? response->unspokenText() : std::string_view{};
-        m_worker->start(m_activeRequestId, QString::fromStdString(std::string(remainder)),
-                        0.7F, 512);
+        // Requests carry rendered text in this runtime. Leave the assistant
+        // turn open: no user label, turn terminator, or second generation cue.
+        const QString continuation = QStringLiteral("Assistant: ")
+            + QString::fromUtf8(remainder.data(), static_cast<int>(remainder.size()));
+        m_worker->start(m_activeRequestId, continuation, 0.7F, 512);
         return;
     }
 

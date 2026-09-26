@@ -205,13 +205,25 @@ if(KESTREL_BUILD_UI)
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
         if(KESTREL_BUILD_TESTS)
+            # AppController is compiled in rather than linked from the app
+            # executable, so the send path can be driven end to end: the
+            # controller picks a backend, assembles a prompt, hands it to the
+            # worker thread, and streams the reply back into the message model.
+            # Without this, every layer is tested except the one the user uses.
             add_executable(kestrel_app_tests
                 tests/app_tests.cpp
                 src/app/generationworker.cpp
                 src/app/generationworker.h
+                src/app/appcontroller.cpp
+                src/app/appcontroller.h
+                src/app/messagemodel.cpp
+                src/app/messagemodel.h
+                src/app/conversationmodel.cpp
+                src/app/conversationmodel.h
+                src/app/conversationentry.h
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
-            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core)
+            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui)
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
 
             # A Qt-linked test needs Qt's DLLs resolvable at run time. CMake does

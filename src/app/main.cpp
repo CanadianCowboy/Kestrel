@@ -5,6 +5,7 @@
 #include <QQuickWindow>
 #include <QTextStream>
 #include <QTimer>
+#include <QUrl>
 
 #include "app/appcontroller.h"
 #include "runtime/backendregistry.h"
@@ -36,8 +37,28 @@ int printRuntime(const kestrel::app::AppController& controller) {
             << entry.value(QStringLiteral("label")).toString() << ": "
             << entry.value(QStringLiteral("value")).toString() << "\n";
     }
+    if (!controller.modelPath().isEmpty()) {
+        out << "  model path   : " << controller.modelPath() << "\n";
+    }
+    if (!controller.modelError().isEmpty()) {
+        out << "  model error  : " << controller.modelError() << "\n";
+    }
     out.flush();
-    return 0;
+    // A model that was asked for and did not load is a failure, not a report.
+    // This is what lets the load path be checked without opening a window.
+    return controller.modelError().isEmpty() ? 0 : 1;
+}
+
+// The value following `flag`, or empty when the flag is absent, is last, or is
+// followed by another flag. A flag with no value must not silently swallow the
+// next one and report a nonsense path.
+QString valueAfter(const QStringList& arguments, const QString& flag) {
+    const int index = arguments.indexOf(flag);
+    if (index < 0 || index + 1 >= arguments.size()) {
+        return {};
+    }
+    const QString value = arguments.at(index + 1);
+    return value.startsWith(QStringLiteral("--")) ? QString() : value;
 }
 
 } // namespace
@@ -58,8 +79,26 @@ int main(int argc, char* argv[]) {
     kestrel::app::AppController controller;
 
     const QStringList arguments = QGuiApplication::arguments();
-    if (arguments.contains(QStringLiteral("--print-runtime"))) {
+
+    const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
+    const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
+    if (reportRuntime && modelArgument.isEmpty()) {
         return printRuntime(controller);
+    }
+    if (!modelArgument.isEmpty()) {
+        if (reportRuntime) {
+            QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
+                             &app, [&] { app.exit(printRuntime(controller)); },
+                             Qt::QueuedConnection);
+        }
+        // The controller loads on a worker and publishes the result on the UI
+        // thread. Start once the event loop can receive that completion.
+        QTimer::singleShot(0, &controller, [&controller, modelArgument] {
+            controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
+        });
+    }
+    if (reportRuntime) {
+        return app.exec();
     }
 
     // Development aid: KESTREL_DEMO=static seeds reviewable conversations,
