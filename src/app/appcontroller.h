@@ -75,6 +75,13 @@ class AppController final : public QObject {
     // backend decodes it once and keeps it resident rather than resending it.
     Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt NOTIFY systemPromptChanged)
 
+    // Loading a model from disk, so the app is not stuck on the mock preview.
+    Q_PROPERTY(bool canLoadModel READ canLoadModel NOTIFY runtimeChanged)
+    Q_PROPERTY(QString modelPath READ modelPath NOTIFY runtimeChanged)
+    // Why the last load attempt failed, empty when it succeeded. Shown next to
+    // the picker so a failure is visible rather than silently ignored.
+    Q_PROPERTY(QString modelError READ modelError NOTIFY runtimeChanged)
+
     // GPU facts, sourced from a real CUDA probe rather than assumed.
     Q_PROPERTY(bool gpuAvailable READ gpuAvailable NOTIFY runtimeChanged)
     Q_PROPERTY(QString gpuName READ gpuName NOTIFY runtimeChanged)
@@ -93,6 +100,9 @@ public:
     [[nodiscard]] int activeConversationId() const noexcept;
     [[nodiscard]] QString conversationTitle() const;
     [[nodiscard]] QString systemPrompt() const;
+    [[nodiscard]] bool canLoadModel() const;
+    [[nodiscard]] QString modelPath() const;
+    [[nodiscard]] QString modelError() const;
     [[nodiscard]] bool generating() const noexcept;
     [[nodiscard]] bool canRegenerate() const noexcept;
     [[nodiscard]] bool sidebarOpen() const noexcept;
@@ -139,6 +149,14 @@ public:
     Q_INVOKABLE void deleteConversation(int id);
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
+    // Loads a GGUF from disk and switches the app onto it. Takes the URL a
+    // FileDialog hands back rather than a raw path, because QML file dialogs
+    // speak in URLs and converting here is far more reliable than string
+    // surgery on the percent-encoded form.
+    Q_INVOKABLE void loadModelFromUrl(const QString& url);
+    // Goes back to the built-in preview backend, so a user who loaded the
+    // wrong file is not stuck with it.
+    Q_INVOKABLE void usePreviewBackend();
     // Re-runs device discovery. Probing is cheap, but it is a driver call, so
     // it is explicit rather than happening on every property read.
     Q_INVOKABLE void refreshRuntime();
@@ -157,6 +175,7 @@ signals:
     void runtimeChanged();
     void diagnosticsOpenChanged();
     void systemPromptChanged();
+    void modelErrorChanged();
     void metricsChanged();
     void voiceChanged();
 
@@ -177,6 +196,13 @@ private:
     // followed by an assistant cue. The shared system prompt is excluded on
     // purpose, because the backend keeps it as a cached prefix.
     [[nodiscard]] QString buildPrompt(const QString& userText) const;
+
+    // Spins the UI event loop until the in-flight generation reports back, or
+    // the timeout expires. Needed before swapping or destroying a backend,
+    // because the worker is inside the old backend's generate() right now and
+    // that backend is about to go away. Bounded, so a wedged backend cannot
+    // freeze the window.
+    void waitForIdleGeneration(int timeoutMs);
 
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
@@ -204,6 +230,8 @@ private:
     bool m_diagnosticsOpen = false;
     QString m_searchQuery;
     QString m_systemPrompt;
+    QString m_modelPath;
+    QString m_modelError;
 
     // Live metrics. Token count and the clock are the basis for throughput;
     // the clock only runs while a response is generating.

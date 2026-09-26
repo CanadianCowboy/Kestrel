@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 ApplicationWindow {
     id: window
@@ -145,6 +146,32 @@ ApplicationWindow {
                                 Text { text: appController.modelName; color: window.ink; font.pixelSize: 12 }
                             }
                             Text { text: appController.backendName; color: window.muted; font.pixelSize: 11 }
+                            // Loading a model from disk, so the app is not stuck
+                            // previewing canned text. Hidden entirely in a build
+                            // that cannot load a real model, rather than offered
+                            // and then refused.
+                            Row {
+                                spacing: 8
+                                visible: appController.canLoadModel
+                                Button {
+                                    id: loadModelButton
+                                    text: appController.modelPath.length > 0 ? "Change model" : "Load model"
+                                    onClicked: modelDialog.open()
+                                }
+                                Button {
+                                    text: "Preview"
+                                    visible: appController.modelPath.length > 0
+                                    onClicked: appController.usePreviewBackend()
+                                }
+                            }
+                            Text {
+                                visible: appController.modelError.length > 0
+                                text: appController.modelError
+                                color: "#c08a95"
+                                font.pixelSize: 11
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
                             Text {
                                 text: appController.gpuAvailable ? appController.gpuSummary : "No GPU detected"
                                 color: appController.gpuAvailable ? window.muted : "#b5909c"
@@ -593,5 +620,16 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    // Native picker for a GGUF on disk. The URL is handed straight to the
+    // controller, which does the local-path conversion; doing that in C++ is
+    // far more dependable than trimming "file:///" off a percent-encoded
+    // string, which is wrong on Windows and for any path containing a space.
+    FileDialog {
+        id: modelDialog
+        title: "Choose a GGUF model"
+        nameFilters: ["GGUF models (*.gguf)", "All files (*)"]
+        onAccepted: appController.loadModelFromUrl(selectedFile.toString())
     }
 }

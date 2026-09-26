@@ -59,4 +59,10 @@ void GenerationWorker::cancel() {
     }
 }
 
+void GenerationWorker::setBackend(runtime::ModelBackend* backend) {
+    // Borrowed, exactly as in the constructor. The caller owns the lifetime and
+    // is responsible for having no generation in flight.
+    m_backend = backend;
+}
+
 } // namespace kestrel::app
