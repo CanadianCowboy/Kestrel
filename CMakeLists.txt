@@ -193,6 +193,7 @@ if(KESTREL_BUILD_UI)
             VERSION 1.0
             QML_FILES
                 src/ui/Main.qml
+                src/ui/MessageBubble.qml
         )
 
         target_link_libraries(kestrel PRIVATE
@@ -226,6 +227,26 @@ if(KESTREL_BUILD_UI)
             target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui)
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
 
+            # Geometry tests for the QML itself. The app test proves a reply
+            # arrives; nothing proves the reply is legible, which is how a
+            # bubble sized to four pixels could sit in the tree passing every
+            # test. This loads src/ui/MessageBubble.qml and asserts the numbers
+            # a user would see, so a layout regression is a failed build rather
+            # than a screenshot nobody compares against last week.
+            add_executable(kestrel_qml_tests
+                tests/qml_tests.cpp
+            )
+            set_target_properties(kestrel_qml_tests PROPERTIES AUTOMOC ON)
+            target_link_libraries(kestrel_qml_tests PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+            # The test loads the component from source rather than from the
+            # app's compiled QML module, so it needs the directory itself.
+            target_compile_definitions(kestrel_qml_tests PRIVATE
+                KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
+            add_test(NAME kestrel_qml_tests COMMAND kestrel_qml_tests)
+            # No display on a build agent, and the window is never shown anyway.
+            set_tests_properties(kestrel_qml_tests PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
             # A Qt-linked test needs Qt's DLLs resolvable at run time. CMake does
             # not put the Qt bin directory on PATH for imported targets, so the
             # test would fail with STATUS_DLL_NOT_FOUND before main() runs.
@@ -239,8 +260,12 @@ if(KESTREL_BUILD_UI)
                 if(_kestrel_qt_core)
                     get_filename_component(_kestrel_qt_lib "${_kestrel_qt_core}" DIRECTORY)
                     get_filename_component(_kestrel_qt_prefix "${_kestrel_qt_lib}" DIRECTORY)
-                    set_tests_properties(kestrel_app_tests PROPERTIES
-                        ENVIRONMENT "PATH=${_kestrel_qt_prefix}/bin;$ENV{PATH}")
+                    # Both Qt-linked test binaries need this, not just the one
+                    # that existed when the fix-up was written.
+                    foreach(_kestrel_qt_test kestrel_app_tests kestrel_qml_tests)
+                        set_tests_properties(${_kestrel_qt_test} PROPERTIES
+                            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PATH=${_kestrel_qt_prefix}/bin;$ENV{PATH}")
+                    endforeach()
                 endif()
             endif()
         endif()

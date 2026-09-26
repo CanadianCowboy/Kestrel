@@ -111,6 +111,18 @@ int main(int argc, char* argv[]) {
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    // QQmlApplicationEngine has no errors() accessor; it reports them through
+    // this signal, so the connection has to exist before the scene is loaded.
+    // Without it a failure prints one bare line and the reason -- an
+    // unresolvable type, a misspelled property, a missing import -- is lost,
+    // which turns a one-line diagnosis into an afternoon.
+    QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app,
+                     [](const QList<QQmlError>& errors) {
+                         for (const QQmlError& error : errors) {
+                             QTextStream(stderr) << "Kestrel QML warning: " << error.toString() << "\n";
+                         }
+                     });
+
     engine.loadFromModule(QStringLiteral("Kestrel"), QStringLiteral("Main"));
 
     if (engine.rootObjects().isEmpty()) {
@@ -119,13 +131,26 @@ int main(int argc, char* argv[]) {
     }
 
     // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
-    // window shortly after startup and exits. Works together with
-    // QT_QPA_PLATFORM=offscreen for display-less UI review.
+    // window and exits. Works together with QT_QPA_PLATFORM=offscreen for
+    // display-less UI review.
+    //
+    // KESTREL_SCREENSHOT_DELAY_MS sets how long to wait first. The default is
+    // long enough for the window to appear and too short for anything to have
+    // happened in it, so capturing the app doing its actual job -- a
+    // conversation on screen, with bubbles sized and wrapped -- needs to wait
+    // for the model rather than guess. Default unchanged.
     const QString screenshotPath = qEnvironmentVariable("KESTREL_SCREENSHOT");
     if (!screenshotPath.isEmpty()) {
-        QTimer::singleShot(1600, &app, [&engine, &app, screenshotPath] {
+        // qEnvironmentVariableIntValue's second parameter is a bool* for
+        // "was it set", not a default value, so the fallback is spelled out.
+        bool delayGiven = false;
+        const int requested = qEnvironmentVariableIntValue("KESTREL_SCREENSHOT_DELAY_MS", &delayGiven);
+        const int delayMs = delayGiven ? requested : 1600;
+        QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath] {
             if (auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0))) {
-                window->grabWindow().save(screenshotPath);
+                if (!window->grabWindow().save(screenshotPath)) {
+                    QTextStream(stderr) << "Kestrel could not write " << screenshotPath << "\n";
+                }
             }
             app.quit();
         });
