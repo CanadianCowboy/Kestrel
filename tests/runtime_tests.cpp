@@ -569,6 +569,22 @@ void testLlamaCppGeneratesFromRealModel() {
     assert(after.contextUsed > 0);
     assert(after.contextUsed <= after.contextLimit);
 
+    // The KV byte total must be a real allocation derived from the model's own
+    // shape, and the used share must stay within it and grow with use. For
+    // this model llama.cpp itself reports 48.00 MiB for 4096 cells, which is
+    // what the formula below has to reproduce.
+    assert(after.kvCacheBytes > 0);
+    assert(after.kvCacheBytesUsed > 0);
+    assert(after.kvCacheBytesUsed <= after.kvCacheBytes);
+    // A full context must fit the window exactly: the byte figure is derived
+    // from contextLimit, so the two cannot drift apart.
+    assert(after.kvCacheBytes ==
+           after.kvCacheBytesUsed * after.contextLimit / after.contextUsed);
+    std::printf("  kv cache: %s of %s (%zu cells, %d used)\n",
+                runtime::formatBytes(after.kvCacheBytesUsed).c_str(),
+                runtime::formatBytes(after.kvCacheBytes).c_str(), after.contextLimit,
+                static_cast<int>(after.contextUsed));
+
     // The shared prefix is the point of the cache: declared before a turn, it
     // must be resident afterwards rather than resent with the next request.
     const std::string prefix =

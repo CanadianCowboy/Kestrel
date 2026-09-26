@@ -30,6 +30,14 @@ struct RuntimeStatus {
     double tokensPerSecond = 0.0;
     std::size_t contextUsed = 0;
     std::size_t contextLimit = 0;
+    // Bytes of KV cache the loaded model holds for a full context, and the
+    // share of it currently in use. Zero means the backend cannot report it,
+    // which is different from a cache that is genuinely empty.
+    //
+    // These are the numbers that decide whether a longer context is affordable:
+    // token counts stay flat while the bytes behind them grow linearly.
+    std::size_t kvCacheBytes = 0;
+    std::size_t kvCacheBytesUsed = 0;
 };
 
 using TokenCallback = std::function<void(std::string_view token)>;
