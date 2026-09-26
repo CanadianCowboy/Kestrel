@@ -85,6 +85,12 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
+          # Match the runner's own architecture. Left to itself the action has
+          # been resolving an x86_64 Qt for the arm64 macOS runner, and the
+          # x86_64 slice of Qt's macOS libraries references AGL -- the legacy
+          # 32-bit OpenGL framework, which does not exist on arm64. The link
+          # then fails with "ld: framework 'AGL' not found".
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           # No `modules` list on purpose. Quick Controls 2 is part of the base
           # Qt 6 installation rather than a separately installable module, and
           # asking aqtinstall for it fails the step on every platform with
