@@ -17,6 +17,20 @@ namespace {
 
 constexpr int kTitleLimit = 42;
 
+// The shared prefix: every turn starts with this text, so it is the one part of
+// the prompt the backend can decode once and keep resident instead of resending
+// with each request. It is deliberately short, because a long persona prompt is
+// exactly the cost this avoids paying per turn.
+const QString kDefaultSystemPrompt = QStringLiteral(
+    "You are Kestrel, a local desktop assistant running on the user's own "
+    "machine. Answer briefly and plainly, and say when you are unsure instead "
+    "of guessing.");
+
+// How many prior turns are replayed to the model. Bounded because the prompt
+// grows with it, and the whole point of the shared prefix is lost if the
+// per-turn text swamps the part that is cached.
+constexpr std::size_t kHistoryTurns = 8;
+
 // Minimum gap between metricsChanged emissions while streaming. Emitting on
 // every token would flood the binding with updates faster than the UI repaints.
 constexpr qint64 kMetricsIntervalMs = 100;
@@ -42,6 +56,11 @@ AppController::AppController(QObject* parent)
     m_worker = new GenerationWorker(m_backend.get());
     m_worker->moveToThread(&m_generationThread);
     m_generationThread.start();
+
+    // Declare the shared prefix before any turn runs. The backend decodes it
+    // on the first generate() and keeps it from then on.
+    m_systemPrompt = kDefaultSystemPrompt;
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
 
     // The worker emits from its own thread, so these connections are queued and
     // the slots run on the UI thread where the QML state lives.
@@ -227,6 +246,23 @@ void AppController::setSidebarOpen(bool open) {
     emit sidebarOpenChanged();
 }
 
+QString AppController::systemPrompt() const {
+    return m_systemPrompt;
+}
+
+void AppController::setSystemPrompt(const QString& text) {
+    const QString trimmed = text.trimmed();
+    if (trimmed == m_systemPrompt) {
+        return;
+    }
+    m_systemPrompt = trimmed;
+    // Declaring a new prefix invalidates the cached one. The backend works out
+    // the consequences on its own thread, so this is safe to call from here.
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    emit systemPromptChanged();
+    publishMetrics();
+}
+
 void AppController::setSearchQuery(const QString& query) {
     if (m_searchQuery == query) {
         return;
@@ -329,7 +365,7 @@ void AppController::onGenerationFinished(quint64 requestId,
     emit voiceChanged();
 }
 
-void AppController::startGeneration(const QString& prompt) {
+void AppController::startGeneration(const QString& userText) {
     m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
     m_generating = true;
     m_userStopped = false;
@@ -338,7 +374,7 @@ void AppController::startGeneration(const QString& prompt) {
     resetMetrics();
     m_generationClock.start();
 
-    m_activeResponse = m_voice.queueResponse(prompt.toStdString());
+    m_activeResponse = m_voice.queueResponse(userText.toStdString());
     m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
     m_activeRequestId = m_nextRequestId++;
 
@@ -354,7 +390,43 @@ void AppController::startGeneration(const QString& prompt) {
         return;
     }
 
-    m_worker->start(m_activeRequestId, prompt, 0.7F, 512);
+    // The voice timeline tracks the user's words; the model gets the assembled
+    // conversation. The system prompt is not in it -- the backend holds that as
+    // a cached prefix, and repeating it here would undo the caching.
+    m_worker->start(m_activeRequestId, buildPrompt(userText), 0.7F, 512);
+}
+
+QString AppController::buildPrompt(const QString& userText) const {
+    QString prompt;
+    const ConversationEntry* entry = activeEntry();
+    if (entry != nullptr) {
+        const auto& messages = entry->conversation.messages();
+        // Walk backwards so the limit keeps the most recent turns, which are
+        // the ones the current question actually depends on.
+        const std::size_t firstUsable =
+            messages.size() > kHistoryTurns ? messages.size() - kHistoryTurns : 0;
+        for (std::size_t i = firstUsable; i < messages.size(); ++i) {
+            const core::Message& message = messages[i];
+            // The empty assistant placeholder for this turn is already in the
+            // conversation and would only add a dangling label.
+            if (message.content.empty()
+                || (message.role != core::MessageRole::User
+                    && message.role != core::MessageRole::Assistant)) {
+                continue;
+            }
+            if (!prompt.isEmpty()) {
+                prompt += QLatin1Char('\n');
+            }
+            prompt += message.role == core::MessageRole::User ? QStringLiteral("User: ")
+                                                               : QStringLiteral("Assistant: ");
+            prompt += QString::fromStdString(message.content);
+        }
+    }
+    if (!prompt.isEmpty()) {
+        prompt += QLatin1Char('\n');
+    }
+    prompt += QStringLiteral("Assistant:");
+    return prompt;
 }
 
 void AppController::finalizeStream(MessageStatus status, const QString& note) {

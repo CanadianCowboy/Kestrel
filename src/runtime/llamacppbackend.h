@@ -41,6 +41,12 @@ public:
     [[nodiscard]] std::size_t countTokens(std::string_view text) const override;
     void resetContextUsage() override;
 
+    // The system prompt is decoded into the context once and then left
+    // resident, so each turn only pays to process its own tokens.
+    void setSystemPrompt(std::string_view text) override;
+    void clearSharedPrefix() override;
+    [[nodiscard]] std::size_t cachedPrefixTokens() const override;
+
 private:
     // Defined only when KESTREL_HAS_LLAMA_CPP is set. Held through an opaque
     // wrapper so this header never mentions a llama type.
@@ -49,6 +55,18 @@ private:
     // Caller must hold m_mutex.
     void refreshStatus();
     [[nodiscard]] std::size_t countTokensImpl(std::string_view text) const;
+
+    // Brings the context in line with the declared system prompt and returns
+    // the number of prefix tokens left resident.
+    //
+    // Called from generate() rather than from setSystemPrompt() because the
+    // context is not safe to touch from the UI thread. When the prefix has not
+    // changed, this drops only the tokens after it and leaves the prefix's KV
+    // entries in place, which is the whole point: the system prompt is not
+    // recomputed per turn.
+    //
+    // Caller must hold m_mutex.
+    [[nodiscard]] std::size_t applySystemPrefix();
 
     mutable std::mutex m_mutex;
     std::unique_ptr<Impl> m_impl;

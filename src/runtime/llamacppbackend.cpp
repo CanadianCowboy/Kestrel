@@ -64,6 +64,12 @@ struct LlamaCppBackend::Impl {
     llama_model* model = nullptr;
     llama_context* context = nullptr;
     std::string modelPath;
+
+    // The shared prefix, tokenized once. Its KV entries stay in the context
+    // between turns; prefixDirty records whether the context still matches
+    // this text, since only generate() can safely reconcile the two.
+    std::vector<llama_token> prefixTokens;
+    bool prefixDirty = true;
 };
 
 LlamaCppBackend::LlamaCppBackend() {
@@ -146,6 +152,10 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     m_impl->model = model;
     m_impl->context = context;
     m_impl->modelPath = modelPath;
+    // A new context holds none of the old model's KV entries, so the prefix
+    // has to be decoded again against it.
+    m_impl->prefixTokens.clear();
+    m_impl->prefixDirty = true;
     m_contextUsed = 0;
     refreshStatus();
     return true;
@@ -201,6 +211,79 @@ void LlamaCppBackend::resetContextUsage() {
     refreshStatus();
 }
 
+void LlamaCppBackend::setSystemPrompt(std::string_view text) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_systemPrompt == text) {
+        // Unchanged: leave the resident KV entries alone. Redecoding an
+        // identical prefix every turn would cost exactly what caching saves.
+        return;
+    }
+    m_systemPrompt = text;
+    if (m_impl != nullptr) {
+        m_impl->prefixTokens.clear();
+        m_impl->prefixDirty = true;
+    }
+}
+
+void LlamaCppBackend::clearSharedPrefix() {
+    setSystemPrompt({});
+}
+
+std::size_t LlamaCppBackend::cachedPrefixTokens() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_impl == nullptr) {
+        return 0;
+    }
+    // While dirty the prefix is not resident, so reporting the token count of
+    // its text would claim a saving that has not happened yet.
+    return m_impl->prefixDirty ? 0 : m_impl->prefixTokens.size();
+}
+
+std::size_t LlamaCppBackend::applySystemPrefix() {
+    if (m_impl == nullptr || m_impl->context == nullptr) {
+        return 0;
+    }
+    llama_memory_t memory = llama_get_memory(m_impl->context);
+
+    if (m_impl->prefixDirty) {
+        // The prefix changed (or this is the first turn): nothing in the cache
+        // can be trusted, so start from empty and decode the prefix once.
+        llama_memory_clear(memory, /* data */ true);
+        m_impl->prefixTokens.clear();
+        if (!m_systemPrompt.empty()) {
+            tokenizeInto(llama_model_get_vocab(m_impl->model), m_systemPrompt, m_impl->prefixTokens);
+            const auto prefixSize = static_cast<int32_t>(m_impl->prefixTokens.size());
+            if (prefixSize > 0) {
+                llama_batch batch = llama_batch_init(prefixSize, 0, 1);
+                batch.n_tokens = prefixSize;
+                for (int32_t i = 0; i < prefixSize; ++i) {
+                    batch.token[i] = m_impl->prefixTokens[static_cast<std::size_t>(i)];
+                    batch.pos[i] = static_cast<llama_pos>(i);
+                    // n_seq_id is a per-token count, not a batch-wide flag, and
+                    // llama_batch_init leaves it uninitialised. Setting only the
+                    // first entry makes the library read a garbage count for
+                    // every later token and reject the batch.
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = 0;
+                    // No logits wanted: the turn's own last token supplies them.
+                    batch.logits[i] = 0;
+                }
+                const int rc = llama_decode(m_impl->context, batch);
+                llama_batch_free(batch);
+                if (rc != 0) {
+                    m_impl->prefixTokens.clear();
+                }
+            }
+        }
+        m_impl->prefixDirty = false;
+    } else if (!m_impl->prefixTokens.empty()) {
+        // The prefix is unchanged, so keep its KV entries and drop only what
+        // the previous turn appended after them.
+        llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(m_impl->prefixTokens.size()), -1);
+    }
+    return m_impl->prefixTokens.size();
+}
+
 void LlamaCppBackend::generate(const GenerationRequest& request,
                                TokenCallback onToken,
                                CompletionCallback onComplete) {
@@ -216,9 +299,13 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     llama_context* context = m_impl->context;
     const llama_vocab* vocab = llama_model_get_vocab(model);
 
-    // Tokenize the prompt against the model's own vocabulary. The helper asks
-    // the library how many tokens are needed before allocating, so a long
-    // prompt is never silently truncated against a guessed buffer size.
+    // Bring the context in line with the declared system prompt. On the first
+    // turn this decodes the prefix; on every turn after it the prefix's KV
+    // entries are already resident and are reused rather than recomputed.
+    const std::size_t prefixLength = applySystemPrefix();
+
+    // Tokenize only this turn's prompt. The prefix is already in the context,
+    // so including it here would both redo the work and double-count it.
     std::vector<llama_token> tokens;
     if (tokenizeInto(vocab, request.prompt, tokens) <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
@@ -247,10 +334,25 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         llama_sampler_chain_add(chain, llama_sampler_init_dist(1234));
     }
 
-    // Decode the prompt in one batch. llama_batch_get_one assigns positions
-    // 0..n-1, which is exactly right for a fresh prompt.
-    llama_batch promptBatch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(promptSize));
-    if (llama_decode(context, promptBatch) != 0) {
+    // Decode this turn's tokens at the positions that follow the prefix.
+    // Positions are explicit rather than delegated to llama_batch_get_one,
+    // which always numbers a batch from 0 and would collide with the prefix.
+    const auto turnSize = static_cast<int32_t>(promptSize);
+    llama_batch promptBatch = llama_batch_init(turnSize, 0, 1);
+    promptBatch.n_tokens = turnSize;
+    for (int32_t i = 0; i < turnSize; ++i) {
+        promptBatch.token[i] = tokens[static_cast<std::size_t>(i)];
+        promptBatch.pos[i] = static_cast<llama_pos>(prefixLength + static_cast<std::size_t>(i));
+        // Per-token count, not a batch-wide flag: llama_batch_init leaves the
+        // array uninitialised and the library reads one entry per token.
+        promptBatch.n_seq_id[i] = 1;
+        promptBatch.seq_id[i][0] = 0;
+        // Only the final token's logits are needed, to sample the reply from.
+        promptBatch.logits[i] = (i == turnSize - 1) ? 1 : 0;
+    }
+    const int promptRc = llama_decode(context, promptBatch);
+    llama_batch_free(promptBatch);
+    if (promptRc != 0) {
         llama_sampler_free(chain);
         onComplete(false, "llama.cpp failed to decode the prompt");
         return;
@@ -277,8 +379,9 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         }
         // Leave headroom so the next token always has a slot. Decoding into a
         // full context fails, and that would surface as a model error rather
-        // than a truncated response.
-        if (contextLimit > 0 && static_cast<int>(tokens.size()) >= contextLimit - 1) {
+        // than a truncated response. The prefix counts against the window
+        // because it occupies real positions in the cache.
+        if (contextLimit > 0 && static_cast<int>(prefixLength + tokens.size()) >= contextLimit - 1) {
             break;
         }
 
@@ -307,13 +410,13 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         }
 
         // One token, at its true position in the sequence. n_seq_id is a
-        // pointer into the batch's per-token storage, not a count field, and
-        // llama_batch_init leaves every member uninitialised -- including the
-        // logits pointer, which the next decode would otherwise read.
+        // per-token count that llama_batch_init leaves uninitialised, and
+        // seq_id/logits are uninitialised too, so every member the next decode
+        // reads is set explicitly.
         step.n_tokens = 1;
         step.token[0] = next;
-        step.pos[0] = static_cast<llama_pos>(tokens.size() - 1);
-        *step.n_seq_id = 1;
+        step.pos[0] = static_cast<llama_pos>(prefixLength + tokens.size() - 1);
+        step.n_seq_id[0] = 1;
         step.seq_id[0][0] = 0;
         step.logits[0] = 1;
         if (llama_decode(context, step) != 0) {
@@ -327,11 +430,13 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     llama_batch_free(step);
     llama_sampler_free(chain);
 
-    // Context grows by the prompt plus what this turn produced, capped at the
-    // model's real window so the UI cannot show an impossible fill level.
+    // Context grows by the resident prefix plus this turn's prompt and output,
+    // capped at the model's real window so the UI cannot show an impossible
+    // fill level.
     if (contextLimit > 0) {
-        m_contextUsed = std::min<std::size_t>(static_cast<std::size_t>(contextLimit),
-                                              m_contextUsed + promptSize + produced);
+        m_contextUsed = std::min<std::size_t>(
+            static_cast<std::size_t>(contextLimit),
+            m_contextUsed + prefixLength + promptSize + produced);
     }
     refreshStatus();
 
@@ -381,6 +486,22 @@ std::size_t LlamaCppBackend::countTokens(std::string_view text) const {
 
 void LlamaCppBackend::resetContextUsage() {
     m_contextUsed = 0;
+}
+
+void LlamaCppBackend::setSystemPrompt(std::string_view text) {
+    m_systemPrompt = text;
+}
+
+void LlamaCppBackend::clearSharedPrefix() {
+    m_systemPrompt.clear();
+}
+
+std::size_t LlamaCppBackend::cachedPrefixTokens() const {
+    return 0;
+}
+
+std::size_t LlamaCppBackend::applySystemPrefix() {
+    return 0;
 }
 
 void LlamaCppBackend::refreshStatus() {}

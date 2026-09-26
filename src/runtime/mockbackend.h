@@ -19,6 +19,11 @@ public:
     [[nodiscard]] std::size_t countTokens(std::string_view text) const override;
     void resetContextUsage() override;
 
+    // The mock has no KV cache, so it keeps the prefix text and charges for it
+    // on every turn, which is the honest cost to preview against.
+    void setSystemPrompt(std::string_view text) override;
+    void clearSharedPrefix() override;
+
 private:
     // Written by cancel() on the UI thread while generate() polls it on the
     // worker thread, so this must be atomic rather than a plain bool.
