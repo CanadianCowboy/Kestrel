@@ -68,6 +68,12 @@ private:
     // Caller must hold m_mutex.
     [[nodiscard]] std::size_t applySystemPrefix();
 
+    // Bytes of KV cache this model holds for a full context. Computed from the
+    // model's own shape and the KV types the context was created with, since
+    // llama.cpp exposes no accessor for the resolved allocation. Returns 0 when
+    // the model does not report enough to compute it honestly.
+    [[nodiscard]] std::size_t kvCacheBytes() const;
+
     mutable std::mutex m_mutex;
     std::unique_ptr<Impl> m_impl;
 

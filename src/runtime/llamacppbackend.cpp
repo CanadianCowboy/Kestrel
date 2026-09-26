@@ -65,6 +65,12 @@ struct LlamaCppBackend::Impl {
     llama_context* context = nullptr;
     std::string modelPath;
 
+    // The KV element types the context was created with. Kept because llama.cpp
+    // exposes no accessor for the resolved types, and the KV byte total is
+    // meaningless without them.
+    ggml_type typeK = GGML_TYPE_F16;
+    ggml_type typeV = GGML_TYPE_F16;
+
     // The shared prefix, tokenized once. Its KV entries stay in the context
     // between turns; prefixDirty records whether the context still matches
     // this text, since only generate() can safely reconcile the two.
@@ -148,10 +154,11 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
         refreshStatus();
         return false;
     }
-
     m_impl->model = model;
     m_impl->context = context;
     m_impl->modelPath = modelPath;
+    m_impl->typeK = contextParams.type_k;
+    m_impl->typeV = contextParams.type_v;
     // A new context holds none of the old model's KV entries, so the prefix
     // has to be decoded again against it.
     m_impl->prefixTokens.clear();
@@ -171,11 +178,21 @@ void LlamaCppBackend::refreshStatus() {
         // this reads the live allocation rather than a training default.
         m_status.contextLimit = llama_n_ctx(m_impl->context);
         m_status.contextUsed = m_contextUsed;
+        const std::size_t total = kvCacheBytes();
+        m_status.kvCacheBytes = total;
+        // The used share is the filled part of the same allocation, so it
+        // tracks the token count exactly rather than estimating separately.
+        m_status.kvCacheBytesUsed =
+            (total > 0 && m_status.contextLimit > 0)
+                ? total * m_contextUsed / m_status.contextLimit
+                : 0;
         m_status.detail = "Loaded " + m_status.modelName;
     } else {
         m_status.modelName = "No model loaded";
         m_status.contextLimit = 0;
         m_status.contextUsed = 0;
+        m_status.kvCacheBytes = 0;
+        m_status.kvCacheBytesUsed = 0;
     }
     // Availability means "this backend can serve requests at all", which is
     // true as soon as the library is linked. modelLoaded is what the registry
@@ -227,6 +244,36 @@ void LlamaCppBackend::setSystemPrompt(std::string_view text) {
 
 void LlamaCppBackend::clearSharedPrefix() {
     setSystemPrompt({});
+}
+
+std::size_t LlamaCppBackend::kvCacheBytes() const {
+    if (m_impl == nullptr || m_impl->model == nullptr || m_impl->context == nullptr) {
+        return 0;
+    }
+    const int32_t layers = llama_model_n_layer(m_impl->model);
+    const int32_t heads = llama_model_n_head(m_impl->model);
+    const int32_t headsKv = llama_model_n_head_kv(m_impl->model);
+    const int32_t embd = llama_model_n_embd(m_impl->model);
+    if (layers <= 0 || heads <= 0 || headsKv <= 0 || embd <= 0
+        || embd % heads != 0) {
+        // Without a clean head dimension any figure here would be invented.
+        return 0;
+    }
+
+    // One K row and one V row per layer per cached token. Under grouped-query
+    // attention the rows are narrower than the model's embedding, which is
+    // exactly why a KV cache is much smaller than the weights it serves.
+    const int64_t rowElements = static_cast<int64_t>(embd / heads) * headsKv;
+    const auto cells = static_cast<std::size_t>(llama_n_ctx(m_impl->context));
+    if (cells == 0) {
+        return 0;
+    }
+    const std::size_t rowK = ggml_row_size(m_impl->typeK, rowElements);
+    const std::size_t rowV = ggml_row_size(m_impl->typeV, rowElements);
+    if (rowK == 0 || rowV == 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(layers) * cells * (rowK + rowV);
 }
 
 std::size_t LlamaCppBackend::cachedPrefixTokens() const {
@@ -497,6 +544,10 @@ void LlamaCppBackend::clearSharedPrefix() {
 }
 
 std::size_t LlamaCppBackend::cachedPrefixTokens() const {
+    return 0;
+}
+
+std::size_t LlamaCppBackend::kvCacheBytes() const {
     return 0;
 }
 

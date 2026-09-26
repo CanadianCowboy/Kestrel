@@ -56,6 +56,12 @@ class AppController final : public QObject {
     Q_PROPERTY(double tokensPerSecond READ tokensPerSecond NOTIFY metricsChanged)
     Q_PROPERTY(int tokensGenerated READ tokensGenerated NOTIFY metricsChanged)
     Q_PROPERTY(QString contextSummary READ contextSummary NOTIFY metricsChanged)
+    // KV cache occupancy in bytes, alongside the token count above. Token
+    // counts stay flat while the bytes behind them grow linearly, so this is
+    // the figure that says whether a bigger context is affordable.
+    Q_PROPERTY(QString kvCacheSummary READ kvCacheSummary NOTIFY metricsChanged)
+    // How much of the shared system prompt is resident and being reused.
+    Q_PROPERTY(QString prefixSummary READ prefixSummary NOTIFY metricsChanged)
 
     // Voice conversation state, projected from the core VoiceSession machine.
     Q_PROPERTY(QString voiceState READ voiceState NOTIFY voiceChanged)
@@ -102,6 +108,8 @@ public:
     [[nodiscard]] double tokensPerSecond() const noexcept;
     [[nodiscard]] int tokensGenerated() const noexcept;
     [[nodiscard]] QString contextSummary() const;
+    [[nodiscard]] QString kvCacheSummary() const;
+    [[nodiscard]] QString prefixSummary() const;
 
     [[nodiscard]] QString voiceState() const;
     [[nodiscard]] bool canPause() const noexcept;

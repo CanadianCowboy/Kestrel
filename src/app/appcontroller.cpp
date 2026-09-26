@@ -166,6 +166,29 @@ QString AppController::contextSummary() const {
         .arg(static_cast<qulonglong>(status.contextLimit));
 }
 
+QString AppController::kvCacheSummary() const {
+    const runtime::RuntimeStatus status = m_backend->status();
+    if (status.kvCacheBytes == 0) {
+        // Distinct from zero bytes: this backend cannot account for its cache,
+        // which is not the same as the cache being empty.
+        return QStringLiteral("not reported by this backend");
+    }
+    return QStringLiteral("%1 of %2")
+        .arg(QString::fromStdString(runtime::formatBytes(status.kvCacheBytesUsed)))
+        .arg(QString::fromStdString(runtime::formatBytes(status.kvCacheBytes)));
+}
+
+QString AppController::prefixSummary() const {
+    const std::size_t resident = m_backend->cachedPrefixTokens();
+    if (resident == 0) {
+        return m_systemPrompt.isEmpty()
+                   ? QStringLiteral("none")
+                   : QStringLiteral("not cached — resent every turn");
+    }
+    return QStringLiteral("%1 tokens, reused")
+        .arg(static_cast<qulonglong>(resident));
+}
+
 QString AppController::voiceState() const {
     const core::VoiceResponse* response = m_voice.find(m_activeResponse);
     if (response == nullptr) {

@@ -519,6 +519,30 @@ ApplicationWindow {
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 10
+                            Text { text: "KV CACHE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.kvCacheSummary
+                                color: window.ink; font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 160
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "SHARED PREFIX"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.prefixSummary
+                                color: window.ink; font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 160
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
                             Text { text: "VOICE STATE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
                             Text { text: appController.voiceState; color: window.ink; font.pixelSize: 12 }
                         }
