@@ -283,6 +283,19 @@ QString AppController::systemPrompt() const {
     return m_systemPrompt;
 }
 
+void AppController::setBackendForTesting(runtime::ModelBackend* backend) {
+    if (backend == nullptr) {
+        return;
+    }
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    m_backend.reset(backend);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    rebuildDiagnostics();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
 void AppController::setSystemPrompt(const QString& text) {
     const QString trimmed = text.trimmed();
     if (trimmed == m_systemPrompt) {

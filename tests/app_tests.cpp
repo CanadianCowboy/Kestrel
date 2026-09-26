@@ -18,11 +18,15 @@
 #include <iostream>
 #include <thread>
 
+#include "app/appcontroller.h"
 #include "app/generationworker.h"
+#include "app/messagemodel.h"
+#include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
 
 namespace {
 
+using kestrel::app::AppController;
 using kestrel::app::GenerationWorker;
 using kestrel::runtime::BackendKind;
 using kestrel::runtime::GenerationRequest;
@@ -279,12 +283,75 @@ void testWorkerFollowsTheSwappedBackend() {
     thread.wait();
 }
 
+// The path a user actually takes: type a message, the controller assembles a
+// prompt, the worker generates on its own thread, and the reply streams back
+// into the message model. Every layer of that had a test except the glue, and
+// the glue is where a real user lives.
+void testSendMessageProducesAReply() {
+    std::cout << "sendMessage streams a reply back into the model\n";
+
+    kestrel::app::AppController controller;
+    // The mock, deliberately: the backend's own generation is covered against
+    // a real GGUF elsewhere. This test is about the wiring, so it uses the one
+    // backend whose output is deterministic enough to assert on exactly.
+    //
+    // The controller takes ownership, so the local handle is released rather
+    // than left to free memory the controller now owns.
+    auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    controller.setBackendForTesting(backend.get());
+    backend.release();
+
+    check(controller.messages() != nullptr, "the message model is exposed");
+    check(controller.messages()->rowCount() == 0, "a new conversation starts empty");
+
+    controller.sendMessage(QStringLiteral("Hello there"));
+    check(controller.generating(), "sending a message starts generation");
+
+    // Pump the real event loop until the stream finishes, exactly as the UI
+    // would. A bounded wait, so a wedged backend fails the test rather than
+    // hanging CI.
+    QEventLoop loop;
+    QObject::connect(&controller, &AppController::metricsChanged, &loop, [&] {
+        if (!controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    check(!controller.generating(), "generation finished");
+    check(controller.messages()->rowCount() == 2, "the user message and the reply are both present");
+
+    kestrel::app::MessageModel* messages = controller.messages();
+    const QString reply = messages->data(messages->index(1, 0),
+                                         kestrel::app::MessageModel::ContentRole).toString();
+    check(!reply.isEmpty(), "the reply has content");
+
+    // The status column is what the UI renders a spinner or an error note
+    // from, so an empty reply that still says "streaming" would look like a
+    // hung app rather than a failure.
+    const auto status = messages->data(messages->index(1, 0),
+                                       kestrel::app::MessageModel::StatusRole).toString();
+    check(status == kestrel::app::toStatusString(kestrel::app::MessageStatus::Complete),
+          "the reply is marked complete, not left streaming");
+
+    // The prompt the controller assembled must carry the conversation, or the
+    // model would have no memory of the message that was just sent.
+    check(controller.contextLimit() > 0, "the context window is reported");
+    check(controller.contextUsed() > 0, "context usage advanced after the turn");
+}
+
 int main(int argc, char** argv) {
+    // Unbuffered, so a crash still shows how far the run got. A lost buffer
+    // turns a five-second diagnosis into a guess about which test died.
+    std::cout << std::unitbuf;
+
     QCoreApplication app(argc, argv);
     testGenerationRunsOffCallingThread();
     testCancelStopsInFlightGeneration();
     testFileDialogUrlBecomesALocalPath();
     testWorkerFollowsTheSwappedBackend();
+    testSendMessageProducesAReply();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

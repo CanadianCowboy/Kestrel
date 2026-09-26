@@ -5,6 +5,7 @@
 #include <QQuickWindow>
 #include <QTextStream>
 #include <QTimer>
+#include <QUrl>
 
 #include "app/appcontroller.h"
 #include "runtime/backendregistry.h"
@@ -36,8 +37,28 @@ int printRuntime(const kestrel::app::AppController& controller) {
             << entry.value(QStringLiteral("label")).toString() << ": "
             << entry.value(QStringLiteral("value")).toString() << "\n";
     }
+    if (!controller.modelPath().isEmpty()) {
+        out << "  model path   : " << controller.modelPath() << "\n";
+    }
+    if (!controller.modelError().isEmpty()) {
+        out << "  model error  : " << controller.modelError() << "\n";
+    }
     out.flush();
-    return 0;
+    // A model that was asked for and did not load is a failure, not a report.
+    // This is what lets the load path be checked without opening a window.
+    return controller.modelError().isEmpty() ? 0 : 1;
+}
+
+// The value following `flag`, or empty when the flag is absent, is last, or is
+// followed by another flag. A flag with no value must not silently swallow the
+// next one and report a nonsense path.
+QString valueAfter(const QStringList& arguments, const QString& flag) {
+    const int index = arguments.indexOf(flag);
+    if (index < 0 || index + 1 >= arguments.size()) {
+        return {};
+    }
+    const QString value = arguments.at(index + 1);
+    return value.startsWith(QStringLiteral("--")) ? QString() : value;
 }
 
 } // namespace
@@ -58,6 +79,16 @@ int main(int argc, char* argv[]) {
     kestrel::app::AppController controller;
 
     const QStringList arguments = QGuiApplication::arguments();
+
+    // Load a model named on the command line before the window opens, so the
+    // first frame already shows the real runtime instead of flashing "no model"
+    // and then loading. It also makes the load path reachable without driving a
+    // native file dialog, which is what a scripted check has to do.
+    const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
+    if (!modelArgument.isEmpty()) {
+        controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
+    }
+
     if (arguments.contains(QStringLiteral("--print-runtime"))) {
         return printRuntime(controller);
     }
