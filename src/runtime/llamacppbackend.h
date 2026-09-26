@@ -75,7 +75,7 @@ private:
     /// recomputed per turn.
     ///
     /// Caller must hold m_mutex.
-    [[nodiscard]] std::size_t applySystemPrefix();
+    [[nodiscard]] std::size_t applySystemPrefix(bool& prefixFailed);
 
     /// Bytes of KV cache this model holds for a full context. Computed from the
     /// model's own shape and the KV types the context was created with, since

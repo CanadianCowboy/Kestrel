@@ -170,7 +170,9 @@ ApplicationWindow {
                                 color: "#c08a95"
                                 font.pixelSize: 11
                                 wrapMode: Text.Wrap
-                                Layout.fillWidth: true
+                                // A plain Column gives no layout width, and
+                                // Text.Wrap cannot wrap without one.
+                                width: parent.width
                             }
                             Text {
                                 text: appController.gpuAvailable ? appController.gpuSummary : "No GPU detected"

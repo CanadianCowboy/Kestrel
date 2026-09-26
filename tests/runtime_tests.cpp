@@ -491,13 +491,18 @@ void testSharedSystemPromptPrefix() {
     mock.resetContextUsage();
     const std::size_t afterPrefixOnly = mock.status().contextUsed;
     assert(afterPrefixOnly == 0);
-    std::string response;
+    // The reply has to be collected to be charged for, so the exact figure can
+    // be stated: prefix, the turn's own prompt, and what came back.
+    std::string reply;
     mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32},
-                  [&response](std::string_view token) { response.append(token); },
+                  [&reply](std::string_view token) { reply.append(token); },
                   [](bool, std::string_view) {});
-    assert(mock.status().contextUsed == mock.countTokens(prefix) +
-                                            mock.countTokens("hello") +
-                                            mock.countTokens(response));
+    assert(!reply.empty());
+
+    // Exact, not a lower bound. A duplicate charge of the prefix is precisely
+    // the bug worth catching here, and ">=" would sail straight past it.
+    assert(mock.status().contextUsed
+           == mock.countTokens(prefix) + mock.countTokens("hello") + mock.countTokens(reply));
 }
 
 /// Exercises the real llama.cpp generation path.

@@ -80,7 +80,7 @@ class AppController final : public QObject {
     Q_PROPERTY(QString modelPath READ modelPath NOTIFY runtimeChanged)
     // Why the last load attempt failed, empty when it succeeded. Shown next to
     // the picker so a failure is visible rather than silently ignored.
-    Q_PROPERTY(QString modelError READ modelError NOTIFY runtimeChanged)
+    Q_PROPERTY(QString modelError READ modelError NOTIFY modelErrorChanged)
 
     // GPU facts, sourced from a real CUDA probe rather than assumed.
     Q_PROPERTY(bool gpuAvailable READ gpuAvailable NOTIFY runtimeChanged)
@@ -218,6 +218,11 @@ private:
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
     void refreshCanRegenerate();
+
+    // Re-reads the backend's status into the snapshot the UI getters use.
+    // Must only be called while the worker is idle; see the definition.
+    void refreshCachedRuntime();
+
     void resetMetrics();
     void publishMetrics();
     void rebuildDiagnostics();
@@ -263,6 +268,12 @@ private:
     core::GenerationId m_activeGeneration = core::kInvalidGenerationId;
     quint64 m_nextRequestId = 1;
     quint64 m_activeRequestId = 0;
+
+    // A snapshot of the backend's status, taken only when the worker is idle.
+    // Reading the live backend from a property getter would block the UI
+    // thread on the generation mutex for the whole reply.
+    runtime::RuntimeStatus m_cachedStatus;
+    std::size_t m_cachedPrefixTokens = 0;
 
     runtime::CudaProbe m_probe;
     QVariantList m_runtimeDiagnostics;

@@ -62,6 +62,7 @@ AppController::AppController(QObject* parent)
     m_conversationModel = new ConversationModel(&m_entries, this);
 
     m_probe = runtime::probeCuda();
+    refreshCachedRuntime();
     rebuildDiagnostics();
 
     m_worker = new GenerationWorker(m_backend.get());
@@ -135,28 +136,27 @@ QString AppController::searchQuery() const {
 }
 
 QString AppController::backendName() const {
-    return QString::fromStdString(m_backend->status().backendName);
+    return QString::fromStdString(m_cachedStatus.backendName);
 }
 
 QString AppController::modelName() const {
-    return QString::fromStdString(m_backend->status().modelName);
+    return QString::fromStdString(m_cachedStatus.modelName);
 }
 
 QString AppController::runtimeDetail() const {
-    return QString::fromStdString(m_backend->status().detail);
+    return QString::fromStdString(m_cachedStatus.detail);
 }
 
 bool AppController::runtimeAvailable() const {
-    const runtime::RuntimeStatus status = m_backend->status();
-    return status.available && status.modelLoaded;
+    return m_cachedStatus.available && m_cachedStatus.modelLoaded;
 }
 
 int AppController::contextUsed() const {
-    return static_cast<int>(m_backend->status().contextUsed);
+    return static_cast<int>(m_cachedStatus.contextUsed);
 }
 
 int AppController::contextLimit() const {
-    return static_cast<int>(m_backend->status().contextLimit);
+    return static_cast<int>(m_cachedStatus.contextLimit);
 }
 
 double AppController::tokensPerSecond() const noexcept {
@@ -168,7 +168,7 @@ int AppController::tokensGenerated() const noexcept {
 }
 
 QString AppController::contextSummary() const {
-    const runtime::RuntimeStatus status = m_backend->status();
+    const runtime::RuntimeStatus& status = m_cachedStatus;
     if (status.contextLimit == 0) {
         return QStringLiteral("not reported by this backend");
     }
@@ -179,7 +179,7 @@ QString AppController::contextSummary() const {
 
 /// Formats used and total KV-cache bytes, or reports unavailable accounting.
 QString AppController::kvCacheSummary() const {
-    const runtime::RuntimeStatus status = m_backend->status();
+    const runtime::RuntimeStatus& status = m_cachedStatus;
     if (status.kvCacheBytes == 0) {
         // Distinct from zero bytes: this backend cannot account for its cache,
         // which is not the same as the cache being empty.
@@ -192,7 +192,7 @@ QString AppController::kvCacheSummary() const {
 
 /// Formats the backend-reported prefix token count or the uncached/empty state.
 QString AppController::prefixSummary() const {
-    const std::size_t resident = m_backend->cachedPrefixTokens();
+    const std::size_t resident = m_cachedPrefixTokens;
     if (resident == 0) {
         return m_systemPrompt.isEmpty()
                    ? QStringLiteral("none")
@@ -381,6 +381,7 @@ void AppController::loadModelFromUrl(const QString& url) {
     // and let the backend rebuild the cache on the next turn.
     m_backend->clearSharedPrefix();
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    refreshCachedRuntime();
     rebuildDiagnostics();
     emit modelErrorChanged();
     emit runtimeChanged();
@@ -401,6 +402,7 @@ void AppController::usePreviewBackend() {
     m_backend = runtime::selectBackend(runtime::BackendKind::Mock);
     m_worker->setBackend(m_backend.get());
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    refreshCachedRuntime();
     rebuildDiagnostics();
     emit modelErrorChanged();
     emit runtimeChanged();
@@ -416,7 +418,11 @@ void AppController::waitForIdleGeneration(int timeoutMs) {
     stopGeneration();
     QEventLoop loop;
     const QMetaObject::Connection done =
-        connect(this, &AppController::onGenerationFinished, &loop, &QEventLoop::quit);
+        connect(this, &AppController::generatingChanged, &loop, [&loop, this] {
+        if (!m_generating) {
+            loop.quit();
+        }
+    });
     QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
     loop.exec();
     disconnect(done);
@@ -598,6 +604,9 @@ void AppController::finalizeStream(MessageStatus status, const QString& note) {
     m_userPaused = false;
     m_userStopped = false;
     m_generationClock.invalidate();
+    // The turn is over, so the backend is idle and the counters it moved during
+    // generation can now be read without blocking anything.
+    refreshCachedRuntime();
     emit generatingChanged();
     touchActiveConversation();
     emit runtimeChanged();
@@ -810,6 +819,7 @@ void AppController::copyToClipboard(const QString& text) const {
 
 void AppController::refreshRuntime() {
     m_probe = runtime::probeCuda();
+    refreshCachedRuntime();
     rebuildDiagnostics();
     emit runtimeChanged();
 }
@@ -861,6 +871,19 @@ void AppController::setActiveConversation(int id) {
     m_messageModel->setEntry(findEntry(id));
     emit activeConversationChanged();
     refreshCanRegenerate();
+}
+
+// Takes the snapshot the getters read.
+//
+// ONLY call this when the worker is known to be idle. Calling it mid-turn
+// reintroduces exactly the stall this exists to remove, since the backend's
+// accessors take the lock generate() is holding.
+void AppController::refreshCachedRuntime() {
+    if (m_generating) {
+        return;
+    }
+    m_cachedStatus = m_backend->status();
+    m_cachedPrefixTokens = m_backend->cachedPrefixTokens();
 }
 
 void AppController::touchActiveConversation() {

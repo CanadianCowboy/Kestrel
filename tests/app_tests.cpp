@@ -224,10 +224,22 @@ void testCancelStopsInFlightGeneration() {
 void testFileDialogUrlBecomesALocalPath() {
     std::cout << "file dialog URLs convert to local paths\n";
 
-    // Windows, percent-encoded, as QtQuick.Dialogs hands it over.
-    const QUrl windowsUrl(QStringLiteral("file:///C:/kestrel-deps/models/my%20model.gguf"));
-    check(windowsUrl.toLocalFile() == QStringLiteral("C:/kestrel-deps/models/my model.gguf"),
-          "a percent-encoded Windows URL decodes to a real path");
+    // Percent-encoded, as QtQuick.Dialogs hands it over. The exact spelling of
+    // the decoded path is platform-dependent -- a drive letter on Windows, a
+    // leading slash elsewhere -- so the parts that must hold everywhere are
+    // asserted everywhere and the rest only where it applies. Asserting the
+    // Windows spelling unconditionally failed the Linux and macOS CI jobs.
+    const QUrl encoded(QStringLiteral("file:///C:/kestrel-deps/models/my%20model.gguf"));
+    const QString decoded = encoded.toLocalFile();
+    check(!decoded.contains(QStringLiteral("%20")), "percent-encoding is decoded");
+    check(decoded.endsWith(QStringLiteral("my model.gguf")),
+          "a space in the file name survives decoding");
+#ifdef Q_OS_WIN
+    check(decoded == QStringLiteral("C:/kestrel-deps/models/my model.gguf"),
+          "Windows keeps the drive and forward slashes");
+#else
+    check(decoded.startsWith(QLatin1Char('/')), "POSIX keeps the leading slash");
+#endif
 
     // POSIX, for the CI build of the same app.
     const QUrl posixUrl(QStringLiteral("file:///home/user/models/qwen.gguf"));

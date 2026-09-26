@@ -306,9 +306,9 @@ std::size_t LlamaCppBackend::cachedPrefixTokens() const {
     return m_impl->prefixDirty ? 0 : m_impl->prefixTokens.size();
 }
 
-/// Rebuilds a dirty prefix or removes tokens following an unchanged nonempty prefix.
 /// Returns the retained prefix length, or zero if unavailable; the caller must hold m_mutex.
-std::size_t LlamaCppBackend::applySystemPrefix() {
+std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
+    prefixFailed = false;
     if (m_impl == nullptr || m_impl->context == nullptr) {
         return 0;
     }
@@ -340,7 +340,13 @@ std::size_t LlamaCppBackend::applySystemPrefix() {
                 const int rc = llama_decode(m_impl->context, batch);
                 llama_batch_free(batch);
                 if (rc != 0) {
+                    // A partially written prefix would leave the model reading
+                    // a cache that does not match the text, so drop the partial
+                    // entries and report the failure rather than continuing.
                     m_impl->prefixTokens.clear();
+                    llama_memory_clear(memory, /* data */ true);
+                    m_impl->prefixDirty = false;
+                    prefixFailed = true;
                 }
             }
         }
@@ -373,7 +379,12 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // Bring the context in line with the declared system prompt. On the first
     // turn this decodes the prefix; on every turn after it the prefix's KV
     // entries are already resident and are reused rather than recomputed.
-    const std::size_t prefixLength = applySystemPrefix();
+    bool prefixFailed = false;
+    const std::size_t prefixLength = applySystemPrefix(prefixFailed);
+    if (prefixFailed) {
+        onComplete(false, "llama.cpp could not decode the system prompt into the context");
+        return;
+    }
 
     // Tokenize only this turn's prompt. The prefix is already in the context,
     // so including it here would both redo the work and double-count it.
@@ -587,7 +598,8 @@ std::size_t LlamaCppBackend::kvCacheBytes() const {
 }
 
 /// Returns zero without modifying state because no llama.cpp context exists.
-std::size_t LlamaCppBackend::applySystemPrefix() {
+std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
+    prefixFailed = false;
     return 0;
 }
 
