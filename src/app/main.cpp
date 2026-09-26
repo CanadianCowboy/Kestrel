@@ -41,7 +41,22 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
 //
 // Runs only when asked, and only with a real model loaded, because a smoke test
 // that passes against the mock proves nothing about the runtime.
-int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs) {
+int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs, bool modelRequested) {
+    // A GGUF now loads on a worker thread so the window stays responsive while
+    // a multi-hundred-megabyte file is read off disk. That makes "is a model
+    // loaded?" a question whose answer arrives later, and asking it the moment
+    // the scene appears is asking too early: the answer is always "not yet".
+    // Wait for the load to finish first, but only when a model was actually
+    // requested -- otherwise the no-model case would sit out the whole timeout
+    // before reporting the thing it already knew, which is the opposite of a
+    // fast negative control.
+    if (modelRequested) {
+        QEventLoop loading;
+        QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished, &loading,
+                         &QEventLoop::quit);
+        QTimer::singleShot(timeoutMs, &loading, &QEventLoop::quit);
+        loading.exec();
+    }
     QTextStream out(stdout);
     out << "Kestrel smoke test\n";
     out << "  backend : " << controller.backendName() << "\n";
@@ -227,7 +242,7 @@ int main(int argc, char* argv[]) {
     // not just the controller. The timeout is generous because a real model's
     // first token can take a while on a cold context.
     if (arguments.contains(QStringLiteral("--smoke-test"))) {
-        return runSmokeTest(controller, 120000);
+        return runSmokeTest(controller, 120000, !modelArgument.isEmpty());
     }
 
     // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
