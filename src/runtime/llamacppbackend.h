@@ -45,6 +45,14 @@ public:
     // Clears the tracked context usage back to zero.
     void resetContextUsage() override;
 
+    /// The system prompt is decoded into the context once and then left
+    /// resident, so each turn only pays to process its own tokens.
+    void setSystemPrompt(std::string_view text) override;
+    /// Clears the declared prefix; the next generation reconciles the context.
+    void clearSharedPrefix() override;
+    /// Returns resident prefix tokens, or zero when dirty, absent, or llama.cpp is unavailable.
+    [[nodiscard]] std::size_t cachedPrefixTokens() const override;
+
 private:
     // Defined only when KESTREL_HAS_LLAMA_CPP is set. Held through an opaque
     // wrapper so this header never mentions a llama type.
@@ -56,6 +64,24 @@ private:
     // Tokenizes `text` with the loaded model's vocabulary, or returns 0 if no
     // model is loaded. Caller must hold m_mutex.
     [[nodiscard]] std::size_t countTokensImpl(std::string_view text) const;
+
+    /// Brings the context in line with the declared system prompt and returns
+    /// the number of prefix tokens left resident.
+    ///
+    /// Called from generate() rather than from setSystemPrompt() because the
+    /// context is not safe to touch from the UI thread. When the prefix has not
+    /// changed, this drops only the tokens after it and leaves the prefix's KV
+    /// entries in place, which is the whole point: the system prompt is not
+    /// recomputed per turn.
+    ///
+    /// Caller must hold m_mutex.
+    [[nodiscard]] std::size_t applySystemPrefix(bool& prefixFailed);
+
+    /// Bytes of KV cache this model holds for a full context. Computed from the
+    /// model's own shape and the KV types the context was created with, since
+    /// llama.cpp exposes no accessor for the resolved allocation. Returns 0 when
+    /// the model does not report enough to compute it honestly.
+    [[nodiscard]] std::size_t kvCacheBytes() const;
 
     mutable std::mutex m_mutex;
     std::unique_ptr<Impl> m_impl;

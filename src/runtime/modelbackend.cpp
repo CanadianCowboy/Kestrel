@@ -30,4 +30,27 @@ void ModelBackend::resetContextUsage() {
     // Backends that accumulate per-session state override this.
 }
 
+/// Stores a copy of the instruction prefix for subsequent requests.
+void ModelBackend::setSystemPrompt(std::string_view text) {
+    m_systemPrompt = text;
+}
+
+/// Returns a borrowed view of the prefix, invalidated by prefix mutation or destruction.
+std::string_view ModelBackend::systemPrompt() const noexcept {
+    return m_systemPrompt;
+}
+
+/// Clears the stored instruction prefix; caching implementations override invalidation.
+void ModelBackend::clearSharedPrefix() {
+    m_systemPrompt.clear();
+}
+
+/// Returns the token cost of the stored prefix using countTokens().
+/// This default reports a cost estimate and does not imply a resident KV cache.
+std::size_t ModelBackend::cachedPrefixTokens() const {
+    // No cache here: this backend re-sends the prefix on every request, so
+    // report what the prefix actually costs rather than implying a saving.
+    return countTokens(m_systemPrompt);
+}
+
 } // namespace kestrel::runtime

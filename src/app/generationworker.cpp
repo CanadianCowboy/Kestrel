@@ -59,4 +59,12 @@ void GenerationWorker::cancel() {
     }
 }
 
+/// Replaces the borrowed backend pointer; the caller must ensure no generation is in flight.
+/// The replacement must remain alive for all worker calls that use it.
+void GenerationWorker::setBackend(runtime::ModelBackend* backend) {
+    // Borrowed, exactly as in the constructor. The caller owns the lifetime and
+    // is responsible for having no generation in flight.
+    m_backend = backend;
+}
+
 } // namespace kestrel::app

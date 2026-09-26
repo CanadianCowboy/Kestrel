@@ -56,6 +56,12 @@ class AppController final : public QObject {
     Q_PROPERTY(double tokensPerSecond READ tokensPerSecond NOTIFY metricsChanged)
     Q_PROPERTY(int tokensGenerated READ tokensGenerated NOTIFY metricsChanged)
     Q_PROPERTY(QString contextSummary READ contextSummary NOTIFY metricsChanged)
+    // KV cache occupancy in bytes, alongside the token count above. Token
+    // counts stay flat while the bytes behind them grow linearly, so this is
+    // the figure that says whether a bigger context is affordable.
+    Q_PROPERTY(QString kvCacheSummary READ kvCacheSummary NOTIFY metricsChanged)
+    // How much of the shared system prompt is resident and being reused.
+    Q_PROPERTY(QString prefixSummary READ prefixSummary NOTIFY metricsChanged)
 
     // Voice conversation state, projected from the core VoiceSession machine.
     Q_PROPERTY(QString voiceState READ voiceState NOTIFY voiceChanged)
@@ -64,6 +70,17 @@ class AppController final : public QObject {
     Q_PROPERTY(bool canBargeIn READ canBargeIn NOTIFY voiceChanged)
 
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
+
+    // The shared instruction prefix. It is identical on every turn, so the
+    // backend decodes it once and keeps it resident rather than resending it.
+    Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt NOTIFY systemPromptChanged)
+
+    // Loading a model from disk, so the app is not stuck on the mock preview.
+    Q_PROPERTY(bool canLoadModel READ canLoadModel NOTIFY runtimeChanged)
+    Q_PROPERTY(QString modelPath READ modelPath NOTIFY runtimeChanged)
+    // Why the last load attempt failed, empty when it succeeded. Shown next to
+    // the picker so a failure is visible rather than silently ignored.
+    Q_PROPERTY(QString modelError READ modelError NOTIFY modelErrorChanged)
 
     // GPU facts, sourced from a real CUDA probe rather than assumed.
     Q_PROPERTY(bool gpuAvailable READ gpuAvailable NOTIFY runtimeChanged)
@@ -82,6 +99,14 @@ public:
     [[nodiscard]] ConversationModel* conversations() const noexcept;
     [[nodiscard]] int activeConversationId() const noexcept;
     [[nodiscard]] QString conversationTitle() const;
+    /// Returns the shared instruction text declared for subsequent turns.
+    [[nodiscard]] QString systemPrompt() const;
+    /// Returns whether this build provides an available llama.cpp backend.
+    [[nodiscard]] bool canLoadModel() const;
+    /// Returns the loaded model's local path, or an empty string in preview mode.
+    [[nodiscard]] QString modelPath() const;
+    /// Returns the latest model-switch error, cleared after a successful switch.
+    [[nodiscard]] QString modelError() const;
     [[nodiscard]] bool generating() const noexcept;
     [[nodiscard]] bool canRegenerate() const noexcept;
     [[nodiscard]] bool sidebarOpen() const noexcept;
@@ -97,6 +122,10 @@ public:
     [[nodiscard]] double tokensPerSecond() const noexcept;
     [[nodiscard]] int tokensGenerated() const noexcept;
     [[nodiscard]] QString contextSummary() const;
+    /// Formats used and total KV-cache bytes, or reports unavailable accounting.
+    [[nodiscard]] QString kvCacheSummary() const;
+    /// Formats the backend-reported prefix token count or the uncached/empty state.
+    [[nodiscard]] QString prefixSummary() const;
 
     [[nodiscard]] QString voiceState() const;
     [[nodiscard]] bool canPause() const noexcept;
@@ -114,6 +143,8 @@ public:
     void setSidebarOpen(bool open);
     void setSearchQuery(const QString& query);
     void setDiagnosticsOpen(bool open);
+    /// Trims and stores changed instruction text, updates the backend, and publishes metrics.
+    void setSystemPrompt(const QString& text);
 
     Q_INVOKABLE void sendMessage(const QString& text);
     Q_INVOKABLE void stopGeneration();
@@ -125,6 +156,14 @@ public:
     Q_INVOKABLE void deleteConversation(int id);
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
+    /// Loads a GGUF from disk and switches the app onto it. Takes the URL a
+    /// FileDialog hands back rather than a raw path, because QML file dialogs
+    /// speak in URLs and converting here is far more reliable than string
+    /// surgery on the percent-encoded form.
+    Q_INVOKABLE void loadModelFromUrl(const QString& url);
+    /// Goes back to the built-in preview backend, so a user who loaded the
+    /// wrong file is not stuck with it.
+    Q_INVOKABLE void usePreviewBackend();
     // Re-runs device discovery. Probing is cheap, but it is a driver call, so
     // it is explicit rather than happening on every property read.
     Q_INVOKABLE void refreshRuntime();
@@ -142,6 +181,10 @@ signals:
     void searchQueryChanged();
     void runtimeChanged();
     void diagnosticsOpenChanged();
+    /// Notifies observers that the shared instruction text changed.
+    void systemPromptChanged();
+    /// Notifies observers that a model-switch attempt updated or cleared the error.
+    void modelErrorChanged();
     void metricsChanged();
     void voiceChanged();
 
@@ -156,10 +199,30 @@ private:
 
     ConversationEntry* createConversation();
     void setActiveConversation(int id);
-    void startGeneration(const QString& prompt);
+    /// Creates a streaming reply and queues the assembled conversation on the worker.
+    /// Uses userText for the voice response timeline and resets per-response metrics.
+    void startGeneration(const QString& userText);
+
+    /// Assembles the text actually sent to the model: the recent conversation
+    /// followed by an assistant cue. The shared system prompt is excluded on
+    /// purpose, because the backend keeps it as a cached prefix.
+    [[nodiscard]] QString buildPrompt(const QString& userText) const;
+
+    /// Spins the UI event loop until the in-flight generation reports back, or
+    /// the timeout expires. Needed before swapping or destroying a backend,
+    /// because the worker is inside the old backend's generate() right now and
+    /// that backend is about to go away. Bounded, so a wedged backend cannot
+    /// freeze the window.
+    void waitForIdleGeneration(int timeoutMs);
+
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
     void refreshCanRegenerate();
+
+    // Re-reads the backend's status into the snapshot the UI getters use.
+    // Must only be called while the worker is idle; see the definition.
+    void refreshCachedRuntime();
+
     void resetMetrics();
     void publishMetrics();
     void rebuildDiagnostics();
@@ -182,6 +245,9 @@ private:
     bool m_sidebarOpen = true;
     bool m_diagnosticsOpen = false;
     QString m_searchQuery;
+    QString m_systemPrompt;
+    QString m_modelPath;
+    QString m_modelError;
 
     // Live metrics. Token count and the clock are the basis for throughput;
     // the clock only runs while a response is generating.
@@ -202,6 +268,12 @@ private:
     core::GenerationId m_activeGeneration = core::kInvalidGenerationId;
     quint64 m_nextRequestId = 1;
     quint64 m_activeRequestId = 0;
+
+    // A snapshot of the backend's status, taken only when the worker is idle.
+    // Reading the live backend from a property getter would block the UI
+    // thread on the generation mutex for the whole reply.
+    runtime::RuntimeStatus m_cachedStatus;
+    std::size_t m_cachedPrefixTokens = 0;
 
     runtime::CudaProbe m_probe;
     QVariantList m_runtimeDiagnostics;

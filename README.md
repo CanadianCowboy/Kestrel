@@ -380,6 +380,40 @@ The backend contract in `src/runtime/modelbackend.h` is the seam between the app
 - Returning useful errors
 - Reporting basic generation/context metrics
 
+### The shared system prompt
+
+A system prompt is identical on every turn and is often longer than the reply
+it precedes, so reprocessing it per request is the largest avoidable cost in a
+chat turn. `ModelBackend::setSystemPrompt()` declares it once; a backend that
+can hold a cache decodes it into the context one time and leaves its KV entries
+resident, and each turn then pays only for its own tokens.
+
+The contract has one rule callers must respect: **pass `generate()` the
+per-turn prompt only.** The prefix is the backend's business, and repeating it
+in the request undoes the caching as well as double-counting the context.
+
+The reconciliation happens on the worker thread, not in the setter, because a
+model context is not safe to touch from the UI thread. When the prefix is
+unchanged only the tokens after it are dropped, so it survives; when it changes
+the cache is rebuilt once. The diagnostics panel's SHARED PREFIX row shows how
+many tokens are actually resident, so the saving is visible rather than
+theoretical. Backends that cannot cache it report the prefix's cost on every
+turn instead, which is what the mock does.
+
+### KV cache accounting
+
+Token counts alone hide the dominant cost. A context looks the same size whether
+it holds 4k or 128k positions, but the KV cache behind it grows linearly with
+context, and it overtakes the weights as the term that matters.
+
+llama.cpp exposes no accessor for the resolved KV allocation, so the total is
+computed from the model's own shape — layer count, head count, grouped-query
+head count, the context's cell count, and the KV element types the context was
+created with (via `ggml_row_size`, so a quantized cache is measured rather than
+assumed to be f16). A model whose shape does not divide cleanly reports zero
+rather than a guess. For a Qwen2.5-0.5B model at 4096 cells this computes to
+48.0 MiB, matching the 48.00 MiB llama.cpp itself reports.
+
 The mock backend exists so the UI can be developed and reviewed without CUDA, TensorRT, or a model. It should remain usable in development and automated tests.
 
 The TensorRT direction requires an additional model preparation workflow. A typical future flow will be:
@@ -522,11 +556,14 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 - [x] Link llama.cpp for GGUF inference behind an auto-degrading option
 - [x] Make context accounting backend-driven so a loaded model reports exact counts
 - [x] Run the full build and test matrix in CI on Windows, Linux, and macOS
+- [x] Cache the shared system prompt as a reusable prefix instead of resending it
+- [x] Report KV cache occupancy in bytes alongside the token count
+- [x] Load a GGUF from disk through a model picker instead of only the mock
 
 ### Application
 
 - [ ] Persist conversations and settings locally
-- [ ] Add model/engine selection and configuration
+- [ ] Add engine selection and configuration
 - [ ] Improve markdown and code rendering
 - [ ] Add search, rename, delete, and conversation management
 - [ ] Add robust loading, error, and recovery states

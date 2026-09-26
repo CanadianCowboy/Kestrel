@@ -46,6 +46,21 @@ void MockBackend::resetContextUsage() {
     m_contextUsed = 0;
 }
 
+/// Stores prefix text for approximate per-turn accounting without a KV cache.
+void MockBackend::setSystemPrompt(std::string_view text) {
+    // Stored, not cached: there is no KV cache here to keep it in, so the
+    // prefix is charged on every turn exactly as a backend with no prefix
+    // support would be. That makes the mock a fair preview of the cost.
+    m_systemPrompt = text;
+}
+
+/// Clears the prefix text without resetting accumulated context usage.
+void MockBackend::clearSharedPrefix() {
+    m_systemPrompt.clear();
+}
+
+/// Streams a preview response and accounts for prefix, prompt, and response tokens.
+/// Reports completion or cooperative cancellation through onComplete.
 void MockBackend::generate(const GenerationRequest& request,
                            TokenCallback onToken,
                            CompletionCallback onComplete) {
@@ -61,10 +76,12 @@ void MockBackend::generate(const GenerationRequest& request,
         onToken(word + " ");
     }
 
-    // Context grows by the prompt plus whatever this turn produced, capped at
-    // the window so the UI cannot show an impossible fill level.
+    // Context grows by the shared prefix, the prompt and whatever this turn
+    // produced, capped at the window so the UI cannot show an impossible fill
+    // level.
     m_contextUsed = std::min(kContextLimit,
-                             m_contextUsed + countTokens(request.prompt) + countTokens(response));
+                             m_contextUsed + countTokens(m_systemPrompt) +
+                                 countTokens(request.prompt) + countTokens(response));
 
     if (m_cancelled.load(std::memory_order_acquire)) {
         onComplete(false, "Generation stopped");

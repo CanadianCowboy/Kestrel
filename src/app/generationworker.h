@@ -46,6 +46,15 @@ public:
     // Safe to call from any thread, including while generation is in flight.
     void cancel();
 
+    /// Points the worker at a different backend, for when the user loads a
+    /// model from disk.
+    ///
+    /// Not safe while generate() is running: the worker would still be inside
+    /// the old backend's call, and the owner is about to destroy that backend.
+    /// The caller must cancel and wait for the in-flight generation to report
+    /// completion first.
+    void setBackend(runtime::ModelBackend* backend);
+
 signals:
     void tokenReady(quint64 requestId, QString token);
     void finished(quint64 requestId, bool success, QString error);

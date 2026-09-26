@@ -2,10 +2,15 @@
 
 #include "app/generationworker.h"
 #include "runtime/backendregistry.h"
+#include "runtime/llamacppbackend.h"
 
 #include <QClipboard>
 #include <QDateTime>
+#include <QEventLoop>
+#include <QFileInfo>
 #include <QGuiApplication>
+#include <QTimer>
+#include <QUrl>
 #include <QVariantMap>
 
 #include <algorithm>
@@ -16,6 +21,25 @@ namespace kestrel::app {
 namespace {
 
 constexpr int kTitleLimit = 42;
+
+// The shared prefix: every turn starts with this text, so it is the one part of
+// the prompt the backend can decode once and keep resident instead of resending
+// with each request. It is deliberately short, because a long persona prompt is
+// exactly the cost this avoids paying per turn.
+const QString kDefaultSystemPrompt = QStringLiteral(
+    "You are Kestrel, a local desktop assistant running on the user's own "
+    "machine. Answer briefly and plainly, and say when you are unsure instead "
+    "of guessing.");
+
+// How many prior turns are replayed to the model. Bounded because the prompt
+// grows with it, and the whole point of the shared prefix is lost if the
+// per-turn text swamps the part that is cached.
+constexpr std::size_t kHistoryTurns = 8;
+
+// How long the UI will wait for an in-flight generation to unwind before a
+// backend swap proceeds anyway. Generous enough for a real decode, short
+// enough that a wedged backend cannot freeze the window.
+constexpr int kBackendSwapTimeoutMs = 15000;
 
 // Minimum gap between metricsChanged emissions while streaming. Emitting on
 // every token would flood the binding with updates faster than the UI repaints.
@@ -31,17 +55,24 @@ QString deriveTitle(const QString& text) {
 
 } // namespace
 
+/// Initializes preview mode, the default system prompt, a generation worker, and a conversation.
 AppController::AppController(QObject* parent)
     : QObject(parent), m_backend(runtime::selectBackend(runtime::BackendKind::Mock)) {
     m_messageModel = new MessageModel(this);
     m_conversationModel = new ConversationModel(&m_entries, this);
 
     m_probe = runtime::probeCuda();
+    refreshCachedRuntime();
     rebuildDiagnostics();
 
     m_worker = new GenerationWorker(m_backend.get());
     m_worker->moveToThread(&m_generationThread);
     m_generationThread.start();
+
+    // Declare the shared prefix before any turn runs. The backend decodes it
+    // on the first generate() and keeps it from then on.
+    m_systemPrompt = kDefaultSystemPrompt;
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
 
     // The worker emits from its own thread, so these connections are queued and
     // the slots run on the UI thread where the QML state lives.
@@ -105,28 +136,27 @@ QString AppController::searchQuery() const {
 }
 
 QString AppController::backendName() const {
-    return QString::fromStdString(m_backend->status().backendName);
+    return QString::fromStdString(m_cachedStatus.backendName);
 }
 
 QString AppController::modelName() const {
-    return QString::fromStdString(m_backend->status().modelName);
+    return QString::fromStdString(m_cachedStatus.modelName);
 }
 
 QString AppController::runtimeDetail() const {
-    return QString::fromStdString(m_backend->status().detail);
+    return QString::fromStdString(m_cachedStatus.detail);
 }
 
 bool AppController::runtimeAvailable() const {
-    const runtime::RuntimeStatus status = m_backend->status();
-    return status.available && status.modelLoaded;
+    return m_cachedStatus.available && m_cachedStatus.modelLoaded;
 }
 
 int AppController::contextUsed() const {
-    return static_cast<int>(m_backend->status().contextUsed);
+    return static_cast<int>(m_cachedStatus.contextUsed);
 }
 
 int AppController::contextLimit() const {
-    return static_cast<int>(m_backend->status().contextLimit);
+    return static_cast<int>(m_cachedStatus.contextLimit);
 }
 
 double AppController::tokensPerSecond() const noexcept {
@@ -138,13 +168,38 @@ int AppController::tokensGenerated() const noexcept {
 }
 
 QString AppController::contextSummary() const {
-    const runtime::RuntimeStatus status = m_backend->status();
+    const runtime::RuntimeStatus& status = m_cachedStatus;
     if (status.contextLimit == 0) {
         return QStringLiteral("not reported by this backend");
     }
     return QStringLiteral("%1 / %2 tokens")
         .arg(static_cast<qulonglong>(status.contextUsed))
         .arg(static_cast<qulonglong>(status.contextLimit));
+}
+
+/// Formats used and total KV-cache bytes, or reports unavailable accounting.
+QString AppController::kvCacheSummary() const {
+    const runtime::RuntimeStatus& status = m_cachedStatus;
+    if (status.kvCacheBytes == 0) {
+        // Distinct from zero bytes: this backend cannot account for its cache,
+        // which is not the same as the cache being empty.
+        return QStringLiteral("not reported by this backend");
+    }
+    return QStringLiteral("%1 of %2")
+        .arg(QString::fromStdString(runtime::formatBytes(status.kvCacheBytesUsed)))
+        .arg(QString::fromStdString(runtime::formatBytes(status.kvCacheBytes)));
+}
+
+/// Formats the backend-reported prefix token count or the uncached/empty state.
+QString AppController::prefixSummary() const {
+    const std::size_t resident = m_cachedPrefixTokens;
+    if (resident == 0) {
+        return m_systemPrompt.isEmpty()
+                   ? QStringLiteral("none")
+                   : QStringLiteral("not cached — resent every turn");
+    }
+    return QStringLiteral("%1 tokens, reused")
+        .arg(static_cast<qulonglong>(resident));
 }
 
 QString AppController::voiceState() const {
@@ -225,6 +280,152 @@ void AppController::setSidebarOpen(bool open) {
     }
     m_sidebarOpen = open;
     emit sidebarOpenChanged();
+}
+
+/// Returns the shared instruction text declared for subsequent turns.
+QString AppController::systemPrompt() const {
+    return m_systemPrompt;
+}
+
+/// Trims and stores changed instruction text, updates the backend, and publishes metrics.
+void AppController::setSystemPrompt(const QString& text) {
+    const QString trimmed = text.trimmed();
+    if (trimmed == m_systemPrompt) {
+        return;
+    }
+    m_systemPrompt = trimmed;
+    // Declaring a new prefix invalidates the cached one. The backend works out
+    // the consequences on its own thread, so this is safe to call from here.
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    emit systemPromptChanged();
+    publishMetrics();
+}
+
+/// Returns whether this build provides an available llama.cpp backend.
+bool AppController::canLoadModel() const {
+    // Ask a throwaway instance rather than caching a flag: whether a real model
+    // can be loaded is a build-time fact, but a cached copy would go stale the
+    // moment the answer is refactored into a runtime check.
+    return runtime::LlamaCppBackend{}.status().available;
+}
+
+/// Returns the loaded model's local path, or an empty string in preview mode.
+QString AppController::modelPath() const {
+    return m_modelPath;
+}
+
+/// Returns the latest model-switch error, cleared after a successful switch.
+QString AppController::modelError() const {
+    return m_modelError;
+}
+
+/// Loads a local GGUF URL synchronously before attempting to replace the backend.
+/// Keeps the current backend on validation/load failure or if generation remains active.
+void AppController::loadModelFromUrl(const QString& url) {
+    const QString path = QUrl(url).toLocalFile();
+    if (path.isEmpty()) {
+        // A dialog can hand back an empty selection, and a non-file URL (a
+        // remote location) has no local path at all. Both are user error, not
+        // a crash, so say so rather than passing "" to the loader.
+        m_modelError = tr("That is not a local file. Choose a GGUF from disk.");
+        emit modelErrorChanged();
+        return;
+    }
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        m_modelError = tr("No such file: %1").arg(path);
+        emit modelErrorChanged();
+        return;
+    }
+    // Checking the extension first turns a typo into a clear message instead of
+    // an opaque loader failure deep inside llama.cpp.
+    if (info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) != 0) {
+        m_modelError = tr("%1 is not a GGUF file.").arg(info.fileName());
+        emit modelErrorChanged();
+        return;
+    }
+
+    // Build and load the candidate before touching the running backend, so a
+    // failed attempt leaves the app exactly as it was. Loading a model takes
+    // seconds; finding out afterwards that it was the wrong file should not
+    // cost the user their current one.
+    auto candidate = std::make_unique<runtime::LlamaCppBackend>();
+    if (!candidate->status().available) {
+        m_modelError = QString::fromStdString(candidate->status().detail);
+        emit modelErrorChanged();
+        return;
+    }
+
+    std::string error;
+    if (!candidate->loadModel(path.toStdString(), error)) {
+        m_modelError = QString::fromStdString(error);
+        emit modelErrorChanged();
+        return;
+    }
+
+    // The new model is proven loadable. Now it is safe to tear the old one
+    // down -- but only once the worker has left it.
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    if (m_generating) {
+        m_modelError = tr("A response is still running. Stop it and try again.");
+        emit modelErrorChanged();
+        return;
+    }
+
+    m_modelPath = path;
+    m_modelError.clear();
+    m_backend = std::move(candidate);
+    m_worker->setBackend(m_backend.get());
+    // The new context holds none of the old prefix's entries, so re-declare it
+    // and let the backend rebuild the cache on the next turn.
+    m_backend->clearSharedPrefix();
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    refreshCachedRuntime();
+    rebuildDiagnostics();
+    emit modelErrorChanged();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
+/// Cancels generation and switches to the mock backend only once idle.
+/// Preserves the declared system prompt and reports a timeout through modelError().
+void AppController::usePreviewBackend() {
+    waitForIdleGeneration(kBackendSwapTimeoutMs);
+    if (m_generating) {
+        m_modelError = tr("A response is still running. Stop it and try again.");
+        emit modelErrorChanged();
+        return;
+    }
+    m_modelPath.clear();
+    m_modelError.clear();
+    m_backend = runtime::selectBackend(runtime::BackendKind::Mock);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    refreshCachedRuntime();
+    rebuildDiagnostics();
+    emit modelErrorChanged();
+    emit runtimeChanged();
+    emit metricsChanged();
+}
+
+/// Requests cancellation and pumps a nested event loop for at most timeoutMs.
+/// Callers must check m_generating afterwards before replacing the backend.
+void AppController::waitForIdleGeneration(int timeoutMs) {
+    if (!m_generating) {
+        return;
+    }
+    stopGeneration();
+    QEventLoop loop;
+    const QMetaObject::Connection done =
+        connect(this, &AppController::generatingChanged, &loop, [&loop, this] {
+        if (!m_generating) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+    loop.exec();
+    disconnect(done);
 }
 
 void AppController::setSearchQuery(const QString& query) {
@@ -329,7 +530,9 @@ void AppController::onGenerationFinished(quint64 requestId,
     emit voiceChanged();
 }
 
-void AppController::startGeneration(const QString& prompt) {
+/// Creates a streaming reply and queues the assembled conversation on the worker.
+/// Uses userText for the voice response timeline and resets per-response metrics.
+void AppController::startGeneration(const QString& userText) {
     m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
     m_generating = true;
     m_userStopped = false;
@@ -338,7 +541,7 @@ void AppController::startGeneration(const QString& prompt) {
     resetMetrics();
     m_generationClock.start();
 
-    m_activeResponse = m_voice.queueResponse(prompt.toStdString());
+    m_activeResponse = m_voice.queueResponse(userText.toStdString());
     m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
     m_activeRequestId = m_nextRequestId++;
 
@@ -354,7 +557,45 @@ void AppController::startGeneration(const QString& prompt) {
         return;
     }
 
-    m_worker->start(m_activeRequestId, prompt, 0.7F, 512);
+    // The voice timeline tracks the user's words; the model gets the assembled
+    // conversation. The system prompt is not in it -- the backend holds that as
+    // a cached prefix, and repeating it here would undo the caching.
+    m_worker->start(m_activeRequestId, buildPrompt(userText), 0.7F, 512);
+}
+
+/// Formats nonempty user/assistant messages among the latest eight entries, then an assistant cue.
+/// Excludes the shared system prompt; userText is currently unused.
+QString AppController::buildPrompt(const QString& userText) const {
+    QString prompt;
+    const ConversationEntry* entry = activeEntry();
+    if (entry != nullptr) {
+        const auto& messages = entry->conversation.messages();
+        // Walk backwards so the limit keeps the most recent turns, which are
+        // the ones the current question actually depends on.
+        const std::size_t firstUsable =
+            messages.size() > kHistoryTurns ? messages.size() - kHistoryTurns : 0;
+        for (std::size_t i = firstUsable; i < messages.size(); ++i) {
+            const core::Message& message = messages[i];
+            // The empty assistant placeholder for this turn is already in the
+            // conversation and would only add a dangling label.
+            if (message.content.empty()
+                || (message.role != core::MessageRole::User
+                    && message.role != core::MessageRole::Assistant)) {
+                continue;
+            }
+            if (!prompt.isEmpty()) {
+                prompt += QLatin1Char('\n');
+            }
+            prompt += message.role == core::MessageRole::User ? QStringLiteral("User: ")
+                                                               : QStringLiteral("Assistant: ");
+            prompt += QString::fromStdString(message.content);
+        }
+    }
+    if (!prompt.isEmpty()) {
+        prompt += QLatin1Char('\n');
+    }
+    prompt += QStringLiteral("Assistant:");
+    return prompt;
 }
 
 void AppController::finalizeStream(MessageStatus status, const QString& note) {
@@ -363,6 +604,9 @@ void AppController::finalizeStream(MessageStatus status, const QString& note) {
     m_userPaused = false;
     m_userStopped = false;
     m_generationClock.invalidate();
+    // The turn is over, so the backend is idle and the counters it moved during
+    // generation can now be read without blocking anything.
+    refreshCachedRuntime();
     emit generatingChanged();
     touchActiveConversation();
     emit runtimeChanged();
@@ -575,6 +819,7 @@ void AppController::copyToClipboard(const QString& text) const {
 
 void AppController::refreshRuntime() {
     m_probe = runtime::probeCuda();
+    refreshCachedRuntime();
     rebuildDiagnostics();
     emit runtimeChanged();
 }
@@ -626,6 +871,19 @@ void AppController::setActiveConversation(int id) {
     m_messageModel->setEntry(findEntry(id));
     emit activeConversationChanged();
     refreshCanRegenerate();
+}
+
+// Takes the snapshot the getters read.
+//
+// ONLY call this when the worker is known to be idle. Calling it mid-turn
+// reintroduces exactly the stall this exists to remove, since the backend's
+// accessors take the lock generate() is holding.
+void AppController::refreshCachedRuntime() {
+    if (m_generating) {
+        return;
+    }
+    m_cachedStatus = m_backend->status();
+    m_cachedPrefixTokens = m_backend->cachedPrefixTokens();
 }
 
 void AppController::touchActiveConversation() {

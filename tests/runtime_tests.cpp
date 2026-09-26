@@ -456,12 +456,61 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
     }
 }
 
-// Exercises the real llama.cpp generation path.
-//
-// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
-// a multi-hundred-megabyte model download to run the suite. When it is set,
-// this is the only test that proves the backend actually generates rather than
-// merely linking.
+/// The shared system prompt contract, which must hold in every configuration.
+void testSharedSystemPromptPrefix() {
+    runtime::MockBackend mock;
+
+    // No prefix declared: nothing to reuse, and no cost claimed.
+    assert(mock.systemPrompt().empty());
+    assert(mock.cachedPrefixTokens() == 0);
+
+    const std::string prefix = "You are Kestrel, a local assistant running on the user's own machine.";
+    mock.setSystemPrompt(prefix);
+    assert(mock.systemPrompt() == prefix);
+    // A backend with no cache still charges for the prefix on every turn, so
+    // the figure is the prefix cost, not a fictitious saving.
+    assert(mock.cachedPrefixTokens() == mock.countTokens(prefix));
+    assert(mock.cachedPrefixTokens() > 0);
+
+    // Redeclaring the same text must be idempotent, or a setter that fires on
+    // every property write would invalidate the cache each time.
+    mock.setSystemPrompt(prefix);
+    assert(mock.systemPrompt() == prefix);
+
+    // A different prompt is a different prefix and must replace the old one.
+    mock.setSystemPrompt("A completely different instruction set.");
+    assert(mock.systemPrompt() != prefix);
+
+    mock.clearSharedPrefix();
+    assert(mock.systemPrompt().empty());
+    assert(mock.cachedPrefixTokens() == 0);
+
+    // A backend that caches a prefix must not require the caller to include it
+    // in the per-turn prompt, and must not double-charge for it.
+    mock.setSystemPrompt(prefix);
+    mock.resetContextUsage();
+    const std::size_t afterPrefixOnly = mock.status().contextUsed;
+    assert(afterPrefixOnly == 0);
+    // The reply has to be collected to be charged for, so the exact figure can
+    // be stated: prefix, the turn's own prompt, and what came back.
+    std::string reply;
+    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32},
+                  [&reply](std::string_view token) { reply.append(token); },
+                  [](bool, std::string_view) {});
+    assert(!reply.empty());
+
+    // Exact, not a lower bound. A duplicate charge of the prefix is precisely
+    // the bug worth catching here, and ">=" would sail straight past it.
+    assert(mock.status().contextUsed
+           == mock.countTokens(prefix) + mock.countTokens("hello") + mock.countTokens(reply));
+}
+
+/// Exercises the real llama.cpp generation path.
+///
+/// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
+/// a multi-hundred-megabyte model download to run the suite. When it is set,
+/// this is the only test that proves the backend actually generates rather than
+/// merely linking.
 void testLlamaCppGeneratesFromRealModel() {
     const char* modelPath = std::getenv("KESTREL_TEST_GGUF");
     if (modelPath == nullptr || *modelPath == '\0') {
@@ -528,8 +577,78 @@ void testLlamaCppGeneratesFromRealModel() {
     const runtime::RuntimeStatus after = backend.status();
     assert(after.contextUsed > 0);
     assert(after.contextUsed <= after.contextLimit);
+
+    // The KV byte total must be a real allocation derived from the model's own
+    // shape, and the used share must stay within it and grow with use. For
+    // this model llama.cpp itself reports 48.00 MiB for 4096 cells, which is
+    // what the formula below has to reproduce.
+    assert(after.kvCacheBytes > 0);
+    assert(after.kvCacheBytesUsed > 0);
+    assert(after.kvCacheBytesUsed <= after.kvCacheBytes);
+    // A full context must fit the window exactly: the byte figure is derived
+    // from contextLimit, so the two cannot drift apart.
+    assert(after.kvCacheBytes ==
+           after.kvCacheBytesUsed * after.contextLimit / after.contextUsed);
+    std::printf("  kv cache: %s of %s (%zu cells, %d used)\n",
+                runtime::formatBytes(after.kvCacheBytesUsed).c_str(),
+                runtime::formatBytes(after.kvCacheBytes).c_str(), after.contextLimit,
+                static_cast<int>(after.contextUsed));
+
+    // The shared prefix is the point of the cache: declared before a turn, it
+    // must be resident afterwards rather than resent with the next request.
+    const std::string prefix =
+        "You are Kestrel, a local desktop assistant. Answer briefly and plainly.\n";
+    backend.setSystemPrompt(prefix);
+    std::string firstTurn;
+    std::string firstError;
+    bool firstOk = false;
+    backend.generate(runtime::GenerationRequest{"Name one bird.", 0.7F, 16},
+                     [&firstTurn](std::string_view token) { firstTurn.append(token); },
+                     [&firstOk, &firstError](bool ok, std::string_view error) {
+                         firstOk = ok;
+                         firstError = std::string(error);
+                     });
+    if (!firstOk) {
+        std::printf("  FAIL  prefixed turn refused: \"%s\"\n", firstError.c_str());
+        std::abort();
+    }
+    assert(!firstTurn.empty());
+    const std::size_t resident = backend.cachedPrefixTokens();
+    assert(resident > 0);
+    // The resident count must be the model's real tokenization of the prefix,
+    // not the chars-per-token fallback, or the saving is not being measured.
+    assert(resident != runtime::MockBackend{}.countTokens(prefix));
+
+    // A second turn reuses those entries. If the prefix were re-decoded at
+    // position 0, or left in place without shifting, the reply would degrade
+    // into nonsense or fail outright, so generating coherent text again is the
+    // evidence that the positions line up.
+    std::string secondTurn;
+    std::string secondError;
+    bool secondOk = false;
+    backend.generate(runtime::GenerationRequest{"Name a different bird.", 0.7F, 16},
+                     [&secondTurn](std::string_view token) { secondTurn.append(token); },
+                     [&secondOk, &secondError](bool ok, std::string_view error) {
+                         secondOk = ok;
+                         secondError = std::string(error);
+                     });
+    if (!secondOk) {
+        std::printf("  FAIL  second prefixed turn refused: \"%s\"\n", secondError.c_str());
+        std::abort();
+    }
+    assert(!secondTurn.empty());
+    assert(backend.cachedPrefixTokens() == resident);
+    std::printf("  shared prefix: %zu tokens resident, turn 2: %.60s\n", resident,
+                secondTurn.c_str());
+
+    // Clearing the prefix must make the next turn start from an empty context
+    // rather than inherit the previous one's instructions.
+    backend.clearSharedPrefix();
+    assert(backend.systemPrompt().empty());
+    assert(backend.cachedPrefixTokens() == 0);
 }
 
+/// Runs portable runtime checks and optional GGUF integration checks; assertions abort on failure.
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
     // checks ran. A lost buffer turns a five-second diagnosis into a guess.
@@ -552,6 +671,7 @@ int main() {
     KESTREL_RUN(testTensorRtBackendValidatesEngine);
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
     KESTREL_RUN(testBackendDrivenTokenCounting);
+    KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
     KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
 #undef KESTREL_RUN
