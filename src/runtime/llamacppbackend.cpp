@@ -84,6 +84,13 @@ LlamaCppBackend::LlamaCppBackend() {
     ensureBackendInitialised();
     m_impl = std::make_unique<Impl>();
     m_status.detail = "llama.cpp linked; no model loaded";
+    // Resolve the status now rather than on the first load. A backend that
+    // reports itself unavailable until it has already loaded a model is
+    // invisible to everything that asks first: selectBackend() skipped it, the
+    // UI hid the model picker, and loading a file was refused with a message
+    // claiming no model was loaded. Reaching this translation unit at all
+    // means llama.cpp is linked, so availability is settled here.
+    refreshStatus();
 }
 
 // Frees any loaded context and model before this backend is destroyed.

@@ -521,6 +521,18 @@ void testLlamaCppGeneratesFromRealModel() {
     runtime::LlamaCppBackend backend;
     std::string error;
 
+    // A freshly constructed backend must already claim to be available, with no
+    // model loaded. This is the state the registry inspects when choosing a
+    // backend and the state the model picker gates its button on, so a backend
+    // that reported itself unavailable here was one nobody could ever hand a
+    // model. It is asserted here, in a build where llama.cpp is actually
+    // linked, because that is the only configuration where it can be wrong.
+    if (!backend.status().available) {
+        std::printf("  FAIL  a linked llama.cpp backend reported itself unavailable\n");
+        std::abort();
+    }
+    assert(!backend.status().modelLoaded);
+
 
     if (!backend.loadModel(modelPath, error)) {
         std::printf("  FAIL  could not load %s: %s\n", modelPath, error.c_str());
