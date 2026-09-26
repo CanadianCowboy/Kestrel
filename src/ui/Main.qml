@@ -28,6 +28,7 @@ ApplicationWindow {
 
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
     Shortcut { sequence: "Ctrl+K"; onActivated: composer.forceActiveFocus() }
+    Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
     Shortcut { sequence: "Escape"; onActivated: appController.stopGeneration() }
 
     Rectangle {
@@ -129,7 +130,7 @@ ApplicationWindow {
 
                     Rectangle {
                         Layout.fillWidth: true
-                        implicitHeight: 78
+                        implicitHeight: 96
                         radius: 12
                         color: "#15181d"
                         border.color: window.line
@@ -144,6 +145,13 @@ ApplicationWindow {
                                 Text { text: appController.modelName; color: window.ink; font.pixelSize: 12 }
                             }
                             Text { text: appController.backendName; color: window.muted; font.pixelSize: 11 }
+                            Text {
+                                text: appController.gpuAvailable ? appController.gpuSummary : "No GPU detected"
+                                color: appController.gpuAvailable ? window.muted : "#b5909c"
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                                width: parent.width
+                            }
                         }
                     }
                 }
@@ -173,17 +181,41 @@ ApplicationWindow {
                     }
                     Item { Layout.fillWidth: true }
                     Rectangle {
+                        id: gpuBadge
                         implicitWidth: 126
                         implicitHeight: 34
                         radius: 17
-                        color: "#17221f"
-                        border.color: "#2d463d"
+                        color: appController.diagnosticsOpen ? "#1e2a26" : "#17221f"
+                        border.color: appController.gpuAvailable ? "#2d463d" : "#3a3038"
+                        Behavior on color { ColorAnimation { duration: 160 } }
                         Row {
                             anchors.centerIn: parent
                             spacing: 8
-                            Rectangle { width: 7; height: 7; radius: 4; color: window.accent; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: "GPU READY"; color: window.accent; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                            Rectangle {
+                                width: 7; height: 7; radius: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: appController.gpuAvailable ? window.accent : "#8a6a74"
+                            }
+                            Text {
+                                text: appController.gpuAvailable ? "GPU READY" : "NO GPU"
+                                color: appController.gpuAvailable ? window.accent : "#b5909c"
+                                font.pixelSize: 10
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 1
+                            }
                         }
+                        MouseArea {
+                            id: gpuBadgeHover
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
+                            onClicked: appController.diagnosticsOpen = !appController.diagnosticsOpen
+                        }
+                        ToolTip.visible: gpuBadgeHover.containsMouse
+                        ToolTip.text: appController.gpuAvailable
+                                       ? appController.gpuName + " — " + appController.gpuDetail
+                                       : appController.gpuDetail
+                        ToolTip.delay: 400
                     }
                 }
 
@@ -306,6 +338,128 @@ ApplicationWindow {
                         }
 
                         Text { text: "Kestrel can make mistakes. Nothing leaves this device."; color: "#555d69"; font.pixelSize: 10; Layout.alignment: Qt.AlignHCenter }
+                    }
+                }
+            }
+        }
+
+        // Runtime diagnostics live in a secondary panel, never in the
+        // conversation flow, so the main workspace stays quiet as the runtime
+        // layer grows.
+        Rectangle {
+            id: diagnosticsPanel
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            anchors.margins: 18
+            width: 360
+            radius: 18
+            color: "#15171c"
+            border.color: window.line
+            visible: appController.diagnosticsOpen
+            opacity: appController.diagnosticsOpen ? 1 : 0
+            clip: true
+
+            Behavior on opacity {
+                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 18
+                spacing: 14
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Column {
+                        spacing: 3
+                        Text { text: "Runtime"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
+                        Text { text: "Ctrl+D to close  ·  click Refresh to re-probe"; color: window.muted; font.pixelSize: 10 }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: "Refresh"
+                        implicitHeight: 30
+                        onClicked: appController.refreshRuntime()
+                        contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: window.line; opacity: 0.7 }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Text { text: "ACTIVE MODEL"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Text { text: appController.modelName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                    Text { text: appController.runtimeDetail; color: window.muted; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: gpuColumn.implicitHeight + 24
+                    radius: 12
+                    color: "#1a1d23"
+                    border.color: window.line
+                    ColumnLayout {
+                        id: gpuColumn
+                        anchors.fill: parent
+                        anchors.margins: 12
+                        spacing: 6
+                        Text { text: "GPU"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                        Text { text: appController.gpuName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                        Text {
+                            text: appController.gpuAvailable
+                                  ? appController.gpuSummary + "  ·  " + appController.gpuDeviceCount + " device(s)"
+                                  : appController.gpuDetail
+                            color: window.muted; font.pixelSize: 11
+                            wrapMode: Text.Wrap
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+
+                Text { text: "DIAGNOSTICS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+
+                ListView {
+                    id: diagnosticList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 10
+                    model: appController.runtimeDiagnostics
+                    boundsBehavior: Flickable.StopAtBounds
+                    delegate: ColumnLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 2
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 7
+                            Rectangle {
+                                width: 6; height: 6; radius: 3
+                                color: modelData.ok ? window.accent : "#8a6a74"
+                                Layout.alignment: Qt.AlignTop
+                                Layout.topMargin: 4
+                            }
+                            Text {
+                                text: modelData.label
+                                color: window.ink
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                                Layout.fillWidth: true
+                                wrapMode: Text.Wrap
+                            }
+                        }
+                        Text {
+                            text: modelData.value
+                            color: window.muted
+                            font.pixelSize: 11
+                            wrapMode: Text.Wrap
+                            Layout.fillWidth: true
+                            Layout.leftMargin: 13
+                        }
                     }
                 }
             }

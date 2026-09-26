@@ -1,14 +1,23 @@
 #include "app/appcontroller.h"
 
-#include "runtime/mockbackend.h"
+#include "runtime/backendregistry.h"
 
 #include <QVariantMap>
 
 namespace kestrel::app {
 
+namespace {
+
+QString fromStd(const std::string& text) {
+    return QString::fromStdString(text);
+}
+
+} // namespace
+
 AppController::AppController(QObject* parent)
-    : QObject(parent), m_backend(std::make_unique<runtime::MockBackend>()) {
-    refreshRuntime();
+    : QObject(parent), m_backend(runtime::selectBackend(runtime::BackendKind::Mock)) {
+    m_probe = runtime::probeCuda();
+    rebuildDiagnostics();
 }
 
 QVariantList AppController::messages() const {
@@ -20,15 +29,15 @@ QString AppController::conversationTitle() const {
 }
 
 QString AppController::backendName() const {
-    return QString::fromStdString(m_backend->status().backendName);
+    return fromStd(m_backend->status().backendName);
 }
 
 QString AppController::modelName() const {
-    return QString::fromStdString(m_backend->status().modelName);
+    return fromStd(m_backend->status().modelName);
 }
 
 QString AppController::runtimeDetail() const {
-    return QString::fromStdString(m_backend->status().detail);
+    return fromStd(m_backend->status().detail);
 }
 
 bool AppController::generating() const noexcept {
@@ -39,6 +48,57 @@ bool AppController::sidebarOpen() const noexcept {
     return m_sidebarOpen;
 }
 
+bool AppController::diagnosticsOpen() const noexcept {
+    return m_diagnosticsOpen;
+}
+
+bool AppController::gpuAvailable() const {
+    return m_probe.runtime.available && m_probe.selectedDevice() != nullptr;
+}
+
+QString AppController::gpuName() const {
+    const runtime::CudaDeviceInfo* device = m_probe.selectedDevice();
+    if (device == nullptr) {
+        return QStringLiteral("No GPU detected");
+    }
+    return fromStd(device->name);
+}
+
+QString AppController::gpuSummary() const {
+    const runtime::CudaDeviceInfo* device = m_probe.selectedDevice();
+    if (device == nullptr) {
+        return QStringLiteral("unavailable");
+    }
+    return QStringLiteral("sm_%1 · %2")
+        .arg(QString::fromStdString(device->computeCapability()),
+             QString::fromStdString(device->memorySummary()));
+}
+
+QString AppController::gpuDetail() const {
+    const runtime::CudaDeviceInfo* device = m_probe.selectedDevice();
+    if (device == nullptr) {
+        return fromStd(m_probe.runtime.detail);
+    }
+    return fromStd(runtime::describeDevice(*device));
+}
+
+QString AppController::computeCapability() const {
+    const runtime::CudaDeviceInfo* device = m_probe.selectedDevice();
+    if (device == nullptr) {
+        return QString();
+    }
+    return QStringLiteral("sm_%1")
+        .arg(QString::fromStdString(device->computeCapability()));
+}
+
+int AppController::gpuDeviceCount() const {
+    return static_cast<int>(m_probe.devices.size());
+}
+
+QVariantList AppController::runtimeDiagnostics() const {
+    return m_runtimeDiagnostics;
+}
+
 void AppController::setSidebarOpen(bool open) {
     if (m_sidebarOpen == open) {
         return;
@@ -47,17 +107,19 @@ void AppController::setSidebarOpen(bool open) {
     emit sidebarOpenChanged();
 }
 
-void AppController::appendMessage(runtime::BackendKind role, const QString& content) {
-    QString roleName = QStringLiteral("assistant");
-    if (role == runtime::BackendKind::Mock) {
-        roleName = QStringLiteral("assistant");
+void AppController::setDiagnosticsOpen(bool open) {
+    if (m_diagnosticsOpen == open) {
+        return;
     }
+    m_diagnosticsOpen = open;
+    emit diagnosticsOpenChanged();
+}
 
+void AppController::appendMessage(const QString& role, const QString& content) {
     QVariantMap message;
-    message.insert(QStringLiteral("role"), roleName);
+    message.insert(QStringLiteral("role"), role);
     message.insert(QStringLiteral("content"), content);
     m_messages.append(message);
-    emit messagesChanged();
 }
 
 void AppController::sendMessage(const QString& text) {
@@ -66,21 +128,14 @@ void AppController::sendMessage(const QString& text) {
         return;
     }
 
-    QVariantMap userMessage;
-    userMessage.insert(QStringLiteral("role"), QStringLiteral("user"));
-    userMessage.insert(QStringLiteral("content"), trimmed);
-    m_messages.append(userMessage);
-
-    QVariantMap assistantMessage;
-    assistantMessage.insert(QStringLiteral("role"), QStringLiteral("assistant"));
-    assistantMessage.insert(QStringLiteral("content"), QString());
-    m_messages.append(assistantMessage);
-    emit messagesChanged();
+    appendMessage(QStringLiteral("user"), trimmed);
+    appendMessage(QStringLiteral("assistant"), QString());
 
     if (m_messages.size() == 2) {
         m_conversationTitle = trimmed.left(34);
         emit conversationTitleChanged();
     }
+    emit messagesChanged();
 
     m_generating = true;
     emit generatingChanged();
@@ -102,7 +157,7 @@ void AppController::sendMessage(const QString& text) {
         [this](bool, std::string_view) {
             m_generating = false;
             emit generatingChanged();
-            refreshRuntime();
+            emit runtimeChanged();
         });
 }
 
@@ -121,7 +176,20 @@ void AppController::newConversation() {
 }
 
 void AppController::refreshRuntime() {
+    m_probe = runtime::probeCuda();
+    rebuildDiagnostics();
     emit runtimeChanged();
+}
+
+void AppController::rebuildDiagnostics() {
+    m_runtimeDiagnostics.clear();
+    for (const runtime::RuntimeDiagnostic& row : runtime::runtimeDiagnostics(m_probe)) {
+        QVariantMap entry;
+        entry.insert(QStringLiteral("label"), fromStd(row.label));
+        entry.insert(QStringLiteral("value"), fromStd(row.value));
+        entry.insert(QStringLiteral("ok"), row.ok);
+        m_runtimeDiagnostics.append(entry);
+    }
 }
 
 } // namespace kestrel::app
