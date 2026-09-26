@@ -76,7 +76,12 @@ jobs:
     # visible; it is non-gating rather than skipped or disabled. The cost is
     # that macOS desktop coverage is not currently enforced. Delete this line
     # when a Qt release whose arm64 build no longer mentions AGL is in use.
-    continue-on-error: ${{ runner.os == 'macOS' }}
+    #
+    # `matrix.os`, not `runner.os`: only github, needs, strategy, matrix, vars
+    # and inputs are available on a job's own keys, and using `runner` here
+    # makes the whole workflow uncompilable. That is the same trap as the `env`
+    # in the job name below, which cost this pipeline every run it ever had.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
