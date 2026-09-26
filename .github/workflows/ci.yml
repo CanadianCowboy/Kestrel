@@ -114,16 +114,32 @@ jobs:
         id: app
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows_NT" ]; then
-            # Multi-config generators put binaries in a per-config subdirectory.
-            EXE="$PWD/build/Release/kestrel.exe"
-          else
-            EXE="$PWD/build/kestrel"
-          fi
-          if [ ! -x "$EXE" ]; then
-            echo "::error::app binary not found at $EXE"
+          # Search for a real file instead of deriving the path from the
+          # platform. A multi-config generator puts the binary under
+          # build/Release, a single-config one at the top of build, and the
+          # platform test that used to choose between them picked wrong on
+          # Windows -- exporting a path to a *directory*.
+          #
+          # The old guard was `[ ! -x ]`, which a directory satisfies, so the
+          # step passed and the QML check below ran a directory. It produced no
+          # output, found no binding errors, and reported success for an
+          # application it never launched. -f cannot be satisfied by a
+          # directory, so a wrong path now fails loudly instead.
+          EXE=""
+          for candidate in \
+            "$PWD/build/Release/kestrel.exe" \
+            "$PWD/build/kestrel.exe" \
+            "$PWD/build/kestrel"; do
+            if [ -f "$candidate" ]; then
+              EXE="$candidate"
+              break
+            fi
+          done
+          if [ -z "$EXE" ]; then
+            echo "::error::no kestrel binary found under $PWD/build"
             exit 1
           fi
+          echo "running: $EXE"
           echo "path=$EXE" >> "$GITHUB_OUTPUT"
 
       - name: QML scene loads
@@ -141,6 +157,14 @@ jobs:
           wait "$APP_PID" 2>/dev/null || true
           echo "--- Qt diagnostics ---"
           cat qml.log
+          # An empty log means the scene never started, which is a failure and
+          # not a pass. Without this the check reports success whenever the
+          # binary produced no output at all, which is exactly what happened
+          # while it was being handed a directory.
+          if [ ! -s qml.log ]; then
+            echo "::error::the app produced no output; the scene never started"
+            exit 1
+          fi
           if grep -Eiq "ReferenceError|TypeError|is not a member|Unable to assign" qml.log; then
             echo "::error::QML reported binding errors"
             exit 1
