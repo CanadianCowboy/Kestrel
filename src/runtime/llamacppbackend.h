@@ -46,7 +46,8 @@ private:
     // wrapper so this header never mentions a llama type.
     struct Impl;
 
-    void refreshStatusLocked(std::unique_lock<std::mutex>& lock);
+    // Caller must hold m_mutex.
+    void refreshStatus();
     [[nodiscard]] std::size_t countTokensImpl(std::string_view text) const;
 
     mutable std::mutex m_mutex;

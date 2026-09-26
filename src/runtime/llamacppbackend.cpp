@@ -13,10 +13,10 @@ namespace kestrel::runtime {
 
 #ifdef KESTREL_HAS_LLAMA_CPP
 
-// llama_backend_init() is process-global and reference counted upstream, but
-// calling it once per backend instance is cheap and keeps the pairing obvious.
 namespace {
 
+// llama_backend_init() is process-global. Doing it once here keeps the pairing
+// with the model lifetime obvious.
 void ensureBackendInitialised() {
     static const bool initialised = [] {
         llama_backend_init();
@@ -63,15 +63,16 @@ RuntimeStatus LlamaCppBackend::status() const {
 }
 
 bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error) {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_impl || m_impl->model == nullptr) {
-        error = "llama.cpp is not linked in this build";
-        return false;
-    }
+    // No "is the library linked" guard here. Reaching this translation unit at
+    // all means llama.cpp is linked; that is a compile-time fact, not runtime
+    // state. A previous version tested m_impl->model != nullptr, which is null
+    // before the *first* load, so the very first loadModel call was rejected
+    // as though the library were missing.
 
     // Release the previous pair before loading a replacement, so a failed load
-    // does not leave a half-swapped model and context behind.
+    // cannot leave a half-swapped model and context behind.
     if (m_impl->context != nullptr) {
         llama_free(m_impl->context);
         m_impl->context = nullptr;
@@ -80,16 +81,18 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
         llama_model_free(m_impl->model);
         m_impl->model = nullptr;
     }
+    m_impl->modelPath.clear();
+    refreshStatus();
 
     llama_model_params modelParams = llama_model_default_params();
     // n_gpu_layers is left at the library default so a CUDA-enabled llama.cpp
-    // build offloads automatically; Kestrel's own CUDA probe reports whether
-    // a GPU is actually present.
+    // build offloads automatically; Kestrel's own probe reports whether a GPU
+    // is actually present.
     llama_model* model = llama_model_load_from_file(modelPath.c_str(), modelParams);
     if (model == nullptr) {
         error = "llama.cpp could not load " + modelPath +
                 ". Is it a GGUF file produced for this build?";
-        refreshStatusLocked(lock);
+        refreshStatus();
         return false;
     }
 
@@ -103,7 +106,7 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
         llama_model_free(model);
         error = "llama.cpp allocated a model but could not create a context. "
                 "Check available RAM and the requested context size.";
-        refreshStatusLocked(lock);
+        refreshStatus();
         return false;
     }
 
@@ -111,17 +114,19 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     m_impl->context = context;
     m_impl->modelPath = modelPath;
     m_contextUsed = 0;
-    refreshStatusLocked(lock);
+    refreshStatus();
     return true;
 }
 
-void LlamaCppBackend::refreshStatusLocked(std::unique_lock<std::mutex>&) {
-    m_status.modelLoaded = m_impl != nullptr && m_impl->model != nullptr;
-    if (m_status.modelLoaded) {
+void LlamaCppBackend::refreshStatus() {
+    const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
+    m_status.modelLoaded = loaded;
+    if (loaded) {
         const std::filesystem::path path(m_impl->modelPath);
-        m_status.modelName =
-            path.has_filename() ? path.filename().string() : m_impl->modelPath;
-        m_status.contextLimit = llama_n_ctx(m_impl->model);
+        m_status.modelName = path.has_filename() ? path.filename().string() : m_impl->modelPath;
+        // The context window is a property of the context, not the model, so
+        // this reads the live allocation rather than a training default.
+        m_status.contextLimit = llama_n_ctx(m_impl->context);
         m_status.contextUsed = m_contextUsed;
         m_status.detail = "Loaded " + m_status.modelName;
     } else {
@@ -130,8 +135,8 @@ void LlamaCppBackend::refreshStatusLocked(std::unique_lock<std::mutex>&) {
         m_status.contextUsed = 0;
     }
     // Availability means "this backend can serve requests at all", which is
-    // true as soon as the library is linked. The registry falls back to the
-    // mock when no model is loaded, via modelLoaded.
+    // true as soon as the library is linked. modelLoaded is what the registry
+    // consults to decide whether a model is actually usable.
     m_status.available = true;
 }
 
@@ -152,27 +157,26 @@ std::size_t LlamaCppBackend::countTokensImpl(std::string_view text) const {
     if (m_impl == nullptr || m_impl->model == nullptr) {
         return 0;
     }
+    const llama_vocab* vocab = llama_model_get_vocab(m_impl->model);
 
     // Ask the library how many tokens it needs, then tokenize for real. The
-    // two-call pattern avoids guessing an upper bound that silently truncates
-    // a long prompt.
-    const int needed = llama_tokenize(
-        m_impl->model, text.data(), static_cast<int>(text.size()), nullptr, 0, true, true);
+    // two-call pattern avoids guessing an upper bound that would silently
+    // truncate a long prompt.
+    const int needed = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()),
+                                      nullptr, 0, true, true);
     if (needed <= 0) {
         return 0;
     }
     std::vector<llama_token> tokens(static_cast<std::size_t>(needed));
-    const int written = llama_tokenize(m_impl->model, text.data(),
-                                       static_cast<int>(text.size()), tokens.data(), needed,
-                                       true, true);
+    const int written = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()),
+                                       tokens.data(), needed, true, true);
     return written > 0 ? static_cast<std::size_t>(written) : 0;
 }
 
 void LlamaCppBackend::resetContextUsage() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_contextUsed = 0;
-    std::unique_lock<std::mutex> adopt = std::adopt_lock;
-    refreshStatusLocked(adopt);
+    refreshStatus();
 }
 
 void LlamaCppBackend::generate(const GenerationRequest& request,
@@ -193,8 +197,8 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // Tokenize the prompt. Ask for the size first so a long prompt is never
     // silently truncated against a guessed buffer.
     const std::string& prompt = request.prompt;
-    const int promptTokens = llama_tokenize(model, prompt.data(),
-                                            static_cast<int>(prompt.size()), nullptr, 0,
+    const int promptTokens = llama_tokenize(vocab, prompt.data(),
+                                            static_cast<int32_t>(prompt.size()), nullptr, 0,
                                             true, true);
     if (promptTokens <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
@@ -204,22 +208,25 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     std::vector<llama_token> tokens;
     tokens.reserve(static_cast<std::size_t>(promptTokens) + request.maxTokens + 8);
     tokens.resize(static_cast<std::size_t>(promptTokens));
-    if (llama_tokenize(model, prompt.data(), static_cast<int>(prompt.size()), tokens.data(),
-                       promptTokens, true, true) != promptTokens) {
+    if (llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()),
+                       tokens.data(), promptTokens, true, true) != promptTokens) {
         onComplete(false, "llama.cpp tokenized the prompt inconsistently");
         return;
     }
 
     const std::size_t promptSize = tokens.size();
 
-    // Sampler chain: temperature for generation, greedy only as a fallback.
-    // Composition order matters, so the chain is built once per request.
+    // Sampler chain. Composition order matters, so it is built once per request.
     llama_sampler_chain_params chainParams = llama_sampler_chain_default_params();
     chainParams.no_perf = true;
     llama_sampler* chain = llama_sampler_chain_init(chainParams);
-    llama_sampler_chain_add(chain, llama_sampler_init_penalties(
-                                       /* penalty_last_n */ 64, /* penalty_repeat */ 1.0F,
-                                       /* penalty_freq */ 0.0F, /* penalty_present */ 0.0F));
+    // The penalty sampler needs the vocabulary size as its first argument.
+    llama_sampler_chain_add(chain,
+                            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),
+                                                        /* penalty_last_n */ 64,
+                                                        /* penalty_repeat */ 1.0F,
+                                                        /* penalty_freq */ 0.0F,
+                                                        /* penalty_present */ 0.0F));
     if (request.temperature <= 0.0F) {
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     } else {
@@ -236,23 +243,23 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         return;
     }
 
-    const int contextLimit = static_cast<int>(llama_n_ctx(model));
-    const int maxTokens =
-        request.maxTokens > 0 ? request.maxTokens : contextLimit;
+    const auto contextLimit = static_cast<int>(llama_n_ctx(context));
+    const int maxTokens = request.maxTokens > 0 ? request.maxTokens : contextLimit;
     std::string piece;
     std::size_t produced = 0;
     bool sawStop = false;
 
     for (int i = 0; i < maxTokens; ++i) {
-        // Cooperative cancellation. Checked before every decode so a stop
+        // Cooperative cancellation, checked before every decode so a stop
         // request takes effect within one token rather than at batch end.
         if (m_cancelled.load(std::memory_order_acquire)) {
             sawStop = true;
             break;
         }
-        // Leave headroom so the next token always has a slot; a full context
-        // would make llama_decode fail and look like a model error.
-        if (static_cast<int>(tokens.size()) >= contextLimit - 1) {
+        // Leave headroom so the next token always has a slot. Decoding into a
+        // full context fails, and that would surface as a model error rather
+        // than a truncated response.
+        if (contextLimit > 0 && static_cast<int>(tokens.size()) >= contextLimit - 1) {
             break;
         }
 
@@ -266,7 +273,9 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         ++produced;
 
         char buffer[256];
-        const int length = llama_token_to_piece(model, next, buffer, sizeof(buffer), 0, true);
+        const int length = llama_token_to_piece(vocab, next, buffer,
+                                                static_cast<int32_t>(sizeof(buffer)),
+                                                /* lstrip */ 0, /* special */ true);
         if (length > 0) {
             piece.assign(buffer, static_cast<std::size_t>(length));
             onToken(piece);
@@ -284,11 +293,11 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
 
     // Context grows by the prompt plus what this turn produced, capped at the
     // model's real window so the UI cannot show an impossible fill level.
-    m_contextUsed = std::min<std::size_t>(
-        static_cast<std::size_t>(contextLimit),
-        m_contextUsed + promptSize + produced);
-    std::unique_lock<std::mutex> adopt = std::adopt_lock;
-    refreshStatusLocked(adopt);
+    if (contextLimit > 0) {
+        m_contextUsed = std::min<std::size_t>(static_cast<std::size_t>(contextLimit),
+                                              m_contextUsed + promptSize + produced);
+    }
+    refreshStatus();
 
     if (sawStop) {
         onComplete(false, "Generation stopped");
@@ -299,7 +308,7 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
 
 void LlamaCppBackend::cancel() {
     // Lock-free on purpose: called from the UI thread while the worker is
-    // inside generate() holding m_mutex, so taking the lock here could
+    // inside generate() holding m_mutex, so taking the lock here would
     // deadlock against a path that waits on this flag.
     m_cancelled.store(true, std::memory_order_release);
 }
@@ -338,7 +347,7 @@ void LlamaCppBackend::resetContextUsage() {
     m_contextUsed = 0;
 }
 
-void LlamaCppBackend::refreshStatusLocked(std::unique_lock<std::mutex>&) {}
+void LlamaCppBackend::refreshStatus() {}
 
 std::size_t LlamaCppBackend::countTokensImpl(std::string_view) const {
     return 0;

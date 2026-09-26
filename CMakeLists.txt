@@ -145,11 +145,17 @@ if(KESTREL_LLAMA_CPP_ENABLED)
         target_link_libraries(kestrel_core PRIVATE llama)
     else()
         target_include_directories(kestrel_core PRIVATE "${KESTREL_LLAMA_CPP_ROOT}/include")
+        # llama.cpp ships several import libraries. Link whichever are present so
+        # a build tree that omits the CUDA backend still links, rather than
+        # failing on a hardcoded ggml-cuda name.
         if(WIN32)
-            target_link_libraries(kestrel_core PRIVATE
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/llama.lib"
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/ggml.lib"
-            )
+            set(_kestrel_llama_libs "")
+            foreach(_comp llama ggml ggml-base ggml-cpu ggml-cuda)
+                if(EXISTS "${KESTREL_LLAMA_CPP_ROOT}/lib/${_comp}.lib")
+                    list(APPEND _kestrel_llama_libs "${KESTREL_LLAMA_CPP_ROOT}/lib/${_comp}.lib")
+                endif()
+            endforeach()
+            target_link_libraries(kestrel_core PRIVATE ${_kestrel_llama_libs})
         elseif(APPLE)
             target_link_libraries(kestrel_core PRIVATE
                 "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.dylib"
