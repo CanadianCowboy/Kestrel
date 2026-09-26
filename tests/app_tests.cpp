@@ -218,9 +218,9 @@ void testCancelStopsInFlightGeneration() {
 
 #include "app_tests.moc"
 
-// A QML FileDialog speaks in URLs, and the controller converts them to local
-// paths. That conversion is the fragile step in loading a model from disk, so
-// it is pinned here rather than only exercised by hand.
+/// A QML FileDialog speaks in URLs, and the controller converts them to local
+/// paths. That conversion is the fragile step in loading a model from disk, so
+/// it is pinned here rather than only exercised by hand.
 void testFileDialogUrlBecomesALocalPath() {
     std::cout << "file dialog URLs convert to local paths\n";
 
@@ -243,8 +243,8 @@ void testFileDialogUrlBecomesALocalPath() {
           "a bare filename is not treated as a usable path");
 }
 
-// After the user loads a model, the worker must generate through the new
-// backend rather than the one it was constructed with.
+/// After the user loads a model, the worker must generate through the new
+/// backend rather than the one it was constructed with.
 void testWorkerFollowsTheSwappedBackend() {
     std::cout << "worker uses the swapped backend\n";
 
@@ -279,6 +279,7 @@ void testWorkerFollowsTheSwappedBackend() {
     thread.wait();
 }
 
+/// Runs the Qt worker and file-URL tests; returns nonzero if any check fails.
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     testGenerationRunsOffCallingThread();

@@ -55,6 +55,7 @@ QString deriveTitle(const QString& text) {
 
 } // namespace
 
+/// Initializes preview mode, the default system prompt, a generation worker, and a conversation.
 AppController::AppController(QObject* parent)
     : QObject(parent), m_backend(runtime::selectBackend(runtime::BackendKind::Mock)) {
     m_messageModel = new MessageModel(this);
@@ -176,6 +177,7 @@ QString AppController::contextSummary() const {
         .arg(static_cast<qulonglong>(status.contextLimit));
 }
 
+/// Formats used and total KV-cache bytes, or reports unavailable accounting.
 QString AppController::kvCacheSummary() const {
     const runtime::RuntimeStatus status = m_backend->status();
     if (status.kvCacheBytes == 0) {
@@ -188,6 +190,7 @@ QString AppController::kvCacheSummary() const {
         .arg(QString::fromStdString(runtime::formatBytes(status.kvCacheBytes)));
 }
 
+/// Formats the backend-reported prefix token count or the uncached/empty state.
 QString AppController::prefixSummary() const {
     const std::size_t resident = m_backend->cachedPrefixTokens();
     if (resident == 0) {
@@ -279,10 +282,12 @@ void AppController::setSidebarOpen(bool open) {
     emit sidebarOpenChanged();
 }
 
+/// Returns the shared instruction text declared for subsequent turns.
 QString AppController::systemPrompt() const {
     return m_systemPrompt;
 }
 
+/// Trims and stores changed instruction text, updates the backend, and publishes metrics.
 void AppController::setSystemPrompt(const QString& text) {
     const QString trimmed = text.trimmed();
     if (trimmed == m_systemPrompt) {
@@ -296,6 +301,7 @@ void AppController::setSystemPrompt(const QString& text) {
     publishMetrics();
 }
 
+/// Returns whether this build provides an available llama.cpp backend.
 bool AppController::canLoadModel() const {
     // Ask a throwaway instance rather than caching a flag: whether a real model
     // can be loaded is a build-time fact, but a cached copy would go stale the
@@ -303,14 +309,18 @@ bool AppController::canLoadModel() const {
     return runtime::LlamaCppBackend{}.status().available;
 }
 
+/// Returns the loaded model's local path, or an empty string in preview mode.
 QString AppController::modelPath() const {
     return m_modelPath;
 }
 
+/// Returns the latest model-switch error, cleared after a successful switch.
 QString AppController::modelError() const {
     return m_modelError;
 }
 
+/// Loads a local GGUF URL synchronously before attempting to replace the backend.
+/// Keeps the current backend on validation/load failure or if generation remains active.
 void AppController::loadModelFromUrl(const QString& url) {
     const QString path = QUrl(url).toLocalFile();
     if (path.isEmpty()) {
@@ -377,6 +387,8 @@ void AppController::loadModelFromUrl(const QString& url) {
     emit metricsChanged();
 }
 
+/// Cancels generation and switches to the mock backend only once idle.
+/// Preserves the declared system prompt and reports a timeout through modelError().
 void AppController::usePreviewBackend() {
     waitForIdleGeneration(kBackendSwapTimeoutMs);
     if (m_generating) {
@@ -395,6 +407,8 @@ void AppController::usePreviewBackend() {
     emit metricsChanged();
 }
 
+/// Requests cancellation and pumps a nested event loop for at most timeoutMs.
+/// Callers must check m_generating afterwards before replacing the backend.
 void AppController::waitForIdleGeneration(int timeoutMs) {
     if (!m_generating) {
         return;
@@ -510,6 +524,8 @@ void AppController::onGenerationFinished(quint64 requestId,
     emit voiceChanged();
 }
 
+/// Creates a streaming reply and queues the assembled conversation on the worker.
+/// Uses userText for the voice response timeline and resets per-response metrics.
 void AppController::startGeneration(const QString& userText) {
     m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
     m_generating = true;
@@ -541,6 +557,8 @@ void AppController::startGeneration(const QString& userText) {
     m_worker->start(m_activeRequestId, buildPrompt(userText), 0.7F, 512);
 }
 
+/// Formats nonempty user/assistant messages among the latest eight entries, then an assistant cue.
+/// Excludes the shared system prompt; userText is currently unused.
 QString AppController::buildPrompt(const QString& userText) const {
     QString prompt;
     const ConversationEntry* entry = activeEntry();

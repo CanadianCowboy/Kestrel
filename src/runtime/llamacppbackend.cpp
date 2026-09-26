@@ -107,6 +107,8 @@ RuntimeStatus LlamaCppBackend::status() const {
     return m_status;
 }
 
+/// Releases the previous model/context and loads a GGUF with a fresh 4096-token context.
+/// Returns false with an error on failure; serializes access with m_mutex.
 bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -168,6 +170,8 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     return true;
 }
 
+/// Updates model identity, context occupancy, and estimated KV bytes.
+/// The caller must hold m_mutex.
 void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
@@ -228,6 +232,8 @@ void LlamaCppBackend::resetContextUsage() {
     refreshStatus();
 }
 
+/// Stores changed prefix text under m_mutex and invalidates its token cache.
+/// Defers context updates to generate(); identical text leaves the cache intact.
 void LlamaCppBackend::setSystemPrompt(std::string_view text) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_systemPrompt == text) {
@@ -242,10 +248,13 @@ void LlamaCppBackend::setSystemPrompt(std::string_view text) {
     }
 }
 
+/// Declares an empty prefix, deferring any context invalidation to the next generation.
 void LlamaCppBackend::clearSharedPrefix() {
     setSystemPrompt({});
 }
 
+/// Estimates full-context KV bytes from model dimensions and configured K/V types.
+/// Returns zero for missing or invalid dimensions; the caller must hold m_mutex.
 std::size_t LlamaCppBackend::kvCacheBytes() const {
     if (m_impl == nullptr || m_impl->model == nullptr || m_impl->context == nullptr) {
         return 0;
@@ -276,6 +285,7 @@ std::size_t LlamaCppBackend::kvCacheBytes() const {
     return static_cast<std::size_t>(layers) * cells * (rowK + rowV);
 }
 
+/// Returns the resident prefix length under m_mutex, or zero while it is dirty or absent.
 std::size_t LlamaCppBackend::cachedPrefixTokens() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_impl == nullptr) {
@@ -286,6 +296,8 @@ std::size_t LlamaCppBackend::cachedPrefixTokens() const {
     return m_impl->prefixDirty ? 0 : m_impl->prefixTokens.size();
 }
 
+/// Rebuilds a dirty prefix or removes tokens following an unchanged nonempty prefix.
+/// Returns the retained prefix length, or zero if unavailable; the caller must hold m_mutex.
 std::size_t LlamaCppBackend::applySystemPrefix() {
     if (m_impl == nullptr || m_impl->context == nullptr) {
         return 0;
@@ -331,6 +343,8 @@ std::size_t LlamaCppBackend::applySystemPrefix() {
     return m_impl->prefixTokens.size();
 }
 
+/// Decodes the shared prefix and per-turn prompt, then streams sampled tokens until done.
+/// Calls onComplete for success, cancellation, or failure while holding m_mutex; callbacks must not re-enter.
 void LlamaCppBackend::generate(const GenerationRequest& request,
                                TokenCallback onToken,
                                CompletionCallback onComplete) {
@@ -535,22 +549,27 @@ void LlamaCppBackend::resetContextUsage() {
     m_contextUsed = 0;
 }
 
+/// Stores prefix text for the build without llama.cpp; no cache is allocated.
 void LlamaCppBackend::setSystemPrompt(std::string_view text) {
     m_systemPrompt = text;
 }
 
+/// Clears the stored prefix text in the build without llama.cpp.
 void LlamaCppBackend::clearSharedPrefix() {
     m_systemPrompt.clear();
 }
 
+/// Returns zero because the build without llama.cpp has no resident prefix.
 std::size_t LlamaCppBackend::cachedPrefixTokens() const {
     return 0;
 }
 
+/// Returns zero because the build without llama.cpp allocates no KV cache.
 std::size_t LlamaCppBackend::kvCacheBytes() const {
     return 0;
 }
 
+/// Returns zero without modifying state because no llama.cpp context exists.
 std::size_t LlamaCppBackend::applySystemPrefix() {
     return 0;
 }

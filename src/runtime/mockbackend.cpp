@@ -46,6 +46,7 @@ void MockBackend::resetContextUsage() {
     m_contextUsed = 0;
 }
 
+/// Stores prefix text for approximate per-turn accounting without a KV cache.
 void MockBackend::setSystemPrompt(std::string_view text) {
     // Stored, not cached: there is no KV cache here to keep it in, so the
     // prefix is charged on every turn exactly as a backend with no prefix
@@ -53,10 +54,13 @@ void MockBackend::setSystemPrompt(std::string_view text) {
     m_systemPrompt = text;
 }
 
+/// Clears the prefix text without resetting accumulated context usage.
 void MockBackend::clearSharedPrefix() {
     m_systemPrompt.clear();
 }
 
+/// Streams a preview response and accounts for prefix, prompt, and response tokens.
+/// Reports completion or cooperative cancellation through onComplete.
 void MockBackend::generate(const GenerationRequest& request,
                            TokenCallback onToken,
                            CompletionCallback onComplete) {

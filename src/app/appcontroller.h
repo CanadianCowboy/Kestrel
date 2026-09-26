@@ -99,9 +99,13 @@ public:
     [[nodiscard]] ConversationModel* conversations() const noexcept;
     [[nodiscard]] int activeConversationId() const noexcept;
     [[nodiscard]] QString conversationTitle() const;
+    /// Returns the shared instruction text declared for subsequent turns.
     [[nodiscard]] QString systemPrompt() const;
+    /// Returns whether this build provides an available llama.cpp backend.
     [[nodiscard]] bool canLoadModel() const;
+    /// Returns the loaded model's local path, or an empty string in preview mode.
     [[nodiscard]] QString modelPath() const;
+    /// Returns the latest model-switch error, cleared after a successful switch.
     [[nodiscard]] QString modelError() const;
     [[nodiscard]] bool generating() const noexcept;
     [[nodiscard]] bool canRegenerate() const noexcept;
@@ -118,7 +122,9 @@ public:
     [[nodiscard]] double tokensPerSecond() const noexcept;
     [[nodiscard]] int tokensGenerated() const noexcept;
     [[nodiscard]] QString contextSummary() const;
+    /// Formats used and total KV-cache bytes, or reports unavailable accounting.
     [[nodiscard]] QString kvCacheSummary() const;
+    /// Formats the backend-reported prefix token count or the uncached/empty state.
     [[nodiscard]] QString prefixSummary() const;
 
     [[nodiscard]] QString voiceState() const;
@@ -137,6 +143,7 @@ public:
     void setSidebarOpen(bool open);
     void setSearchQuery(const QString& query);
     void setDiagnosticsOpen(bool open);
+    /// Trims and stores changed instruction text, updates the backend, and publishes metrics.
     void setSystemPrompt(const QString& text);
 
     Q_INVOKABLE void sendMessage(const QString& text);
@@ -149,13 +156,13 @@ public:
     Q_INVOKABLE void deleteConversation(int id);
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
-    // Loads a GGUF from disk and switches the app onto it. Takes the URL a
-    // FileDialog hands back rather than a raw path, because QML file dialogs
-    // speak in URLs and converting here is far more reliable than string
-    // surgery on the percent-encoded form.
+    /// Loads a GGUF from disk and switches the app onto it. Takes the URL a
+    /// FileDialog hands back rather than a raw path, because QML file dialogs
+    /// speak in URLs and converting here is far more reliable than string
+    /// surgery on the percent-encoded form.
     Q_INVOKABLE void loadModelFromUrl(const QString& url);
-    // Goes back to the built-in preview backend, so a user who loaded the
-    // wrong file is not stuck with it.
+    /// Goes back to the built-in preview backend, so a user who loaded the
+    /// wrong file is not stuck with it.
     Q_INVOKABLE void usePreviewBackend();
     // Re-runs device discovery. Probing is cheap, but it is a driver call, so
     // it is explicit rather than happening on every property read.
@@ -174,7 +181,9 @@ signals:
     void searchQueryChanged();
     void runtimeChanged();
     void diagnosticsOpenChanged();
+    /// Notifies observers that the shared instruction text changed.
     void systemPromptChanged();
+    /// Notifies observers that a model-switch attempt updated or cleared the error.
     void modelErrorChanged();
     void metricsChanged();
     void voiceChanged();
@@ -190,18 +199,20 @@ private:
 
     ConversationEntry* createConversation();
     void setActiveConversation(int id);
+    /// Creates a streaming reply and queues the assembled conversation on the worker.
+    /// Uses userText for the voice response timeline and resets per-response metrics.
     void startGeneration(const QString& userText);
 
-    // Assembles the text actually sent to the model: the recent conversation
-    // followed by an assistant cue. The shared system prompt is excluded on
-    // purpose, because the backend keeps it as a cached prefix.
+    /// Assembles the text actually sent to the model: the recent conversation
+    /// followed by an assistant cue. The shared system prompt is excluded on
+    /// purpose, because the backend keeps it as a cached prefix.
     [[nodiscard]] QString buildPrompt(const QString& userText) const;
 
-    // Spins the UI event loop until the in-flight generation reports back, or
-    // the timeout expires. Needed before swapping or destroying a backend,
-    // because the worker is inside the old backend's generate() right now and
-    // that backend is about to go away. Bounded, so a wedged backend cannot
-    // freeze the window.
+    /// Spins the UI event loop until the in-flight generation reports back, or
+    /// the timeout expires. Needed before swapping or destroying a backend,
+    /// because the worker is inside the old backend's generate() right now and
+    /// that backend is about to go away. Bounded, so a wedged backend cannot
+    /// freeze the window.
     void waitForIdleGeneration(int timeoutMs);
 
     void finalizeStream(MessageStatus status, const QString& note);

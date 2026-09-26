@@ -19,9 +19,10 @@ public:
     [[nodiscard]] std::size_t countTokens(std::string_view text) const override;
     void resetContextUsage() override;
 
-    // The mock has no KV cache, so it keeps the prefix text and charges for it
-    // on every turn, which is the honest cost to preview against.
+    /// The mock has no KV cache, so it keeps the prefix text and charges for it
+    /// on every turn, which is the honest cost to preview against.
     void setSystemPrompt(std::string_view text) override;
+    /// Clears the declared prefix without resetting accumulated context usage.
     void clearSharedPrefix() override;
 
 private:

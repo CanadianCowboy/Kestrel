@@ -456,7 +456,7 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
     }
 }
 
-// The shared system prompt contract, which must hold in every configuration.
+/// The shared system prompt contract, which must hold in every configuration.
 void testSharedSystemPromptPrefix() {
     runtime::MockBackend mock;
 
@@ -496,12 +496,12 @@ void testSharedSystemPromptPrefix() {
     assert(mock.status().contextUsed >= mock.countTokens(prefix));
 }
 
-// Exercises the real llama.cpp generation path.
-//
-// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
-// a multi-hundred-megabyte model download to run the suite. When it is set,
-// this is the only test that proves the backend actually generates rather than
-// merely linking.
+/// Exercises the real llama.cpp generation path.
+///
+/// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
+/// a multi-hundred-megabyte model download to run the suite. When it is set,
+/// this is the only test that proves the backend actually generates rather than
+/// merely linking.
 void testLlamaCppGeneratesFromRealModel() {
     const char* modelPath = std::getenv("KESTREL_TEST_GGUF");
     if (modelPath == nullptr || *modelPath == '\0') {
@@ -639,6 +639,7 @@ void testLlamaCppGeneratesFromRealModel() {
     assert(backend.cachedPrefixTokens() == 0);
 }
 
+/// Runs portable runtime checks and optional GGUF integration checks; assertions abort on failure.
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
     // checks ran. A lost buffer turns a five-second diagnosis into a guess.
