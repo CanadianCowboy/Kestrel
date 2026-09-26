@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace kestrel::core {
@@ -26,6 +27,15 @@ public:
     void setTitle(std::string title);
 
     void addMessage(MessageRole role, std::string content);
+
+    // Streams additional content into the most recent message. Returns false
+    // when the conversation is empty.
+    bool appendToLastMessage(std::string_view text);
+
+    // Removes the most recent message, e.g. when regenerating a response.
+    // Returns false when the conversation is empty.
+    bool removeLastMessage();
+
     void clear();
     [[nodiscard]] const std::vector<Message>& messages() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;

@@ -29,10 +29,21 @@ bool eventsContainInOrder(const core::VoiceSession& session,
 void testConversationBasics() {
     core::Conversation conversation;
     assert(conversation.size() == 0);
+    assert(!conversation.appendToLastMessage("orphan"));
+    assert(!conversation.removeLastMessage());
+
     conversation.addMessage(core::MessageRole::User, "Hello");
-    conversation.addMessage(core::MessageRole::Assistant, "Hi there");
+    conversation.addMessage(core::MessageRole::Assistant, "Hi");
     assert(conversation.size() == 2);
     assert(conversation.messages().front().content == "Hello");
+
+    assert(conversation.appendToLastMessage(" there"));
+    assert(conversation.messages().back().content == "Hi there");
+
+    assert(conversation.removeLastMessage());
+    assert(conversation.size() == 1);
+    assert(conversation.messages().back().content == "Hello");
+
     conversation.clear();
     assert(conversation.size() == 0);
 }
@@ -40,6 +51,8 @@ void testConversationBasics() {
 void testMockBackend() {
     runtime::MockBackend backend;
     assert(backend.status().available);
+    assert(backend.status().contextUsed == 0);
+
     std::string streamed;
     bool completed = false;
     backend.generate({"test", 0.7F, 32},
@@ -47,6 +60,16 @@ void testMockBackend() {
                      [&completed](bool success, std::string_view) { completed = success; });
     assert(completed);
     assert(streamed.find("local preview response") != std::string::npos);
+
+    const runtime::RuntimeStatus status = backend.status();
+    assert(status.contextUsed > 0);
+    assert(status.contextUsed <= status.contextLimit);
+    assert(status.tokensPerSecond > 0.0);
+
+    const std::size_t usedAfterFirst = status.contextUsed;
+    backend.generate({"again", 0.7F, 32}, [](std::string_view) {},
+                     [](bool, std::string_view) {});
+    assert(backend.status().contextUsed > usedAfterFirst);
 }
 
 void testVoiceHappyPathAndEvents() {
