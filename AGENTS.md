@@ -15,6 +15,17 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
 - `src/ui/`: QML desktop interface.
 - `tests/`: small, dependency-free tests for portable behavior.
 
+## Vendor SDK boundary
+
+`src/runtime/cudadiscovery_cuda.cpp` is the only translation unit that may
+include a CUDA header, and `src/runtime/tensorrtbackend.cpp` is the only one that
+may include TensorRT headers. All other code, including `cudadevice.h`,
+`AppController`, and QML, reads device facts through the portable structs.
+
+CMake picks `cudadiscovery_cuda.cpp` or `cudadiscovery_stub.cpp` based on
+`KESTREL_ENABLE_CUDA` and toolkit detection. Do not add a second CUDA-including
+file; extend `cudadevice.h` and the existing implementation instead.
+
 ## Implementation conventions
 
 - Target C++20 and preserve the repository's existing style: four-space
@@ -23,9 +34,13 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
 - Prefer standard-library types in `core` and `runtime`; do not let Qt types or
   UI concerns cross into portable backend/domain interfaces.
 - Make behavior changes testable. Add or update coverage in `tests/core_tests.cpp`
-  when modifying core or mock-backend behavior.
+  for core or mock-backend behavior, and in `tests/runtime_tests.cpp` for device
+  discovery, engine records, and backend selection.
 - Keep model-specific code behind `ModelBackend`; the mock backend must remain
   usable without external model runtimes.
+- Report failures as actionable messages that tell the user what to do next, not
+  bare status codes. A missing GPU, an old driver, and a mismatched engine are
+  different problems and need different advice.
 - Do not commit generated build directories or local IDE/cache artifacts.
 
 ## Build and test
@@ -40,3 +55,15 @@ ctest --test-dir build -C Debug --output-on-failure
 
 For UI changes, configure with `-DKESTREL_BUILD_UI=ON`. Qt 6.6+ is required for
 the desktop target; CMake will skip that target when Qt is unavailable.
+
+CUDA device discovery compiles in automatically when a CUDA Toolkit is present
+and falls back to a stub that explains itself when it is not, so no extra flag is
+needed for normal work. To verify or disable it explicitly:
+
+```powershell
+cmake -S . -B build-nocuda -DKESTREL_BUILD_UI=OFF -DKESTREL_ENABLE_CUDA=OFF
+```
+
+`kestrel.exe --print-runtime` reports the detected device and every backend's
+availability without opening a window. Use it in development notes instead of
+recalling GPU, driver, and CUDA versions from memory.

@@ -11,6 +11,10 @@
 *.so
 *.dylib
 
+# Local developer helper scripts. These wrap machine-specific toolchain paths
+# (Visual Studio, Qt, CUDA) and are intentionally not shared.
+/tools/
+
 # CMake and Qt generated files
 CMakeCache.txt
 CMakeFiles/
@@ -35,6 +39,9 @@ _autogen/
 *.engine
 *.plan
 *.safetensors
+
+# Kestrel engine build records, which sit beside their engine
+*.kestrel-engine
 
 # OS files
 .DS_Store

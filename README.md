@@ -10,7 +10,7 @@ The project prioritizes:
 - **A maintainable C++ foundation:** application state, runtime integration, and UI are separated so contributors can work independently.
 - **Safe extensibility:** tools and automation must be explicit, inspectable, cancellable, and disabled by default until configured.
 
-> **Project status:** Kestrel is an early scaffold. The C++ core, mock streaming backend, backend contracts, tests, and initial Qt/QML shell exist. Native model execution, persistent conversations, GPU telemetry, and agent tools are still under development.
+> **Project status:** Kestrel is an early scaffold. The C++ core, mock streaming backend, backend contracts, tests, and initial Qt/QML shell exist. CUDA device discovery and engine-artifact validation are in place and reported to the UI. Native model execution, persistent conversations, live throughput telemetry, and agent tools are still under development.
 
 ## Vision
 
@@ -42,21 +42,29 @@ Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA
 ├── README.md                  # Project and contributor documentation
 ├── src/
 │   ├── app/
-│   │   ├── main.cpp           # Qt application entry point
+│   │   ├── main.cpp           # Qt application entry point and --print-runtime
 │   │   ├── appcontroller.h
 │   │   └── appcontroller.cpp  # QML-facing application state/controller
 │   ├── core/
 │   │   ├── conversation.h
-│   │   └── conversation.cpp    # Conversation and message domain model
+│   │   ├── conversation.cpp    # Conversation and message domain model
+│   │   ├── voicesession.h
+│   │   └── voicesession.cpp    # Voice response timeline state machine
 │   ├── runtime/
 │   │   ├── modelbackend.h      # Backend-agnostic model contract
+│   │   ├── cudadevice.*        # Portable device/capability types and formatting
+│   │   ├── cudadiscovery_cuda.cpp  # Real device discovery (only CUDA-including TU)
+│   │   ├── cudadiscovery_stub.cpp  # No-toolkit fallback with the same interface
+│   │   ├── engineartifact.*    # Engine build records and compatibility checks
+│   │   ├── backendregistry.*   # Backend selection and runtime diagnostics
 │   │   ├── mockbackend.*       # Development/demo streaming backend
 │   │   ├── llamacppbackend.*   # Placeholder legacy/experimental adapter boundary
 │   │   └── tensorrtbackend.*   # TensorRT adapter boundary
 │   └── ui/
 │       └── Main.qml            # Initial soft-glass desktop workspace
 └── tests/
-    └── core_tests.cpp          # Core behavior tests
+    ├── core_tests.cpp          # Core behavior tests
+    └── runtime_tests.cpp       # Device discovery, engine records, backend selection
 ```
 
 ### Architectural boundaries
@@ -74,6 +82,20 @@ QML UI → AppController → core domain + ModelBackend
 - `app` adapts the core and runtime layers to Qt/QML properties and invokable methods.
 - `ui` displays state and sends user intent. QML should not call CUDA, TensorRT, or model APIs directly.
 - `tests` should prefer deterministic tests of core logic and backend contracts.
+
+### Vendor headers
+
+`src/runtime/cudadiscovery_cuda.cpp` is the **only** translation unit permitted to
+include a CUDA header, and `src/runtime/tensorrtbackend.cpp` is the only one
+permitted to include TensorRT headers. Everything else—including
+`src/runtime/cudadevice.h`, `AppController`, and QML—sees device facts through
+portable structs. CMake swaps `cudadiscovery_cuda.cpp` for
+`cudadiscovery_stub.cpp` when no CUDA Toolkit is found, so a build without CUDA
+still compiles, runs, and explains itself.
+
+Keep that boundary intact. Widening vendor headers into portable files makes the
+project unbuildable on contributor machines that lack the SDKs, which is the
+opposite of what Kestrel wants.
 
 ## Prerequisites
 
@@ -157,7 +179,22 @@ ctest --test-dir build --build-config Debug --output-on-failure
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `KESTREL_BUILD_UI` | `ON` | Build the Qt/QML application when Qt is available |
-| `KESTREL_BUILD_TESTS` | `ON` | Build and register the core tests |
+| `KESTREL_BUILD_TESTS` | `ON` | Build and register the core and runtime tests |
+| `KESTREL_ENABLE_CUDA` | `ON` | Compile real CUDA device discovery. Degrades to the portable stub when no toolkit is found, so it is safe to leave on |
+| `KESTREL_ENABLE_TENSORRT` | `OFF` | Link the TensorRT SDK. Opt-in because the SDK is not vendored |
+| `KESTREL_TENSORRT_ROOT` | *(empty)* | Path to an unpacked TensorRT SDK (must contain `include/NvInfer.h`) |
+
+### Checking the detected runtime
+
+The desktop binary can report what it actually found without opening a window,
+which is the quickest way to confirm a build picked up the GPU you expect:
+
+```powershell
+.\build\kestrel.exe --print-runtime
+```
+
+It prints the active backend, the probed device, and a diagnostics table that
+also explains why an unavailable backend is unavailable.
 
 Generated directories such as `build/`, `build-*`, and `cmake-build-*` are ignored by Git. It is safe to delete and recreate them when changing generators or toolchains.
 
@@ -354,6 +391,45 @@ CUDA execution on the local GPU
 
 Engine files are machine- and version-sensitive and should remain local artifacts, not repository assets.
 
+### Engine build records
+
+A serialized TensorRT engine is bound to the TensorRT version that produced it,
+to a CUDA version, and to the GPU architecture it was built for. Deserializing a
+mismatched engine fails deep inside TensorRT with a message that does not tell
+the user what to do.
+
+To make that failure predictable, the offline engine-build step writes a small
+sidecar record next to each engine:
+
+```text
+model.plan
+model.plan.kestrel-engine
+```
+
+The record is plain `key=value` text so it stays diffable and inspectable, and it
+introduces no serialization dependency:
+
+```text
+# Kestrel engine build record. Written by the offline engine-build step.
+tensorrt_version=10400
+cuda_version=13040
+compute_major=8
+compute_minor=9
+gpu_name=NVIDIA GeForce RTX 4060
+built_by=trtexec 10.4
+```
+
+`TensorRTBackend::loadModel()` reads it and compares it against the live CUDA
+probe **before** any deserialization is attempted, refusing the artifact with an
+explanation when the architecture, driver, or TensorRT version cannot work. A
+missing record is treated as unknown rather than invalid: absence of metadata is
+not evidence of a problem, so it warns instead of blocking.
+
+`writeEngineBuildRecord()` and `readEngineBuildRecord()` in
+`src/runtime/engineartifact.h` are the API. The writer is intended for the
+offline tooling; the desktop process only ever reads records and must never
+modify an engine.
+
 ## Safety and privacy principles
 
 Kestrel is intended to be local-first, but contributors must not assume that “local” automatically means safe. Future tools must:
@@ -380,12 +456,12 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 
 ### Runtime
 
-- [ ] Add CUDA device discovery and capability reporting
-- [ ] Integrate TensorRT headers and libraries through CMake options
-- [ ] Load and validate TensorRT engine files
+- [x] Add CUDA device discovery and capability reporting
+- [x] Integrate TensorRT headers and libraries through CMake options
+- [x] Validate engine artifacts against the live device before deserializing
 - [ ] Implement asynchronous token generation and cancellation
 - [ ] Expose GPU memory and throughput metrics to the UI
-- [ ] Define and document the model conversion workflow
+- [x] Define and document the model conversion workflow
 
 ### Application
 
