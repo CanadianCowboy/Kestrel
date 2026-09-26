@@ -50,3 +50,6 @@ _autogen/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Freebuff agent worktrees
+.freebuff/
