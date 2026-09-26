@@ -127,6 +127,7 @@ These are intentionally not vendored in this repository:
 
 - TensorRT SDK, including headers, libraries, runtime DLLs, and `trtexec`
 - TensorRT-LLM, if adopted for engine generation or LLM-specific optimizations
+- llama.cpp, when built from source rather than consumed as a system package
 - Model conversion tooling and model files
 
 Do not commit model files, engine files, SDK binaries, credentials, or machine-specific build output. The repository's `.gitignore` excludes common model and generated-artifact formats.
@@ -183,6 +184,12 @@ ctest --test-dir build --build-config Debug --output-on-failure
 | `KESTREL_ENABLE_CUDA` | `ON` | Compile real CUDA device discovery. Degrades to the portable stub when no toolkit is found, so it is safe to leave on |
 | `KESTREL_ENABLE_TENSORRT` | `OFF` | Link the TensorRT SDK. Opt-in because the SDK is not vendored |
 | `KESTREL_TENSORRT_ROOT` | *(empty)* | Path to an unpacked TensorRT SDK (must contain `include/NvInfer.h`) |
+| `KESTREL_ENABLE_LLAMA_CPP` | `ON` | Link llama.cpp for GGUF inference. Degrades to an unavailable backend when not found |
+| `KESTREL_LLAMA_CPP_ROOT` | *(empty)* | Path to a llama.cpp install or build tree (must contain `include/llama.h`) |
+
+llama.cpp resolves from its own CMake package first, then from
+`KESTREL_LLAMA_CPP_ROOT`. It is never found by accident, because a mismatched
+llama.cpp would produce subtly wrong tokens rather than a link error.
 
 ### Checking the detected runtime
 
@@ -512,6 +519,9 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 - [x] Expose GPU memory and throughput metrics to the UI
 - [x] Define and document the model conversion workflow
 - [x] Provide the offline engine-build tool and build record
+- [x] Link llama.cpp for GGUF inference behind an auto-degrading option
+- [x] Make context accounting backend-driven so a loaded model reports exact counts
+- [x] Run the full build and test matrix in CI on Windows, Linux, and macOS
 
 ### Application
 
