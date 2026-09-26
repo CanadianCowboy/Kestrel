@@ -153,18 +153,25 @@ jobs:
           "${{ steps.app.outputs.path }}" > qml.log 2>&1 &
           APP_PID=$!
           sleep 6
+          # Liveness, not output. The app starts its event loop and prints
+          # nothing on Linux or macOS, so a check that treats silence as
+          # failure fails a good build. A process still alive after a few
+          # seconds has loaded its scene and is executing; a process that died
+          # did so at startup, which is the failure worth catching -- and it is
+          # also what a wrong path produces, since no process is ever started
+          # when the shell is handed a directory or a missing file.
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "the scene is up and still running"
+          else
+            echo "::error::the app exited during startup; the scene never loaded"
+            echo "--- Qt diagnostics ---"
+            cat qml.log
+            exit 1
+          fi
           kill "$APP_PID" 2>/dev/null || true
           wait "$APP_PID" 2>/dev/null || true
           echo "--- Qt diagnostics ---"
           cat qml.log
-          # An empty log means the scene never started, which is a failure and
-          # not a pass. Without this the check reports success whenever the
-          # binary produced no output at all, which is exactly what happened
-          # while it was being handed a directory.
-          if [ ! -s qml.log ]; then
-            echo "::error::the app produced no output; the scene never started"
-            exit 1
-          fi
           if grep -Eiq "ReferenceError|TypeError|is not a member|Unable to assign" qml.log; then
             echo "::error::QML reported binding errors"
             exit 1
