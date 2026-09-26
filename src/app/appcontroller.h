@@ -65,6 +65,10 @@ class AppController final : public QObject {
 
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
 
+    // The shared instruction prefix. It is identical on every turn, so the
+    // backend decodes it once and keeps it resident rather than resending it.
+    Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt NOTIFY systemPromptChanged)
+
     // GPU facts, sourced from a real CUDA probe rather than assumed.
     Q_PROPERTY(bool gpuAvailable READ gpuAvailable NOTIFY runtimeChanged)
     Q_PROPERTY(QString gpuName READ gpuName NOTIFY runtimeChanged)
@@ -82,6 +86,7 @@ public:
     [[nodiscard]] ConversationModel* conversations() const noexcept;
     [[nodiscard]] int activeConversationId() const noexcept;
     [[nodiscard]] QString conversationTitle() const;
+    [[nodiscard]] QString systemPrompt() const;
     [[nodiscard]] bool generating() const noexcept;
     [[nodiscard]] bool canRegenerate() const noexcept;
     [[nodiscard]] bool sidebarOpen() const noexcept;
@@ -114,6 +119,7 @@ public:
     void setSidebarOpen(bool open);
     void setSearchQuery(const QString& query);
     void setDiagnosticsOpen(bool open);
+    void setSystemPrompt(const QString& text);
 
     Q_INVOKABLE void sendMessage(const QString& text);
     Q_INVOKABLE void stopGeneration();
@@ -142,6 +148,7 @@ signals:
     void searchQueryChanged();
     void runtimeChanged();
     void diagnosticsOpenChanged();
+    void systemPromptChanged();
     void metricsChanged();
     void voiceChanged();
 
@@ -156,7 +163,13 @@ private:
 
     ConversationEntry* createConversation();
     void setActiveConversation(int id);
-    void startGeneration(const QString& prompt);
+    void startGeneration(const QString& userText);
+
+    // Assembles the text actually sent to the model: the recent conversation
+    // followed by an assistant cue. The shared system prompt is excluded on
+    // purpose, because the backend keeps it as a cached prefix.
+    [[nodiscard]] QString buildPrompt(const QString& userText) const;
+
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
     void refreshCanRegenerate();
@@ -182,6 +195,7 @@ private:
     bool m_sidebarOpen = true;
     bool m_diagnosticsOpen = false;
     QString m_searchQuery;
+    QString m_systemPrompt;
 
     // Live metrics. Token count and the clock are the basis for throughput;
     // the clock only runs while a response is generating.

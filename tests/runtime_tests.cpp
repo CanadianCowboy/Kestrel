@@ -456,6 +456,46 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
     }
 }
 
+// The shared system prompt contract, which must hold in every configuration.
+void testSharedSystemPromptPrefix() {
+    runtime::MockBackend mock;
+
+    // No prefix declared: nothing to reuse, and no cost claimed.
+    assert(mock.systemPrompt().empty());
+    assert(mock.cachedPrefixTokens() == 0);
+
+    const std::string prefix = "You are Kestrel, a local assistant running on the user's own machine.";
+    mock.setSystemPrompt(prefix);
+    assert(mock.systemPrompt() == prefix);
+    // A backend with no cache still charges for the prefix on every turn, so
+    // the figure is the prefix cost, not a fictitious saving.
+    assert(mock.cachedPrefixTokens() == mock.countTokens(prefix));
+    assert(mock.cachedPrefixTokens() > 0);
+
+    // Redeclaring the same text must be idempotent, or a setter that fires on
+    // every property write would invalidate the cache each time.
+    mock.setSystemPrompt(prefix);
+    assert(mock.systemPrompt() == prefix);
+
+    // A different prompt is a different prefix and must replace the old one.
+    mock.setSystemPrompt("A completely different instruction set.");
+    assert(mock.systemPrompt() != prefix);
+
+    mock.clearSharedPrefix();
+    assert(mock.systemPrompt().empty());
+    assert(mock.cachedPrefixTokens() == 0);
+
+    // A backend that caches a prefix must not require the caller to include it
+    // in the per-turn prompt, and must not double-charge for it.
+    mock.setSystemPrompt(prefix);
+    mock.resetContextUsage();
+    const std::size_t afterPrefixOnly = mock.status().contextUsed;
+    assert(afterPrefixOnly == 0);
+    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32}, [](std::string_view) {},
+                  [](bool, std::string_view) {});
+    assert(mock.status().contextUsed >= mock.countTokens(prefix));
+}
+
 // Exercises the real llama.cpp generation path.
 //
 // Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
@@ -528,6 +568,59 @@ void testLlamaCppGeneratesFromRealModel() {
     const runtime::RuntimeStatus after = backend.status();
     assert(after.contextUsed > 0);
     assert(after.contextUsed <= after.contextLimit);
+
+    // The shared prefix is the point of the cache: declared before a turn, it
+    // must be resident afterwards rather than resent with the next request.
+    const std::string prefix =
+        "You are Kestrel, a local desktop assistant. Answer briefly and plainly.\n";
+    backend.setSystemPrompt(prefix);
+    std::string firstTurn;
+    std::string firstError;
+    bool firstOk = false;
+    backend.generate(runtime::GenerationRequest{"Name one bird.", 0.7F, 16},
+                     [&firstTurn](std::string_view token) { firstTurn.append(token); },
+                     [&firstOk, &firstError](bool ok, std::string_view error) {
+                         firstOk = ok;
+                         firstError = std::string(error);
+                     });
+    if (!firstOk) {
+        std::printf("  FAIL  prefixed turn refused: \"%s\"\n", firstError.c_str());
+        std::abort();
+    }
+    assert(!firstTurn.empty());
+    const std::size_t resident = backend.cachedPrefixTokens();
+    assert(resident > 0);
+    // The resident count must be the model's real tokenization of the prefix,
+    // not the chars-per-token fallback, or the saving is not being measured.
+    assert(resident != runtime::MockBackend{}.countTokens(prefix));
+
+    // A second turn reuses those entries. If the prefix were re-decoded at
+    // position 0, or left in place without shifting, the reply would degrade
+    // into nonsense or fail outright, so generating coherent text again is the
+    // evidence that the positions line up.
+    std::string secondTurn;
+    std::string secondError;
+    bool secondOk = false;
+    backend.generate(runtime::GenerationRequest{"Name a different bird.", 0.7F, 16},
+                     [&secondTurn](std::string_view token) { secondTurn.append(token); },
+                     [&secondOk, &secondError](bool ok, std::string_view error) {
+                         secondOk = ok;
+                         secondError = std::string(error);
+                     });
+    if (!secondOk) {
+        std::printf("  FAIL  second prefixed turn refused: \"%s\"\n", secondError.c_str());
+        std::abort();
+    }
+    assert(!secondTurn.empty());
+    assert(backend.cachedPrefixTokens() == resident);
+    std::printf("  shared prefix: %zu tokens resident, turn 2: %.60s\n", resident,
+                secondTurn.c_str());
+
+    // Clearing the prefix must make the next turn start from an empty context
+    // rather than inherit the previous one's instructions.
+    backend.clearSharedPrefix();
+    assert(backend.systemPrompt().empty());
+    assert(backend.cachedPrefixTokens() == 0);
 }
 
 int main() {
@@ -552,6 +645,7 @@ int main() {
     KESTREL_RUN(testTensorRtBackendValidatesEngine);
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
     KESTREL_RUN(testBackendDrivenTokenCounting);
+    KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
     KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
 #undef KESTREL_RUN

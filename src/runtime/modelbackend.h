@@ -78,6 +78,39 @@ public:
     // Clears accumulated per-session accounting, e.g. the running context
     // occupancy. Called when the conversation is cleared or switched.
     virtual void resetContextUsage();
+
+    // Declares the shared instruction prefix for a conversation.
+    //
+    // This text is identical on every turn, so a backend that can keep it
+    // resident decodes it once and reuses those KV entries instead of
+    // reprocessing it on every request. That is the single largest avoidable
+    // cost in a chat turn: the system prompt is often longer than the reply.
+    //
+    // Callers pass generate() the per-turn prompt only. The prefix is the
+    // backend's business, and a backend that caches it must not expect to see
+    // it again in the request.
+    //
+    // Safe to call from the UI thread: an implementation defers the work to the
+    // next generate() call, because the model context is only safe to touch
+    // from the worker thread.
+    virtual void setSystemPrompt(std::string_view text);
+
+    // The prefix currently declared, for display and for tests.
+    [[nodiscard]] virtual std::string_view systemPrompt() const noexcept;
+
+    // Forgets the prefix and everything derived from it. A new conversation
+    // must call this, or the next turn inherits the previous one's prompt.
+    virtual void clearSharedPrefix();
+
+    // Prefix tokens the backend is actually keeping resident, which is the
+    // figure the diagnostics panel reports. Zero means the prefix is not
+    // cached and is being resent with every request.
+    [[nodiscard]] virtual std::size_t cachedPrefixTokens() const;
+
+protected:
+    // Shared by every backend so the prefix text has one owner. Subclasses
+    // that cache the prefix decode it separately.
+    std::string m_systemPrompt;
 };
 
 } // namespace kestrel::runtime

@@ -30,4 +30,22 @@ void ModelBackend::resetContextUsage() {
     // Backends that accumulate per-session state override this.
 }
 
+void ModelBackend::setSystemPrompt(std::string_view text) {
+    m_systemPrompt = text;
+}
+
+std::string_view ModelBackend::systemPrompt() const noexcept {
+    return m_systemPrompt;
+}
+
+void ModelBackend::clearSharedPrefix() {
+    m_systemPrompt.clear();
+}
+
+std::size_t ModelBackend::cachedPrefixTokens() const {
+    // No cache here: this backend re-sends the prefix on every request, so
+    // report what the prefix actually costs rather than implying a saving.
+    return countTokens(m_systemPrompt);
+}
+
 } // namespace kestrel::runtime
