@@ -85,6 +85,18 @@ if(KESTREL_ENABLE_TENSORRT)
     endif()
 endif()
 
+# The platform keystore, one implementation per platform, chosen here for the
+# same reason the CUDA discovery source is chosen: the platform API has to live
+# in a single translation unit so that everything above it stays portable, and
+# so a build for one platform cannot pick up another's headers by accident.
+if(WIN32)
+    set(KESTREL_SECRET_STORE_SOURCE src/storage/secretstore_windows.cpp)
+elseif(APPLE)
+    set(KESTREL_SECRET_STORE_SOURCE src/storage/secretstore_macos.cpp)
+else()
+    set(KESTREL_SECRET_STORE_SOURCE src/storage/secretstore_linux.cpp)
+endif()
+
 add_library(kestrel_core
     src/core/conversation.cpp
     src/core/conversation.h
@@ -106,6 +118,15 @@ add_library(kestrel_core
     src/runtime/llamacppbackend.h
     src/runtime/tensorrtbackend.cpp
     src/runtime/tensorrtbackend.h
+    src/storage/atomicfile.cpp
+    src/storage/atomicfile.h
+    src/storage/paths.cpp
+    src/storage/paths.h
+    src/storage/secretstore.h
+    src/storage/secretstore_memory.cpp
+    src/storage/sha256.cpp
+    src/storage/sha256.h
+    ${KESTREL_SECRET_STORE_SOURCE}
 )
 
 target_include_directories(kestrel_core PUBLIC src)
@@ -115,6 +136,13 @@ if(MSVC)
     target_compile_options(kestrel_core PRIVATE /W4 /permissive-)
 else()
     target_compile_options(kestrel_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(APPLE)
+    # SecItemAdd and friends live here, and only the macOS secret store needs
+    # them. Named at configure time rather than with a pragma in the source so
+    # that the dependency is visible where the build is described.
+    target_link_libraries(kestrel_core PRIVATE "-framework Security")
 endif()
 
 if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND)
@@ -314,6 +342,13 @@ if(KESTREL_BUILD_TESTS)
     add_executable(kestrel_runtime_tests tests/runtime_tests.cpp)
     target_link_libraries(kestrel_runtime_tests PRIVATE kestrel_core)
     add_test(NAME kestrel_runtime_tests COMMAND kestrel_runtime_tests)
+
+    add_executable(kestrel_storage_tests tests/storage_tests.cpp)
+    target_link_libraries(kestrel_storage_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_storage_tests COMMAND kestrel_storage_tests)
+    # Deliberately not part of the Qt PATH fix-up further down: this binary
+    # links no Qt. It does link the platform keystore, whose library is either
+    # the system one or already a load-time dependency of the process.
 
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
