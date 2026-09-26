@@ -64,7 +64,11 @@ void testMockBackend() {
     const runtime::RuntimeStatus status = backend.status();
     assert(status.contextUsed > 0);
     assert(status.contextUsed <= status.contextLimit);
-    assert(status.tokensPerSecond > 0.0);
+    // The backend deliberately reports no throughput figure. A hardcoded rate
+    // would put a number in the UI that nothing produced, and the app measures
+    // real throughput from delivered tokens instead. This assertion exists to
+    // fail loudly if a fabricated value is reintroduced.
+    assert(status.tokensPerSecond == 0.0);
 
     const std::size_t usedAfterFirst = status.contextUsed;
     backend.generate({"again", 0.7F, 32}, [](std::string_view) {},
