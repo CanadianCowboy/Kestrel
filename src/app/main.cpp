@@ -51,11 +51,31 @@ int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs, bool mo
     // before reporting the thing it already knew, which is the opposite of a
     // fast negative control.
     if (modelRequested) {
+        // Whether the load actually finished is the whole point of the wait.
+        // QEventLoop::quit is also reachable from the timeout, so a loop that
+        // returns tells you nothing on its own: with only the runtimeAvailable()
+        // check below, a model that failed to load fell through to the mock
+        // backend -- which reports available -- and the smoke test passed
+        // against a model that was never loaded. It has to be named here.
+        bool loadFinished = false;
         QEventLoop loading;
         QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished, &loading,
-                         &QEventLoop::quit);
+                         [&] {
+                             loadFinished = true;
+                             loading.quit();
+                         });
         QTimer::singleShot(timeoutMs, &loading, &QEventLoop::quit);
         loading.exec();
+        if (!loadFinished) {
+            QTextStream(stdout) << "  FAIL    the model did not finish loading within " << timeoutMs
+                                << " ms\n";
+            return 1;
+        }
+        if (!controller.modelError().isEmpty()) {
+            QTextStream(stdout) << "  FAIL    the model failed to load: " << controller.modelError()
+                                << "\n";
+            return 1;
+        }
     }
     QTextStream out(stdout);
     out << "Kestrel smoke test\n";
@@ -63,7 +83,12 @@ int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs, bool mo
     out << "  model   : " << controller.modelName() << "\n";
     out.flush();
 
-    if (!controller.runtimeAvailable()) {
+    // A real model, not merely an available runtime. The mock backend reports
+    // itself available and answers instantly, so checking runtimeAvailable()
+    // here let the whole check pass against a canned reply -- which is the one
+    // outcome this function exists to rule out. modelPath() is empty until a
+    // GGUF is actually loaded, so it is the question worth asking.
+    if (controller.modelPath().isEmpty()) {
         out << "  FAIL    no model is loaded, so there is nothing to exercise.\n"
                "          Pass --model <path> to run this against a real model.\n";
         out.flush();
