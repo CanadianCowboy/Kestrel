@@ -324,6 +324,33 @@ ApplicationWindow {
                                     }
                                 }
                                 Button {
+                                    id: pauseResumeButton
+                                    // Only offered when the voice state machine
+                                    // says the transition is actually legal, so
+                                    // the button can never be a no-op that
+                                    // silently does nothing.
+                                    visible: appController.canPause || appController.canResume
+                                    implicitWidth: 44
+                                    implicitHeight: 44
+                                    text: appController.canResume ? "▶" : "❚❚"
+                                    onClicked: {
+                                        if (appController.canResume) appController.resumeConversation()
+                                        else appController.pauseConversation()
+                                    }
+                                    contentItem: Text {
+                                        text: pauseResumeButton.text
+                                        color: window.ink
+                                        font.pixelSize: 13
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    background: Rectangle {
+                                        radius: 13
+                                        color: "#232830"
+                                        border.color: window.line
+                                    }
+                                }
+                                Button {
                                     implicitWidth: 44
                                     implicitHeight: 44
                                     text: appController.generating ? "■" : "↑"
@@ -416,6 +443,60 @@ ApplicationWindow {
                             color: window.muted; font.pixelSize: 11
                             wrapMode: Text.Wrap
                             Layout.fillWidth: true
+                        }
+                    }
+                }
+
+                Text { text: "LIVE GENERATION"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: liveColumn.implicitHeight + 24
+                    radius: 12
+                    color: "#1a1d23"
+                    border.color: appController.generating ? window.accent : window.line
+                    Behavior on border.color { ColorAnimation { duration: 160 } }
+                    ColumnLayout {
+                        id: liveColumn
+                        anchors.fill: parent
+                        anchors.margins: 12
+                        spacing: 7
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "THROUGHPUT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.tokensPerSecond > 0
+                                      ? appController.tokensPerSecond.toFixed(1) + " tok/s"
+                                      : "—"
+                                color: appController.tokensPerSecond > 0 ? window.accent : window.muted
+                                font.pixelSize: 13
+                                font.weight: Font.DemiBold
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "TOKENS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text { text: appController.tokensGenerated; color: window.ink; font.pixelSize: 13 }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "CONTEXT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.contextSummary
+                                color: window.ink; font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 160
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "VOICE STATE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text { text: appController.voiceState; color: window.ink; font.pixelSize: 12 }
                         }
                     }
                 }
