@@ -8,6 +8,14 @@ ListenSession::ListenSession(runtime::SpeechRecognizer& recognizer, QObject* par
     connect(&m_poll, &QTimer::timeout, this, &ListenSession::poll);
 }
 
+ListenSession::~ListenSession() {
+    // Unconditional, and before anything of this object is gone. stop() is
+    // cheap when the session already ended -- the callbacks have been taken
+    // and cleared, so there is nothing to wait for -- and it is the only thing
+    // that makes the recognizer's use of `this` safe from here on.
+    m_recognizer.stop();
+}
+
 bool ListenSession::startListening(QString& error) {
     if (m_listening) {
         error = tr("Already listening.");
@@ -29,9 +37,17 @@ bool ListenSession::startListening(QString& error) {
     //
     // The result and the end reason are copied into the queued call, because
     // the recognizer owns them and may reuse the storage as soon as it returns.
-    // The queued call is addressed to this object, so one that is still in
-    // flight when the session is destroyed is discarded with it rather than
-    // landing on freed memory.
+    //
+    // The queued call being addressed to this object is half of the safety
+    // story and not all of it. A posted event whose receiver has been destroyed
+    // is discarded by Qt, so nothing lands on freed memory -- but only once the
+    // destructor has run. The dangerous moment is earlier: the recognizer's
+    // worker thread executing this lambda, and calling invokeMethod on a `this`
+    // that is being destroyed underneath it.
+    //
+    // That is why the destructor stops the recognizer rather than relying on
+    // this, and why AppController releases the recognizer before the session.
+    // A returned stop() is the boundary; everything after it is arithmetic.
     if (!m_recognizer.start(
             [this](const runtime::RecognitionResult& result) {
                 QMetaObject::invokeMethod(

@@ -84,14 +84,23 @@ void KokoroSpeechBackend::startEngine() {
         return;
     }
     m_process->start(m_python, {m_serverScript});
-    if (!m_process->waitForStarted(5000)) {
-        markGivenUp();
-        return;
-    }
     // Launched, not ready. The model is still loading at this point, which is
     // deliberate: the driver answers requests only once it has the model, and
     // queues the ones that arrive before that rather than dropping them. The
     // voice becomes usable when the driver announces itself, not here.
+    //
+    // No waitForStarted here, and that is the whole point. This runs from the
+    // KokoroSpeechBackend constructor, which LocalVoiceEngines::create() calls
+    // and the AppController calls on the UI thread -- so a synchronous wait is a
+    // frozen window for as long as it allows, at start-up and on every engine
+    // switch. A slow disk or a virtual environment inside a syncing folder is
+    // enough to spend all of it.
+    //
+    // A launch that fails is not lost by not waiting for it: the
+    // errorOccurred(FailedToStart) handler above reports it, and markGivenUp()
+    // now withdraws the promise for an engine that was launched and then died,
+    // which is what releases a reply that is being held for this voice. The
+    // answer just arrives asynchronously rather than being paid for up front.
     markLaunched();
 }
 

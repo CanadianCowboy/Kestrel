@@ -37,23 +37,10 @@ ApplicationWindow {
         property bool checked: false
         signal toggled()
         Layout.fillWidth: true
-        spacing: 10
         activeFocusOnTab: true
         Keys.onSpacePressed: function(event) {
             toggle.toggled()
             event.accepted = true
-        }
-        Rectangle {
-            width: 14
-            height: 14
-            radius: 4
-            color: toggle.checked ? window.accent : "#1a1d23"
-            // Focus is drawn on the indicator because it is the one fixed-size
-            // part of the row, so a keyboard user can see where they are without
-            // the label having to change.
-            border.color: toggle.activeFocus ? window.ink
-                                            : toggle.checked ? window.accent : window.line
-            Behavior on color { ColorAnimation { duration: 140 } }
         }
         // One MouseArea over the whole row, so the label is the target and the
         // hover that reveals the hint is the same gesture as the click.
@@ -69,15 +56,42 @@ ApplicationWindow {
         // Wrapping the row in an Item lets the MouseArea anchor to the row
         // instead, which is legal precisely because it is no longer a child of
         // the layout. One cell, one item, one gesture over all of it.
+        //
+        // The indicator is inside that Item too, which is the part this got
+        // wrong once already. Left as a sibling of the Item it is a cell of its
+        // own further left, so clicking the switch did nothing -- the same
+        // defect one cell along. The inner Row exists only to keep the
+        // indicator and the label side by side now that they share a cell.
         Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Text {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: toggle.label
-                color: window.ink
-                font.pixelSize: 12
+            Row {
+                id: row
+                anchors.fill: parent
+                spacing: 10
+                Rectangle {
+                    width: 14
+                    height: 14
+                    radius: 4
+                    color: toggle.checked ? window.accent : "#1a1d23"
+                    // Focus is drawn on the indicator because it is the one
+                    // fixed-size part of the row, so a keyboard user can see
+                    // where they are without the label having to change.
+                    border.color: toggle.activeFocus ? window.ink
+                                                    : toggle.checked ? window.accent : window.line
+                    Behavior on color { ColorAnimation { duration: 140 } }
+                }
+                Text {
+                    // 14 for the indicator, 10 for the gap, and whatever is
+                    // left, so the label elides rather than pushing the row
+                    // wider than the panel it is in.
+                    width: Math.max(0, row.width - 24)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: toggle.label
+                    color: window.ink
+                    font.pixelSize: 12
+                    elide: Text.ElideRight
+                }
             }
             MouseArea {
                 id: hover
@@ -479,8 +493,14 @@ ApplicationWindow {
                         }                            Item {
                                 id: composerDock
                                 Layout.fillWidth: true
+                                // The dictation line sits above the shell and needs
+                                // its own room: its implicit height plus the shell
+                                // plus the 6 pixel gap between them. 84 is the
+                                // shell's height, and it is fixed rather than a
+                                // fill -- a shell that grows with the dock
+                                // swallows the line that the dock grew for.
                                 Layout.preferredHeight: dictationLine.visible
-                                                      ? dictationLine.implicitHeight + 84 : 84
+                                                      ? dictationLine.implicitHeight + 90 : 84
 
 
                             // The breathing glow. Slow, wide, and close to
@@ -515,10 +535,10 @@ ApplicationWindow {
                             // microphone nobody pressed.
                             Text {
                                 id: dictationLine
-                                anchors.bottom: composerShell.top
+                                anchors.bottom: composerDock.top
                                 anchors.bottomMargin: 6
-                                anchors.left: composerShell.left
-                                anchors.right: composerShell.right
+                                anchors.left: composerDock.left
+                                anchors.right: composerDock.right
                                 anchors.leftMargin: 18
                                 visible: appController.listenError.length > 0
                                          || appController.listening
@@ -557,7 +577,16 @@ ApplicationWindow {
 
                                 Rectangle {
                                 id: composerShell
-                                anchors.fill: parent
+                                // Left, right and bottom rather than fill: the
+                                // dock is taller than the shell whenever the
+                                // dictation line is showing, and filling would
+                                // give the extra pixels to the shell instead of
+                                // to the line.
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                                anchors.bottomMargin: 6
+                                height: 84
                                 radius: 18
                                 color: "#191c22"
                                 border.color: composer.activeFocus ? "#55776a" : window.line

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace kestrel::core {
 
@@ -23,5 +24,22 @@ namespace kestrel::core {
 // mistake being prevented is a silent one, so a second copy is a second chance
 // to get it wrong.
 [[nodiscard]] std::string pathText(const std::filesystem::path& path);
+
+// The other direction: a path handed to this project as UTF-8 text.
+//
+// Qt speaks UTF-8, so every path that arrives from the interface -- a model
+// chosen in a file dialog, a directory named by an environment variable -- is
+// a std::string holding UTF-8. On Windows, std::filesystem::path's constructor
+// from std::string reads those bytes as the active ANSI code page instead, so a
+// model in a folder whose name has a Cyrillic or CJK character in it does not
+// exist as far as every is_directory and file_size call is concerned. The
+// failure is a plain "no such file or directory" pointing at a path that is
+// plainly there.
+//
+// std::filesystem::u8path() says this correctly and is deprecated in C++20, so
+// this is the same conversion spelled out: a char8_t view of exactly the same
+// bytes, which the path constructor accepts directly. Whether the bytes really
+// are UTF-8 is the caller's claim, not something to guess at or to assert.
+[[nodiscard]] std::filesystem::path pathFromUtf8(std::string_view text);
 
 } // namespace kestrel::core

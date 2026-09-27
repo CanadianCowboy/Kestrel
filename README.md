@@ -336,8 +336,15 @@ That is the whole setup. Kestrel finds the interpreter and the model beside the 
 
 ```bash
 build/kestrel.exe --print-runtime
-#   voice        : available (bm_george (Kokoro, local))
+#   voice        : unavailable (the Kokoro voice is still loading)
 ```
+
+That is what a launch reports, and it is not a failure. The report is printed
+the moment the controller is constructed, and at that moment the driver process
+has been launched but has not yet answered `{"ready": true}`; the model is
+several hundred megabytes and takes a moment to come up. The voice becomes
+`available (bm_george (Kokoro, local))` as soon as the engine announces itself,
+and a reply asked for in between is held and then spoken.
 
 The model loads in about a second and synthesises a clause faster than it can be spoken, so a clause-by-clause reply does not sound like it is waiting on something. `VOICE PROFILE` in the assistant panel switches voice without a restart; an unknown name is refused rather than accepted and failed at the next reply.
 
@@ -625,10 +632,16 @@ is what lets speech begin before generation finishes. A `VoicePersona` (voice id
 rate, pitch, warmth, and three pause lengths) makes the pacing a value rather than
 a hardcoded constant.
 
-Because there is no audio engine yet, `VoiceSession` drives the visible
-timeline and playback is treated as delivered as soon as generation finishes.
-That is the text-only fallback the state machine defines for exactly this
-situation. Pause stops delivery while preserving the response for `resume()`,
+`VoiceSession` drives the visible timeline, and audio is delivered clause by
+clause as each one finishes rather than in one lump when generation ends. Where
+there is no engine -- a build without Qt TextToSpeech, a machine with no voice
+installed, or a local engine that is still loading when the reply is finished --
+the same timeline runs with playback treated as delivered immediately, which is
+the text-only fallback the state machine defines for exactly that situation. The
+two paths are the same code with a different backend behind it, not two
+behaviours.
+
+Pause stops delivery while preserving the response for `resume()`,
 which reopens generation for whatever text was still owed; sending a new
 message mid-response is a barge-in, which abandons the interrupted response
 and hands the timeline to the new prompt. The pause/resume control is only

@@ -435,6 +435,19 @@ private:
     /// freeze the window.
     void waitForIdleGeneration(int timeoutMs);
 
+    /// True while the worker is running anything at all: a reply, the idle
+    /// prewarm, or a permissioned tool. Every check that needs the worker free
+    /// -- before a backend swap, before reading live backend state -- asks this
+    /// rather than testing a subset of the three.
+    [[nodiscard]] bool workerBusy() const noexcept;
+
+    /// Cancels the prewarm or the tool run and waits for the worker to let go
+    /// of it. Called when a real turn arrives: both of those are inside the
+    /// backend's generate(), and one backend has one generator, so a reply
+    /// queued behind them waits for tokens nobody asked for. Bounded, so a
+    /// backend that ignores cancellation cannot freeze the window.
+    void drainBackgroundRequests();
+
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
     void refreshCanRegenerate();
@@ -533,6 +546,11 @@ private:
     // the prewarm id so a backend swap can tell "busy answering someone" from
     // "busy thinking on its own".
     quint64 m_toolRequestId = 0;
+    // The text a permissioned tool produced, accumulated from its own tokens.
+    // It cannot come out of the streaming path, which only keeps the active
+    // request, and it cannot be read back off the transcript, whose last row
+    // belongs to whoever spoke last.
+    QString m_toolOutput;
     // Why the last idle tool did not run, shown in place of the task detail. A
     // tool that is refused without saying so is a tool the user cannot debug.
     QString m_idleToolNotice;

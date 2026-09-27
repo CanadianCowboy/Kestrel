@@ -14,6 +14,9 @@
 #include <QTimer>
 #include <QUrl>
 
+#include <algorithm>
+#include <utility>
+
 #include "app/appcontroller.h"
 #include "runtime/backendregistry.h"
 
@@ -120,21 +123,24 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
 //     made the ONNX backend unreachable from a plain launch -- the same class of
 //     defect as the one this function was written to fix.
 //
-// Among candidates the largest wins. A quantisation of the same family differs
-// in size by a wide margin, and among different families the larger model is the
-// more capable one -- picking alphabetically would hand a 0.5 B model chosen
-// for the name starting with 'a' over the 8 B one sitting next to it. Kestrel
-// shipped a `qwen.gguf` next to a much better local model precisely because the
-// name said nothing about the contents.
-QString discoverModel(const QString& explicitPath) {
+// Among candidates the largest is tried first. A quantisation of the same family
+// differs in size by a wide margin, and among different families the larger
+// model is the more capable one -- picking alphabetically would hand a 0.5 B
+// model chosen for the name starting with 'a' over the 8 B one sitting next to
+// it. Kestrel shipped a `qwen.gguf` next to a much better local model precisely
+// because the name said nothing about the contents.
+//
+// The rest come back too, rather than only the best, because a ranking is a
+// guess and the caller is what settles it.
+QStringList discoverModels(const QString& explicitPath) {
     if (!explicitPath.isEmpty()) {
-        return explicitPath;
+        return {explicitPath};
     }
 
     const QString fromEnvironment =
         qEnvironmentVariable("KESTREL_MODEL", QString());
     if (!fromEnvironment.isEmpty() && QFileInfo::exists(fromEnvironment)) {
-        return fromEnvironment;
+        return {fromEnvironment};
     }
 
     const QString modelDirectory =
@@ -144,19 +150,21 @@ QString discoverModel(const QString& explicitPath) {
         return {};
     }
 
-    QString best;
-    qint64 bestBytes = -1;
-    const auto consider = [&best, &bestBytes](const QString& path, qint64 bytes) {
-        if (bytes > bestBytes) {
-            bestBytes = bytes;
-            best = path;
-        }
+    // (size, path), largest first. Kept as a ranked list rather than a single
+    // winner because "largest" is a guess about which model will load, and
+    // guesses about model files are wrong: a folder can hold gigabytes of
+    // weights behind a config that is empty or truncated, and a .gguf can be a
+    // half-finished download. Ranking says who to try; the caller loading each
+    // in turn and moving on is what actually decides.
+    QList<QPair<qint64, QString>> ranked;
+    const auto consider = [&ranked](const QString& path, qint64 bytes) {
+        ranked.append({bytes, path});
     };
 
     for (const QString& entry :
          directory.entryList({QStringLiteral("*.gguf")}, QDir::Files, QDir::Name)) {
         const QFileInfo info(directory.filePath(entry));
-        if (info.isFile() && info.isReadable()) {
+        if (info.isFile() && info.isReadable() && info.size() > 0) {
             consider(info.absoluteFilePath(), info.size());
         }
     }
@@ -168,6 +176,18 @@ QString discoverModel(const QString& explicitPath) {
         if (!candidate.exists(QStringLiteral("genai_config.json"))) {
             continue;
         }
+        const QFileInfo config(
+            candidate.filePath(QStringLiteral("genai_config.json")));
+        if (!config.isReadable() || config.size() == 0) {
+            // An empty or unreadable config is the specific case that used to
+            // win the ranking on the strength of the weights beside it and then
+            // fail to load. There is no graph to run, so it is not a model
+            // however large the folder is.
+            continue;
+        }
+        if (candidate.entryList({QStringLiteral("*.onnx")}, QDir::Files).isEmpty()) {
+            continue;
+        }
         qint64 bytes = 0;
         const QFileInfoList files =
             candidate.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
@@ -176,7 +196,22 @@ QString discoverModel(const QString& explicitPath) {
         }
         consider(candidate.absolutePath(), bytes);
     }
-    return best;
+
+    // Ties broken by path, so the same directory always yields the same order.
+    std::sort(ranked.begin(), ranked.end(),
+              [](const QPair<qint64, QString>& left,
+                 const QPair<qint64, QString>& right) {
+                  if (left.first != right.first) {
+                      return left.first > right.first;
+                  }
+                  return left.second < right.second;
+              });
+    QStringList ordered;
+    ordered.reserve(ranked.size());
+    for (const QPair<qint64, QString>& entry : std::as_const(ranked)) {
+        ordered.append(entry.second);
+    }
+    return ordered;
 }
 
 // Sends one message through the real window and reports whether a reply came
@@ -367,23 +402,50 @@ int main(int argc, char* argv[]) {
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    const QString modelArgument =
-        discoverModel(valueAfter(arguments, QStringLiteral("--model")));
+    const QStringList modelCandidates =
+        discoverModels(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
-    if (reportRuntime && modelArgument.isEmpty()) {
+    if (reportRuntime && modelCandidates.isEmpty()) {
         attachToLaunchConsole();
         return printRuntime(controller);
     }
-    if (!modelArgument.isEmpty()) {
+    if (!modelCandidates.isEmpty()) {
         if (reportRuntime) {
             QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
                              &app, [&] { app.exit(printRuntime(controller)); },
                              Qt::QueuedConnection);
         }
+        // Each candidate in turn, and the next one when the last fails to load.
+        //
+        // Ranking by size picks the model most likely to be the one wanted; it
+        // cannot know whether the largest file on disk is a complete download
+        // or a folder whose config names a graph that is not there. Trying the
+        // rest costs one failed load and is the difference between starting on
+        // a real model and starting on the preview mock with an error nobody
+        // asked for. An explicit --model is a single candidate, so the loop
+        // never second-guesses a choice the user made.
+        //
+        // The controller drops its load thread before publishing
+        // modelLoadFinished, so the next attempt is not refused as a load
+        // already in flight.
+        auto attempt = std::make_shared<int>(0);
+        QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
+                         &app, [&controller, modelCandidates, attempt] {
+            if (controller.modelError().isEmpty()) {
+                return; // loaded; the loop is finished
+            }
+            if (*attempt >= modelCandidates.size()) {
+                return; // every candidate refused; the last error stands
+            }
+            const QString next = modelCandidates.at(*attempt);
+            ++(*attempt);
+            controller.loadModelFromUrl(QUrl::fromLocalFile(next).toString());
+        }, Qt::QueuedConnection);
         // The controller loads on a worker and publishes the result on the UI
         // thread. Start once the event loop can receive that completion.
-        QTimer::singleShot(0, &controller, [&controller, modelArgument] {
-            controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
+        const QString first = modelCandidates.first();
+        QTimer::singleShot(0, &controller, [&controller, first] {
+            controller.loadModelFromUrl(QUrl::fromLocalFile(first).toString());
         });
     }
     if (reportRuntime) {
@@ -432,7 +494,7 @@ int main(int argc, char* argv[]) {
     // not just the controller. The timeout is generous because a real model's
     // first token can take a while on a cold context.
     if (arguments.contains(QStringLiteral("--smoke-test"))) {
-        return runSmokeTest(controller, 120000, !modelArgument.isEmpty());
+        return runSmokeTest(controller, 120000, !modelCandidates.isEmpty());
     }
 
     // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
@@ -458,8 +520,18 @@ int main(int argc, char* argv[]) {
     // here is not an exit at all -- with no platform plugin it puts up a modal
     // dialog -- so the packaging step copies the offscreen plugin and says so
     // if it cannot.
+    //
+    // Every one of those exits is nonzero, because the exit status is the only
+    // thing the packaging check reads. A capture that quietly produced no file
+    // and reported success is worse than one that failed: the check goes on to
+    // measure the missing file, or, if the file was left from a previous run,
+    // to pass on yesterday's picture.
     const QString screenshotPath = qEnvironmentVariable("KESTREL_SCREENSHOT");
     if (!screenshotPath.isEmpty()) {
+        const auto fail = [&app](const char* what) {
+            QTextStream(stderr) << "Kestrel could not " << what << "\n";
+            app.exit(1);
+        };
         // qEnvironmentVariableIntValue's second parameter is a bool* for
         // "was it set", not a default value, so the fallback is spelled out.
         bool delayGiven = false;
@@ -467,22 +539,33 @@ int main(int argc, char* argv[]) {
         const int delayMs = delayGiven ? requested : 1600;
         auto* watchdog = new QTimer(&app);
         watchdog->setSingleShot(true);
-        QObject::connect(watchdog, &QTimer::timeout, &app, &QGuiApplication::quit);
+        QObject::connect(watchdog, &QTimer::timeout, &app,
+                         [&app] { app.exit(1); }); // the grab never arrived
         watchdog->start(delayMs + 15000);
-        QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath] {
+        QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath, fail] {
             auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0));
             if (window == nullptr || window->contentItem() == nullptr) {
-                app.quit();
+                fail("find a window to capture");
                 return;
             }
             const QSharedPointer<QQuickItemGrabResult> grab = window->contentItem()->grabToImage();
+            // grabToImage returns null when the grab cannot even be started,
+            // and then there is no ready signal to connect to and nothing else
+            // that would ever end this process.
+            if (grab.isNull()) {
+                fail("start a capture of the window");
+                return;
+            }
             QObject::connect(grab.data(), &QQuickItemGrabResult::ready, &app,
-                             [grab, screenshotPath] {
+                             [grab, screenshotPath, &app] {
                                  const QImage image = grab->image();
                                  if (image.isNull() || !image.save(screenshotPath)) {
-                                     QTextStream(stderr) << "Kestrel could not write " << screenshotPath << "\n";
+                                     QTextStream(stderr) << "Kestrel could not write "
+                                                         << screenshotPath << "\n";
+                                     app.exit(1);
+                                     return;
                                  }
-                                 QGuiApplication::quit();
+                                 app.quit();
                              });
         });
     }

@@ -68,12 +68,19 @@ QString LocalModelSpeechBackend::description() const {
 }
 
 void LocalModelSpeechBackend::markGivenUp() {
+    // Whether anything was promised to the synthesizer, not whether it ever
+    // came true. An engine that launched and then failed while loading its
+    // model has still made a promise -- present() said a voice was coming, and
+    // a reply may already be held waiting for it -- so it has to be withdrawn
+    // here. Reporting only for a started engine left that case silent, and the
+    // reply then waited out the whole 15 second load deadline for an engine
+    // already known to be dead.
+    const bool wasPromised = m_launched || m_started;
     m_launched = false;
-    if (!m_started) {
-        return;
-    }
     m_started = false;
-    reportUnavailable();
+    if (wasPromised) {
+        reportUnavailable();
+    }
 }
 
 QString LocalModelSpeechBackend::engineExecutable() const {
@@ -171,14 +178,50 @@ void LocalModelSpeechBackend::noteEngineFailed(const QString& reason) {
 }
 
 void LocalModelSpeechBackend::stop() {
-    // A clause already handed to the model is not recalled; it finishes, which is
-    // the same bargain the platform voice makes and the reason a barge-in lands
-    // between clauses rather than mid-word.
-    m_player->stop();
+    // A clause already handed to the player is not recalled; it finishes, which
+    // is the same bargain the platform voice makes with BoundaryHint::Utterance
+    // and the reason a barge-in lands between clauses rather than mid-word.
+    //
+    // Calling m_player->stop() here instead is the obvious thing to write and
+    // it is wrong twice over. It cuts the audio in the middle of a word, and it
+    // moves the media status to LoadedMedia rather than EndOfMedia -- so the
+    // finish never arrives, m_speaking stays true, and the synthesizer sits
+    // waiting for the stopCompleted() that only onBackendFinished() can send.
+    // Every later clause is then refused at the top of speak() and the voice
+    // goes silent for the rest of the session.
+    //
+    // So nothing is cut here. What is dropped is everything that was asked for
+    // and is not yet playing: a stop is a decision about what is heard next,
+    // and work queued behind it should not start after it.
+    for (PendingRequest& request : m_pending) {
+        request.playsNow = false;
+    }
+    m_prefetched.clear();
+    if (m_player->playbackState() == QMediaPlayer::PlayingState) {
+        // Something is genuinely being heard, so this is a real boundary and
+        // the finish will arrive on its own through EndOfMedia.
+        return;
+    }
+    // Nothing is playing. Either the clause is still being synthesised or there
+    // is nothing in flight at all, and both are already a boundary. The finish
+    // is reported here because nobody else is going to report it: no audio
+    // means no EndOfMedia, and the synthesizer is waiting.
+    m_speaking = false;
+    reportFinished();
 }
 
 void LocalModelSpeechBackend::stopImmediately() {
     m_player->stop();
+    // A clause still being synthesised must not begin playing afterwards.
+    // noteSynthesised() takes the front of the queue whatever its flag says, so
+    // without this a cancel landing during synthesis is followed by the very
+    // clause it cancelled, and that clause's EndOfMedia reports a segment
+    // finishing that nobody asked for.
+    for (PendingRequest& request : m_pending) {
+        request.playsNow = false;
+    }
+    // The prefetch cache survives: it is keyed by text, and a later reply that
+    // happens to contain this clause is a legitimate hit.
     m_speaking = false;
 }
 

@@ -282,11 +282,13 @@ void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
     if (loaded) {
-        // u8path is deprecated in C++20 and the path constructor takes the same
-        // u8string. Built from an explicit conversion rather than a silent
-        // reinterpret: the source is a std::string, and whether its bytes are
-        // UTF-8 is the caller's claim, not something to assert here.
-        const std::filesystem::path path(m_impl->modelPath);
+        // u8path is deprecated in C++20, so the conversion it performs lives in
+        // core::pathFromUtf8 now. What matters is not the spelling but what the
+        // comment claimed: the bytes are UTF-8, and a narrow std::string
+        // constructor would read them as the ANSI code page instead, so a model
+        // under a folder name the code page cannot spell would be reported
+        // here under a mangled name.
+        const std::filesystem::path path = core::pathFromUtf8(m_impl->modelPath);
         // core::pathText rather than filename().string(): a model file under a
         // user name the ANSI code page cannot spell throws from string() on
         // Windows, and this is the line that decides what the UI calls the model.

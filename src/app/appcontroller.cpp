@@ -301,6 +301,22 @@ void AppController::onListeningEnded(const QString& reason) {
 }
 
 AppController::~AppController() {
+    // The listen session goes first, then the recognizer, and this is not a
+    // style preference.
+    //
+    // m_listen is declared after m_recognizer, so members are destroyed in
+    // reverse and the implicit order would already be right. It is spelled out
+    // anyway because the reason is not visible from the declarations: the
+    // session owns the callbacks the recognizer's worker thread invokes, and
+    // those lambdas address the session by raw pointer. ~ListenSession stops
+    // the recognizer, which is the boundary that makes the callbacks safe --
+    // and it can only do that while the recognizer it holds a reference to is
+    // still alive. Releasing the recognizer first would leave ~ListenSession
+    // calling stop() on a destroyed object, which is the same class of bug one
+    // step earlier in the same destructor.
+    m_listen.reset();
+    m_recognizer.reset();
+
     // The idle loop is a child of this object and its timer is stopped first:
     // a tick arriving during teardown would call into a half-destroyed
     // controller.
@@ -940,7 +956,7 @@ void AppController::setBackendForTesting(std::unique_ptr<runtime::ModelBackend> 
         return;
     }
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating || m_warmupRequestId != 0) {
+    if (workerBusy()) {
         return;
     }
     m_backend = std::move(backend);
@@ -1078,7 +1094,7 @@ void AppController::loadModelFromUrl(const QString& url) {
         m_modelLoadThread->wait();
         if (!m_discardModelLoad && result->error.isEmpty()) {
             waitForIdleGeneration(kBackendSwapTimeoutMs);
-            if (m_generating || m_warmupRequestId != 0) {
+            if (workerBusy()) {
                 result->error = tr("A response is still running. Stop it and try again.");
             }
         }
@@ -1111,7 +1127,7 @@ void AppController::loadModelFromUrl(const QString& url) {
 void AppController::usePreviewBackend() {
     m_discardModelLoad = true;
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating || m_warmupRequestId != 0) {
+    if (workerBusy()) {
         m_modelError = tr("A response is still running. Stop it and try again.");
         emit modelErrorChanged();
         return;
@@ -1129,19 +1145,48 @@ void AppController::usePreviewBackend() {
 }
 
 /// Requests cancellation and pumps a nested event loop for at most timeoutMs.
-/// Callers must check generation and warmup afterwards before replacing the backend.
+/// Callers must check workerBusy() afterwards before replacing the backend.
+void AppController::drainBackgroundRequests() {
+    // Only the requests that are not a conversation. A reply in flight is a
+    // different thing entirely and is handled by the barge-in path above.
+    if (m_warmupRequestId == 0 && m_toolRequestId == 0) {
+        return;
+    }
+    m_worker->cancel();
+    QEventLoop loop;
+    const QMetaObject::Connection done =
+        connect(this, &AppController::generatingChanged, &loop, [this, &loop] {
+            if (m_warmupRequestId == 0 && m_toolRequestId == 0) {
+                loop.quit();
+            }
+        });
+    // Bounded, for the same reason waitForIdleGeneration is: a backend that
+    // ignores cancellation must not turn a typed message into a frozen window.
+    // If it does overrun, the reply is queued anyway and starts behind it,
+    // which is the old behaviour rather than a worse one.
+    QTimer::singleShot(kBackendSwapTimeoutMs, &loop, &QEventLoop::quit);
+    loop.exec();
+    disconnect(done);
+}
+
 void AppController::waitForIdleGeneration(int timeoutMs) {
-    if (!m_generating && m_warmupRequestId == 0) {
+    if (!workerBusy()) {
         return;
     }
     stopGeneration();
-    if (m_warmupRequestId != 0) {
+    // The prewarm and the tool run are not a conversation, so stopGeneration()
+    // does not speak for them and they keep going unless they are cancelled
+    // here. Without this the wait below is a wait for a request that will not
+    // finish until its own generation does, which may be much longer than the
+    // timeout, so the swap proceeds with the worker still inside the old
+    // backend.
+    if (m_warmupRequestId != 0 || m_toolRequestId != 0) {
         m_worker->cancel();
     }
     QEventLoop loop;
     const QMetaObject::Connection done =
-        connect(this, &AppController::generatingChanged, &loop, [&loop, this] {
-        if (!m_generating && m_warmupRequestId == 0) {
+        connect(this, &AppController::generatingChanged, &loop, [this, &loop] {
+        if (!workerBusy()) {
             loop.quit();
         }
     });
@@ -1150,8 +1195,22 @@ void AppController::waitForIdleGeneration(int timeoutMs) {
     disconnect(done);
 }
 
-std::uint64_t AppController::nowMs() const noexcept {
-    // m_clock is only invalid between construction and start(), which no caller
+bool AppController::workerBusy() const noexcept {
+    // All three are inside one generate() call on the worker thread, and all
+    // three hold the backend's generation lock for its duration. So "is the
+    // worker free" is one question with three answers, and the checks that ask
+    // it have to ask all three -- a check that forgets the tool id believes the
+    // worker is idle while a summary is running, and then either replaces the
+    // backend underneath that generate() or calls a status() accessor that
+    // blocks the UI thread until the summary finishes.
+    //
+    // It is here rather than spelled out at each call site because that is how
+    // the tool request came to be missed: the list grew a third member and two
+    // of the five places that needed it were left reading the old pair.
+    return m_generating || m_warmupRequestId != 0 || m_toolRequestId != 0;
+}
+
+std::uint64_t AppController::nowMs() const noexcept {    // m_clock is only invalid between construction and start(), which no caller
     // can observe: the clock is started in the constructor and the tick timer
     // is not connected until after that.
     return static_cast<std::uint64_t>(m_clock.isValid() ? m_clock.elapsed() : 0);
@@ -1253,6 +1312,7 @@ void AppController::startSessionSummary() {
         }
     }
     m_toolRequestId = m_nextRequestId++;
+    m_toolOutput.clear();
     m_worker->start(m_toolRequestId,
                     QStringLiteral("Assistant: ") + material
                         + QStringLiteral("\nIn two sentences, what is this session about?"),
@@ -1351,6 +1411,16 @@ void AppController::publishMetrics() {
 }
 
 void AppController::onGenerationToken(quint64 requestId, const QString& token) {
+    if (requestId == m_toolRequestId) {
+        // A permissioned idle run. Its tokens belong to it, and they used to be
+        // dropped on the floor: the guard below keeps only the active request,
+        // and a tool's request is never the active one, so a summary was
+        // generated in full and then discarded without ever being read. The
+        // completion handler made up the text by reading the last row of the
+        // transcript, which is the previous assistant reply.
+        m_toolOutput += token;
+        return;
+    }
     if (requestId != m_activeRequestId || m_userPaused || m_userStopped) {
         return;
     }
@@ -1393,13 +1463,20 @@ void AppController::onGenerationFinished(quint64 requestId,
         // user was away -- and then released, so the worker is free for the
         // next real question.
         m_toolRequestId = 0;
-        const int lastRow = m_messageModel->rowCount() - 1;
-        const QString said = success && lastRow >= 0
-            ? m_messageModel->data(m_messageModel->index(lastRow, 0),
-                                   MessageModel::ContentRole).toString()
-            : QString();
-        m_messageModel->setLastMessageStatus(MessageStatus::Complete, {});
-        if (!said.trimmed().isEmpty()) {
+        // The text is what the tool actually produced. Reading it back out of
+        // the last transcript row was how the summary used to be "recovered":
+        // that row is the previous assistant reply or the indexing note, so the
+        // notice said "Summarised the session" every single time, including
+        // when the summary had been empty or had failed outright.
+        const QString said = success ? m_toolOutput.trimmed() : QString();
+        m_toolOutput.clear();
+        if (!said.isEmpty()) {
+            // Appended as its own row rather than written over the last one.
+            // Overwriting is what turned a Stopped or Failed reply into a
+            // Complete one on every successful summary -- a different kind of
+            // wrong, and just as visible once the user reads the transcript.
+            m_messageModel->appendMessage(core::MessageRole::Tool, said,
+                                          MessageStatus::Complete);
             m_idleToolNotice = tr("Summarised the session.");
         } else {
             m_idleToolNotice = error.isEmpty()
@@ -1476,6 +1553,19 @@ void AppController::onGenerationFinished(quint64 requestId,
 /// Creates a streaming reply and queues the assembled conversation on the worker.
 /// Uses userText for the voice response timeline and resets per-response metrics.
 void AppController::startGeneration(const QString& userText) {
+    // A real turn outranks whatever the idle loop had queued for the worker.
+    // Both of those requests are inside the backend's generate() right now, and
+    // the backend is one object with one generator, so the reply's own start
+    // would sit behind the warmup's remaining tokens and the user would watch
+    // their question wait on a prewarm they never asked for.
+    //
+    // Cancelling and then starting in the same breath would not help:
+    // GenerationWorker::start() clears the shared cancellation flag as its
+    // first act, so the cancel would be forgotten before the warmup noticed it.
+    // The warmup has to be given the chance to finish, and only then may the
+    // reply be queued.
+    drainBackgroundRequests();
+
     m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
     m_generating = true;
     m_userStopped = false;
@@ -1896,6 +1986,20 @@ void AppController::setActiveConversation(int id) {
         if (m_speech != nullptr) {
             m_speech->releaseOwedAudio();
         }
+        // A reply that has finished generating but is still being spoken is a
+        // different case, and it is the one that was missed. releaseOwedAudio
+        // only drops a reply that has not started playing; once the pump is
+        // running, leaving the conversation has to stop the pump too. Otherwise
+        // the old conversation's reply keeps being spoken over the new one, and
+        // finishPlayback then judges how long the reply was by looking at the
+        // last row of a transcript it does not belong to.
+        if (m_speaking) {
+            m_speech->stopNow();
+            m_speaking = false;
+            m_hasPendingSegment = false;
+            m_acknowledgement.clear();
+            emit ttsChanged();
+        }
     }
     m_activeId = id;
     m_messageModel->setEntry(findEntry(id));
@@ -1909,7 +2013,7 @@ void AppController::setActiveConversation(int id) {
 // reintroduces exactly the stall this exists to remove, since the backend's
 // accessors take the lock generate() is holding.
 void AppController::refreshCachedRuntime() {
-    if (m_generating || m_warmupRequestId != 0) {
+    if (workerBusy()) {
         return;
     }
     m_cachedStatus = m_backend->status();

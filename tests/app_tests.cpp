@@ -1494,12 +1494,31 @@ void testBargeInStopsAudioAtAClauseBoundary() {
 
     // The abandoned response is replaced, not resumed: the spoken text is kept
     // for the record and the new turn owns the timeline.
-    const bool stopped = controller.voiceState() == QLatin1String("interrupted")
-                      || controller.voiceState() == QLatin1String("cancelled")
-                      || controller.voiceState() == QLatin1String("generating")
-                      || controller.voiceState() == QLatin1String("speaking")
-                      || controller.voiceState() == QLatin1String("queued");
-    check(stopped, "the interrupted response moves out of the speaking state");
+    //
+    // Checking the state name was no use. The disjunction had to admit
+    // "generating", "speaking" and "queued" to survive a controller that had
+    // already moved on, and those are three of the five states a running
+    // controller reports -- so it passed whatever happened, including the
+    // barge-in silently doing nothing. What is worth asserting is the thing
+    // that actually matters: the clause in flight lands, and the replacing
+    // response then runs to completion rather than stalling on a stopCompleted
+    // that never arrives.
+    observed->finishUtterance();
+    // Then drive the replacing turn to its end. The fake reports the end of an
+    // utterance only when told to -- that is what makes it able to express a
+    // boundary stop at all -- so a turn runs out by handing it one clause
+    // boundary at a time, and the loop is also the wait for the slow backend
+    // to finish generating.
+    for (int i = 0; i < 500 && (controller.speaking() || controller.generating()); ++i) {
+        if (observed->speakingNow()) {
+            observed->finishUtterance();
+        }
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+    check(!controller.speaking() && !controller.generating(),
+          "the replacing response completes after a boundary stop");
     controller.stopGeneration();
 }
 

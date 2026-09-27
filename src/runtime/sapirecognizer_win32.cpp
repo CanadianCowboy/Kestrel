@@ -11,10 +11,13 @@
 //   CoCreateInstance(CLSID_SpSharedRecognizer) -> ISpRecognizer
 //   ISpRecognizer::SetInput(nullptr, SPADTYPE_INPUT)   the default microphone
 //   ISpRecognizer::CreateRecoContext()       -> ISpRecoContext
-//   ISpEventSource::SetInterest(SPRVI_SR | SPRVI_OTHER, 0)
+//   ISpRecoContext::CreateGrammar(...)       -> ISpRecoGrammar
+//   ISpRecoGrammar::SetDictationState(SPRS_ACTIVE)  hear anything at all
+//   ISpEventSource::SetInterest(SPFEI(...) | ..., 0)
 //   ISpEventSource::SetNotifyWin32Event()    -> an HANDLE to wait on
 //   ISpEventSource::GetNotifyEventHandle()
 //   ISpEventSource::GetEvents(...)           -> the events themselves
+//   ISpRecoResult::GetText(...)              -> the words, via the interface
 //
 // Two things about that list are worth writing down, because both look like
 // missing features and are not:
@@ -81,9 +84,10 @@ namespace {
 //
 // SPFEI itself does come from sapi.h, so no spelling-out is needed.
 constexpr ULONGLONG kInterest =
-    SPFEI(SPEI_RECOGNITION)     // a phrase was recognised; carries the text
-    | SPFEI(SPEI_SOUND_START)    // the engine heard something begin
-    | SPFEI(SPEI_END_SR_STREAM); // the engine closed the phrase: normal end
+    SPFEI(SPEI_RECOGNITION)      // a phrase was recognised; carries the text
+    | SPFEI(SPEI_SOUND_START)     // the engine heard something begin
+    | SPFEI(SPEI_FALSE_RECOGNITION) // audio arrived and the engine rejected it
+    | SPFEI(SPEI_END_SR_STREAM);  // the engine closed the phrase: normal end
 
 // The audio category SetInput is told to look in, when the token is null and
 // the engine picks its own default device. SPADTYPE_INPUT is a Speech SDK enum
@@ -98,21 +102,32 @@ constexpr DWORD kAudioCategoryInput = 1;
 // state forever, which is the one outcome worse than an error message.
 constexpr std::chrono::seconds kPhraseDeadline{30};
 
-// The payload of SPEI_RECOGNITION. SPRECOCGNITION belongs to the Speech SDK's
-// sapi.h, so its layout is declared here from the published SAPI 5 definition.
-// The two asserts pin the offsets that matter: a mistake in this file then
-// fails the build rather than producing a misread pointer at run time.
-struct RecognitionPayload {
-    SPEVENT streamEnd;        // the SPEI_END_SR_STREAM that closes this phrase
-    LRESULT confidence;       // 0..1000, the scale SAPI reports on
-    wchar_t* phrase;          // the words, NUL terminated
-    void* alternates;         // unused: one phrase per turn is enough
-};
-static_assert(offsetof(RecognitionPayload, confidence) == sizeof(SPEVENT),
-              "SPEVENT is not the first member, or the SDK added padding");
-static_assert(offsetof(RecognitionPayload, phrase) == sizeof(SPEVENT) + sizeof(LRESULT),
-              "the phrase pointer does not follow the confidence");
-
+// What SPEI_RECOGNITION actually carries, and the thing this file used to get
+// wrong.
+//
+// There is a struct for this event in SAPI, called SPRECOCGNITION, and it is
+// laid out here from the published definition: a closing SPEVENT, a confidence,
+// a wide phrase pointer, an alternates pointer. It reads beautifully and it is
+// not what arrives. SPRECOCGNITION belongs to the Speech SDK's sapi.h, not the
+// Windows SDK's, and the Windows SDK delivers the event differently: lParam is
+// an ISpRecoResult* COM object.
+//
+// Casting lParam to the struct is not a rough edge, it is memory corruption. The
+// read takes the object's vtable pointer as the confidence and its first
+// internal as the phrase pointer, and then CoTaskMemFree's that -- handing the
+// COM task allocator a pointer it never allocated, on the hot path, once per
+// recognised phrase. SpClearEvent afterwards releases an object that has
+// already been damaged, so nothing reports the fault; the process just goes
+// wrong somewhere later.
+//
+// The assertions that used to sit here pinned the offsets and made the file
+// look checked. They pinned the offsets of a struct no event ever contains.
+//
+// So the text is read through the interface instead, which is the only way it
+// can be read correctly. The cost is that confidence goes with it: the Speech
+// SDK's ISpRecoResult::GetConfidence, and the SPRECOCGNITIONINFO it returns,
+// are absent from the Windows SDK entirely -- not declared differently,
+// absent -- so there is no confidence to report and none is invented.
 // UTF-16 from the engine to UTF-8 for the interface. Reported, not repaired:
 // a conversion failure yields no text, and a session with no text ends as
 // NoAudio rather than as a phrase nobody said.
@@ -159,12 +174,45 @@ thread_local bool t_inWorker = false;
 // back.
 struct SessionState {
     std::string phrase;
+    // Left at zero for every phrase, deliberately. The Windows SDK's
+    // ISpRecoResult has no confidence accessor to read and none is invented
+    // here; the field stays because the result contract has one and a future
+    // build against the Speech SDK is the place to fill it.
     double confidence = 0.0;
     bool heardSound = false;
+    // The engine received audio and declined to recognise it, as opposed to
+    // there being no audio. The difference decides which of the two NoAudio
+    // messages the user is given, and both of them name a different thing to
+    // go and check.
+    bool rejectedAudio = false;
     // Set by the engine closing the phrase, or by the microphone stopping. Both
     // end the session, and both are the engine's decision rather than a timeout.
     bool finished = false;
     std::string failure;
+};
+
+// The callbacks one session delivers through.
+//
+// Taken at the top of the session and held for its whole length, rather than
+// read from the members at the moment of delivery. The difference is what
+// happens when a stop is followed immediately by a start.
+//
+// stop() waits for the worker to leave the session, so in the ordinary case
+// there is nothing to get wrong. The wait is bounded, though, because a stop
+// that never returned would be worse than a late one, and an engine wedged
+// inside a COM call is exactly the case that outlives the bound. After a
+// timeout, start() is free to store a new session's callbacks -- and then the
+// old session finishes, finds the new callbacks in the members, delivers
+// Cancelled to them, and clears them on its way out. The new session never
+// runs, and the consumer is told its own fresh listen was cancelled.
+//
+// Holding the snapshot makes the outcome the same in both cases. A session can
+// only ever deliver to the callbacks it was started with, so the newest
+// session's are untouchable by the one it replaced, whether or not the
+// replacement waited for it.
+struct SessionCallbacks {
+    SpeechRecognizer::ResultCallback onResult;
+    SpeechRecognizer::EndCallback onEnd;
 };
 
 } // namespace
@@ -328,7 +376,7 @@ private:
         const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(comInit)) {
             m_listening.store(false, std::memory_order_release);
-            deliverEnd(RecognitionEnd::Failed,
+            deliverEnd(takeCallbacks(), RecognitionEnd::Failed,
                        "COM could not be initialised on the recognizer thread: "
                            + formatHr(comInit));
             return;
@@ -377,6 +425,9 @@ private:
 
     void runSession(unsigned generation) {
         SessionState state;
+        // Taken before anything else, so the callbacks belong to this session
+        // and to nothing that happens after it.
+        const SessionCallbacks callbacks = takeCallbacks();
 
         ISpRecognizer* recognizer = nullptr;
         ISpRecoContext* context = nullptr;
@@ -451,8 +502,8 @@ private:
 
         if (FAILED(hr)) {
             releaseAudio(context, grammar, recognizer);
-            m_listening.store(false, std::memory_order_release);
-            deliverEnd(RecognitionEnd::Failed,
+            clearListeningIfCurrent(generation);
+            deliverEnd(callbacks, RecognitionEnd::Failed,
                        std::string("SAPI could not ") + step_name + ": " + formatHr(hr));
             return;
         }
@@ -513,7 +564,7 @@ private:
         }
 
         releaseAudio(context, grammar, recognizer);
-        m_listening.store(false, std::memory_order_release);
+        clearListeningIfCurrent(generation);
 
         if (cancelled) {
             // A stop is a cancellation, not a completed phrase. Reporting the
@@ -522,18 +573,21 @@ private:
             RecognitionResult stopped;
             stopped.isFinal = false;
             stopped.end = RecognitionEnd::Cancelled;
-            deliverResult(stopped);
-            deliverEnd(RecognitionEnd::Cancelled, {});
+            deliverResult(callbacks, stopped);
+            deliverEnd(callbacks, RecognitionEnd::Cancelled, {});
             return;
         }
         if (!state.failure.empty()) {
-            deliverEnd(RecognitionEnd::Failed, state.failure);
+            deliverEnd(callbacks, RecognitionEnd::Failed, state.failure);
             return;
         }
         if (state.phrase.empty()) {
-            deliverEnd(RecognitionEnd::NoAudio,
-                       state.heardSound ? "the microphone heard no recognisable speech"
-                                        : "the microphone heard nothing at all");
+            deliverEnd(callbacks, RecognitionEnd::NoAudio,
+                       state.rejectedAudio
+                           ? "the speech engine heard audio and could not recognise it"
+                           : (state.heardSound
+                                  ? "the microphone heard no recognisable speech"
+                                  : "the microphone heard nothing at all"));
             return;
         }
 
@@ -542,8 +596,23 @@ private:
         final.confidence = state.confidence;
         final.isFinal = true;
         final.end = RecognitionEnd::Silence;
-        deliverResult(final);
-        deliverEnd(RecognitionEnd::Silence, {});
+        deliverResult(callbacks, final);
+        deliverEnd(callbacks, RecognitionEnd::Silence, {});
+    }
+
+    // Clears the listening flag only while this session is still the current
+    // one.
+    //
+    // The flag is a plain store in the obvious version of this, and the obvious
+    // version is wrong for the same reason the callbacks are snapshotted: a
+    // session that has already been superseded is still allowed to reach here,
+    // and clearing the flag would tell the worker nobody is listening when the
+    // session that replaced it very much is. The worker would then sit in its
+    // wait with m_listening false and the new session would never start.
+    void clearListeningIfCurrent(unsigned generation) {
+        if (m_generation.load(std::memory_order_acquire) == generation) {
+            m_listening.store(false, std::memory_order_release);
+        }
     }
 
     // Reads whatever the engine has queued. Called on the worker thread with
@@ -565,26 +634,41 @@ private:
             case SPEI_SOUND_START:
                 state.heardSound = true;
                 break;
+            case SPEI_FALSE_RECOGNITION:
+                // The engine got audio and could not make words out of it. That
+                // is the one case where "the microphone heard nothing at all"
+                // is exactly the wrong thing to tell the user: the audio
+                // arrived, and what failed was recognition. Counting it as
+                // heard is what makes the end reason say so.
+                state.heardSound = true;
+                state.rejectedAudio = true;
+                break;
             case SPEI_RECOGNITION: {
                 // lParam is a LONG_PTR, so the pointer has to be cast through
                 // an integer type. const_cast cannot do it: the value is not
                 // const, it is a pointer stored in a field that happens to be
                 // named like one.
-                auto* payload = reinterpret_cast<RecognitionPayload*>(
+                auto* result = reinterpret_cast<ISpRecoResult*>(
                     static_cast<std::uintptr_t>(event.lParam));
-                if (payload == nullptr) {
+                if (result == nullptr) {
                     break;
                 }
-                const std::string text = toUtf8(payload->phrase);
-                // The engine allocates pwszResult and hands over ownership by
-                // putting the pointer in the event. Nothing else releases it,
-                // and CoTaskMemFree is the only thing that can: freeing it with
-                // the C runtime would corrupt the COM task allocator's heap. A
-                // dictation session raises one of these per phrase, so this is
-                // a leak on the hot path rather than a theoretical one.
-                if (payload->phrase != nullptr) {
-                    ::CoTaskMemFree(payload->phrase);
-                    payload->phrase = nullptr;
+                // GetText rather than a field read, because there is no field.
+                // Zero and zero mean the whole phrase -- ulStart is a word index
+                // and ulCount of zero means "every word from there on" -- and
+                // TRUE asks for the text replacements, so a phrase with a
+                // corrected homophone reads as the corrected word.
+                wchar_t* raw = nullptr;
+                std::string text;
+                if (SUCCEEDED(result->GetText(0, 0, TRUE, &raw, nullptr))
+                    && raw != nullptr) {
+                    text = toUtf8(raw);
+                    // The allocation is the COM task allocator's, and
+                    // CoTaskMemFree is the only thing that can release it:
+                    // freeing it with the C runtime would corrupt a heap the
+                    // engine still owns. One of these arrives per recognised
+                    // phrase, so this is the hot path rather than an edge.
+                    ::CoTaskMemFree(raw);
                 }
                 if (text.empty()) {
                     break;
@@ -594,17 +678,38 @@ private:
                 // delivered. This adapter reports a finished phrase, not the
                 // words so far; ListenSession already treats partial text as
                 // optional.
+                //
+                // Note what is deliberately not here: this event does not end
+                // the session. A dictation grammar raises one of these for
+                // every revision of the utterance, so treating the first as
+                // final would deliver the opening word and throw the sentence
+                // away. SPEI_END_SR_STREAM is what closes a phrase.
                 state.phrase = text;
-                // SAPI reports confidence on a 0..1000 scale and the interface
-                // promises [0, 1], so it is converted rather than reported raw.
-                state.confidence = static_cast<double>(payload->confidence) / 1000.0;
+                // No confidence is set, and the reason is in the note above the
+                // old SPRECOCGNITION declaration: the Windows SDK's
+                // ISpRecoResult has no accessor for one. The field stays at its
+                // default rather than being filled with a plausible number.
                 break;
             }
-            case SPEI_END_SR_STREAM:
+            case SPEI_END_SR_STREAM: {
                 // The engine closed the phrase: the speaker stopped and it
                 // decided that was the end. This is the normal exit.
                 state.finished = true;
+                // lParam carries the HRESULT the stream ended with. A capture
+                // device that was unplugged, or a format the engine could not
+                // keep up with, ends the stream in failure, and reporting that
+                // as a completed phrase would tell the user their words were
+                // heard when the engine never received them. The session still
+                // finishes -- the audio is gone either way -- but it finishes
+                // with the reason attached.
+                const HRESULT streamEnd = static_cast<HRESULT>(event.lParam);
+                if (FAILED(streamEnd) && state.failure.empty()) {
+                    state.failure =
+                        "the speech engine ended the input stream in failure: "
+                        + formatHr(streamEnd);
+                }
                 break;
+            }
             default:
                 break;
             }
@@ -653,30 +758,36 @@ private:
         }
     }
 
-    // Copies the callback out and clears the member before invoking it, so a
-    // callback that stops the recognizer cannot leave a second invocation
-    // pointing at an empty std::function.
-    void deliverResult(const RecognitionResult& result) {
-        ResultCallback callback;
+    // Moves the pending callbacks out of the members and leaves them empty.
+    // A consumer that stops the recognizer from inside its own callback can
+    // therefore never provoke a second invocation through a std::function that
+    // has just been called and destroyed.
+    SessionCallbacks takeCallbacks() {
+        SessionCallbacks callbacks;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            callback = m_onResult;
+            callbacks.onResult = std::move(m_onResult);
+            callbacks.onEnd = std::move(m_onEnd);
             m_onResult = {};
+            m_onEnd = {};
         }
-        if (callback) {
-            callback(result);
+        return callbacks;
+    }
+
+    // Invoked on the worker thread with this session's own callbacks, holding
+    // no lock, so a consumer is free to call back into the recognizer -- and
+    // free to stop it, which is the common way a listening session ends.
+    void deliverResult(const SessionCallbacks& callbacks,
+                       const RecognitionResult& result) {
+        if (callbacks.onResult) {
+            callbacks.onResult(result);
         }
     }
 
-    void deliverEnd(RecognitionEnd reason, const std::string& detail) {
-        EndCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            callback = m_onEnd;
-            m_onEnd = {};
-        }
-        if (callback) {
-            callback(reason, detail);
+    void deliverEnd(const SessionCallbacks& callbacks, RecognitionEnd reason,
+                    const std::string& detail) {
+        if (callbacks.onEnd) {
+            callbacks.onEnd(reason, detail);
         }
     }
 

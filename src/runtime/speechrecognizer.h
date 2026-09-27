@@ -42,7 +42,9 @@ struct RecognitionResult {
     // The text so far. Grows across partial results and is repeated in full in
     // the final one, so a consumer never has to accumulate it itself.
     std::string text;
-    // Confidence in [0, 1], reported by the engine and not invented here.
+    // Confidence in [0, 1], as the engine reported it. Zero where the engine
+    // reports none, which is a real answer rather than a rounded-up one: the
+    // Windows SDK's SAPI 5 view has no accessor to ask.
     double confidence = 0.0;
     bool isFinal = false;
     RecognitionEnd end = RecognitionEnd::Silence;

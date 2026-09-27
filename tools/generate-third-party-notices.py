@@ -176,7 +176,9 @@ def licence_of(meta):
         (r"^MIT$", "MIT"),
         (r"^Apache 2\.0$", "Apache-2.0"),
         (r"^BSD 3-Clause License$", "BSD-3-Clause"),
+        (r"^3-Clause BSD License$", "BSD-3-Clause"),
         (r"^BSD 2-Clause License$", "BSD-2-Clause"),
+        (r"^Simplified BSD License$", "BSD-2-Clause"),
         (r"^GNU Lesser General Public License v3", "LGPL-3.0"),
     ):
         if re.match(pattern, squashed, re.IGNORECASE):
@@ -202,6 +204,92 @@ def licence_files(dist_info):
         licenses_dir = dist_info / "licenses"
         if licenses_dir.is_dir():
             found.extend(p for p in sorted(licenses_dir.rglob("*")) if p.is_file())
+    return found
+
+
+# Openings of licence texts, mapped to their SPDX id. Used when a
+# distribution's metadata names no licence at all, and to check that a bundled
+# notice matches what the package declared -- see sniff_licence and text_licence.
+LICENCE_OPENINGS = (
+    (r"MIT License|Permission is hereby granted, free of charge", "MIT"),
+    (r"Apache License[\s\S]{0,80}Version 2\.0", "Apache-2.0"),
+    (r"GNU AFFERO GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 3", "AGPL-3.0"),
+    (r"GNU LESSER GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 3", "LGPL-3.0"),
+    (r"GNU GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 3", "GPL-3.0"),
+    (r"GNU GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 2", "GPL-2.0"),
+    (r"Mozilla Public License[\s\S]{0,80}Version 2\.0", "MPL-2.0"),
+    (r"This is free and unencumbered software released into the public domain",
+     "0BSD"),
+)
+
+# The two BSD variants share an opening and differ by a third clause, so they
+# cannot be told apart by a single phrase the way the rest can. Both markers are
+# checked for the same reason the order matters: a distance-limited pattern
+# between the opening and the third clause is measured in characters of a
+# particular typesetter's line breaks, and the marker sits about five hundred
+# characters in -- far enough that the pattern silently stopped matching and
+# every 3-clause BSD in the environment got filed as 2-clause.
+BSD_OPENING = r"Redistribution and use in source and binary forms"
+BSD_THIRD_CLAUSE = r"[Nn]either the name"
+
+
+def sniff_licence(body):
+    """The SPDX id a licence text opens with, or "" when it is not recognisable."""
+    head = body[:4000]
+    for pattern, spdx in LICENCE_OPENINGS:
+        if re.search(pattern, head, re.IGNORECASE):
+            return spdx
+    if re.search(BSD_OPENING, head, re.IGNORECASE):
+        return (
+            "BSD-3-Clause"
+            if re.search(BSD_THIRD_CLAUSE, head)
+            else "BSD-2-Clause"
+        )
+    return ""
+
+
+def licence_from_text(path):
+    """sniff_licence() for a file on disk."""
+    try:
+        return sniff_licence(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def licence_terms(expression):
+    """The individual SPDX ids inside an expression, AND and OR alike."""
+    return {part.strip() for part in re.split(r"\s+(?:AND|OR|WITH)\s+", expression)}
+
+
+def text_licence(declared, body):
+    """What a licence text should be indexed under, given the package's claim.
+
+    The package's declaration is normally right, and it is what the table
+    above is built from. It is not always right about every file: a GPL
+    distribution can bundle a notice for someone else's Apache-licensed code,
+    and indexing that file under the package's GPL makes the inventory say the
+    file is GPL when its first line says Apache. So the text is read, and the
+    reading wins only when it disagrees about a licence the declaration does
+    not already account for.
+
+    "Account for" means being one of the terms of the expression, which is what
+    keeps a compound row like NumPy's BSD-3-Clause AND 0BSD AND MIT AND Zlib AND
+    CC0-1.0 indexed under the whole expression rather than under whichever part
+    happened to be the opening of one of its files.
+    """
+    if not declared or declared == "NOT DECLARED":
+        return declared
+    found = sniff_licence(body)
+    terms = licence_terms(declared)
+    if not found:
+        return declared
+    for term in terms:
+        # "GPL-3.0-or-later" and "GPL-3.0" are the same licence text. The "or
+        # later" is a grant about which versions may be used, not a different
+        # licence, and a file containing the GPL-3.0 text does not thereby make
+        # the package's declaration narrower than it is.
+        if term == found or term.startswith(found) or found.startswith(term):
+            return declared
     return found
 
 
@@ -231,12 +319,18 @@ def collect_python_packages():
         meta = read_metadata(dist_info / "METADATA")
         if meta is None:
             continue
+        texts = licence_files(dist_info)
+        licence = licence_of(meta)
+        if not licence:
+            licence = next(
+                (found for found in (licence_from_text(t) for t in texts) if found), ""
+            )
         rows.append(
             {
                 "name": meta.get("Name", dist_info.name),
                 "version": meta.get("Version", "?"),
-                "licence": licence_of(meta) or "NOT DECLARED",
-                "texts": licence_files(dist_info),
+                "licence": licence or "NOT DECLARED",
+                "texts": texts,
                 "summary": meta.get("Summary", "").strip(),
                 "home": meta.get("Home-page", "").strip(),
             }
@@ -244,10 +338,36 @@ def collect_python_packages():
     return rows
 
 
+def text_stem(path, package):
+    """A name fragment distinguishing one of several licence files.
+
+    Distributions may declare more than one License-File, and naming every one
+    of them `<licence>-<package>.txt` means each write lands on the same path
+    and the last one silently replaces the rest. That is how the notice ended
+    up pointing at a file containing nothing but the SplitMix64 dedication
+    while claiming to be NumPy's BSD-3-Clause AND 0BSD AND MIT AND Zlib AND
+    CC0-1.0 text: a dozen real files, one surviving name.
+
+    So when there is more than one, the file's own name goes into the output
+    name. The stem is a path relative to the dist-info root, so it is stable
+    across machines and says what the text is rather than where it was found.
+    """
+    relative = path.name
+    for part in path.parts:
+        if part.endswith(".dist-info"):
+            relative = "/".join(path.parts[path.parts.index(part) + 1:])
+            break
+    stem = re.sub(r"\.(txt|md|rst|)$", "", relative)
+    stem = re.sub(r"^(LICENSE|COPYING|NOTICE)[-_.]?", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"[-_.]+", "-", stem).strip("-").lower()
+    return safe_name(stem) if stem else safe_name(package)
+
+
 def copy_texts(rows, components, written):
     """Copies each distinct licence text into licenses/ and returns what it used."""
     used = {}
     for row in rows:
+        many = len(row["texts"]) > 1
         for text in row["texts"]:
             try:
                 body = text.read_text(encoding="utf-8", errors="replace")
@@ -255,15 +375,17 @@ def copy_texts(rows, components, written):
                 continue
             if not body.strip():
                 continue
-            key = (row["licence"], body)
+            label = text_licence(row["licence"], body)
+            key = (label, body)
             if key in written:
-                used.setdefault(row["licence"], set()).add(written[key])
+                used.setdefault(label, set()).add(written[key])
                 continue
-            filename = f"{safe_name(row['licence'])}-{safe_name(row['name'])}.txt"
+            stem = text_stem(text, row["name"]) if many else safe_name(row["name"])
+            filename = f"{safe_name(label)}-{stem}.txt"
             target = OUT_DIR / filename
             target.write_text(body, encoding="utf-8")
             written[key] = filename
-            used.setdefault(row["licence"], set()).add(filename)
+            used.setdefault(label, set()).add(filename)
     for component in components:
         source = component.get("from", "")
         if not source or not os.path.isfile(source):
@@ -326,6 +448,16 @@ def main():
         "property of its authors; the licence named here governs it."
     )
     lines.append("")
+    if any(r["name"] in NOT_SHIPPED for r in rows):
+        dropped_names = ", ".join(
+            f"`{r['name']}`" for r in rows if r["name"] in NOT_SHIPPED
+        )
+        lines.append(
+            f"One exception, marked where it appears: {dropped_names} is present "
+            "in the development environment and is **not** carried in the "
+            "package. See the copyleft section below."
+        )
+        lines.append("")
 
     lines.append("## Native components")
     lines.append("")
@@ -376,7 +508,8 @@ def main():
             lines.append("")
             for row in dropped:
                 lines.append(
-                    f"- **{row['name']} {row['version']}** -- `{row['licence']}`. "
+                    f"- **{row['name']} {row['version']}** -- `{row['licence']}`, "
+                    "development environment only, not shipped. "
                     "Nothing in the build imports it. "
                     "`tools/package-desktop.bat` excludes it from the `Lib` copy "
                     "and fails the packaging run if it is still there afterwards."
@@ -403,15 +536,19 @@ def main():
             )
             lines.append("")
             lines.append(
-                "**What this does and does not require.** Kestrel invokes the "
-                "voice as a separate `python.exe` process and exchanges JSON over "
-                "a pipe. Copyleft reaches a *derivative work*; a program run as a "
-                "separate process and talked to over stdin/stdout is a separate "
-                "work, so Kestrel's own MIT licence is not forced to change. What "
-                "GPL-3.0 does require of anyone redistributing this package is on "
-                "that component itself: convey its licence (see `licenses/`) and "
-                "its Corresponding Source, or a written offer of it. A licence "
-                "file alone does not discharge that."
+                "**What this does and does not require.** The GPL analysis turns "
+                "on the nature of the interaction, not on the process boundary "
+                "existing. Kestrel sends ordinary text-to-speech request data -- "
+                "`text`, `voice`, `speed` and an output path -- and receives a "
+                "path to a generated WAV plus a status. Nothing of Kestrel's is "
+                "passed into the other work to be combined with it, and no part "
+                "of the other work is passed back to be combined with Kestrel's. "
+                "A program run as a separate process and talked to in that way is "
+                "a separate work, so Kestrel's own MIT licence is not forced to "
+                "change. What GPL-3.0 does require of anyone redistributing this "
+                "package is on that component itself: convey its licence (see "
+                "`licenses/`) and its Corresponding Source, or a written offer of "
+                "it. A licence file alone does not discharge that."
             )
             lines.append("")
             lines.append(

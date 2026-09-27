@@ -4,6 +4,7 @@
 #include "runtime/cudadevice.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,14 @@
 #endif
 
 namespace kestrel::runtime {
+
+// Everything in this anonymous namespace exists to read genai_config.json and
+// budget a KV cache against it, which only a build with ONNX Runtime GenAI ever
+// does. Guarded rather than left to warn as unused: a build without the toolkit
+// is the supported one -- it is what CI runs, and it is the whole reason the
+// inert-backend branch below exists -- so it has to compile clean, not merely
+// compile.
+#ifdef KESTREL_HAS_ORT_GENAI
 
 namespace {
 
@@ -219,6 +228,8 @@ std::size_t kvBytesPerToken(std::int64_t layers, std::int64_t kvHeads, std::int6
 
 } // namespace
 
+#endif // KESTREL_HAS_ORT_GENAI
+
 struct OrtGenAiBackend::Impl {
 #ifdef KESTREL_HAS_ORT_GENAI
     std::unique_ptr<OgaModel> model;
@@ -289,7 +300,7 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
     m_kvCacheBytes = 0;
 
     std::error_code fileError;
-    const std::filesystem::path root(modelPath);
+    const std::filesystem::path root = core::pathFromUtf8(modelPath);
     if (!std::filesystem::is_directory(root, fileError)) {
         error = "Not a model directory: " + modelPath
               + " (an ONNX Runtime GenAI model is a folder holding "
@@ -375,6 +386,52 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
     std::string decoderName = "model.onnx";
     readJsonString(configText, "filename", decoderName);
 
+    // The context this machine can actually hold, which is usually not what
+    // the model declares. Qwen3.5-4B declares 262144; on an 8 GB card with
+    // 3.7 GB of weights resident that is not a setting, it is a way to fail at
+    // load time. The declared figure is kept and reported, because "your model
+    // supports 262144" and "your machine can hold 24576" are both true and
+    // only the second one is actionable.
+    //
+    // Worked out here rather than after the model is built because it has to
+    // go into the config *before* the model is created. Reporting a context
+    // length that the generator was never told about is how this used to
+    // behave: the number was published as contextLimit, the KV figure was
+    // derived from it, and nothing enforced it -- so a conversation longer
+    // than the budget ran past it and could push contextUsed above
+    // contextLimit, which is the one relationship those two numbers have.
+    int chosen = m_impl->declaredContextLength > 0 ? m_impl->declaredContextLength
+                                                   : kFallbackContextLength;
+    int budgeted = 0;
+    if (m_impl->totalDeviceBytes > 0 && m_impl->kvBytesPerTokenValue > 0) {
+        const std::size_t total = m_impl->totalDeviceBytes;
+        const std::size_t spare = total > m_impl->weightsBytes + kFixedOverheadBytes
+                                      ? total - m_impl->weightsBytes - kFixedOverheadBytes
+                                      : 0;
+        const auto affordable = static_cast<std::size_t>(
+            static_cast<double>(spare) * kKvBudgetShare) / m_impl->kvBytesPerTokenValue;
+        if (affordable >= 1024) {
+            // Rounded down to a multiple of 1024 so the reported figure is one
+            // a reader can recognise as a deliberate choice rather than the
+            // residue of a division.
+            budgeted = static_cast<int>((affordable / 1024) * 1024);
+            chosen = std::min(chosen, budgeted);
+        } else {
+            // Not enough room for even a modest context. The model is about to
+            // be built; generation is what will strain, and the status says so
+            // rather than the load failing for a reason the user cannot act on.
+            budgeted = 0;
+        }
+    }
+    if (m_requestedContextLength > 0) {
+        chosen = m_requestedContextLength;
+    }
+    if (chosen < 1024) {
+        chosen = 1024;
+    }
+    m_contextLength = chosen;
+    m_kvCacheBytes = m_impl->kvBytesPerTokenValue * static_cast<std::size_t>(m_contextLength);
+
     try {
         m_impl->model.reset();
         m_impl->tokenizer.reset();
@@ -426,59 +483,36 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
             m_impl->resolvedDecoder = decoderName;
         }
 
+        // The budgeted context, put into the config the model is built from.
+        // Same mechanism as the decoder substitution above: an overlay on a
+        // loaded config, so the published genai_config.json on disk is left
+        // exactly as it was and the correction lives only in this process.
+        //
+        // "search" is where ONNX Runtime GenAI keeps the generation options --
+        // the same ones generate() sets per request -- so max_length here is
+        // the number the generator will hold itself to, and it is the one that
+        // decides how much KV cache is allocated up front.
+        config->Overlay(("{\"search\":{\"max_length\":"
+                         + std::to_string(m_contextLength) + "}}").c_str());
+
         m_impl->model = OgaModel::Create(*config);
         m_impl->tokenizer = OgaTokenizer::Create(*config);
     } catch (const std::exception& thrown) {
         m_impl->model.reset();
         m_impl->tokenizer.reset();
+        // A load that failed has no context, and leaving the budgeted figure
+        // behind would report a limit for a model that is not resident.
+        m_contextLength = 0;
+        m_kvCacheBytes = 0;
         m_status.modelLoaded = false;
         error = "ONNX Runtime GenAI could not load " + modelPath + ": " + thrown.what();
         m_status.detail = error;
         return false;
     }
 
-    // The context this machine can actually hold, which is usually not what
-    // the model declares. Qwen3.5-4B declares 262144; on an 8 GB card with
-    // 3.7 GB of weights resident that is not a setting, it is a way to fail at
-    // load time. The declared figure is kept and reported, because "your model
-    // supports 262144" and "your machine can hold 24576" are both true and
-    // only the second one is actionable.
-    int chosen = m_impl->declaredContextLength > 0 ? m_impl->declaredContextLength
-                                                   : kFallbackContextLength;
-    int budgeted = 0;
-    if (m_impl->totalDeviceBytes > 0 && m_impl->kvBytesPerTokenValue > 0) {
-        const std::size_t total = m_impl->totalDeviceBytes;
-        const std::size_t spare = total > m_impl->weightsBytes + kFixedOverheadBytes
-                                      ? total - m_impl->weightsBytes - kFixedOverheadBytes
-                                      : 0;
-        const auto affordable = static_cast<std::size_t>(
-            static_cast<double>(spare) * kKvBudgetShare) / m_impl->kvBytesPerTokenValue;
-        if (affordable >= 1024) {
-            // Rounded down to a multiple of 1024 so the reported figure is one
-            // a reader can recognise as a deliberate choice rather than the
-            // residue of a division.
-            budgeted = static_cast<int>((affordable / 1024) * 1024);
-            chosen = std::min(chosen, budgeted);
-        } else {
-            // Not enough room for even a modest context. The load has already
-            // succeeded, so the model is resident; generation is what will
-            // strain, and the status says so rather than the load failing for
-            // a reason the user cannot act on.
-            budgeted = 0;
-        }
-    }
-    if (m_requestedContextLength > 0) {
-        chosen = m_requestedContextLength;
-    }
-    if (chosen < 1024) {
-        chosen = 1024;
-    }
-    m_contextLength = chosen;
-    m_kvCacheBytes = m_impl->kvBytesPerTokenValue * static_cast<std::size_t>(m_contextLength);
-
     m_modelPath = modelPath;
     m_status.modelLoaded = true;
-    m_status.modelName = core::pathText(root.filename().string());
+    m_status.modelName = core::pathText(root.filename());
     refreshStatus();
 
     std::ostringstream detail;
@@ -536,11 +570,35 @@ void OrtGenAiBackend::generate(const GenerationRequest& request,
             return;
         }
 
+        // The context is enforced here as well as in the config, because a
+        // limit the runtime already knows about is not a limit the caller can
+        // be allowed to talk it out of. A prompt that has already filled the
+        // budget cannot be answered within it, and the honest answer to that
+        // is a message saying so rather than a turn that runs off the end.
+        if (m_contextLength > 0
+            && inputCount >= static_cast<std::size_t>(m_contextLength)) {
+            m_contextUsed = 0;
+            m_kvCacheBytesUsed = 0;
+            refreshStatus();
+            onComplete(false,
+                       "This conversation has reached the context this machine can "
+                       "hold ("
+                           + std::to_string(m_contextLength)
+                           + " tokens). Start a new conversation to carry on.");
+            return;
+        }
+
         auto params = OgaGeneratorParams::Create(*m_impl->model);
         // max_length counts prompt plus reply in this API, so a reply budget has
-        // to be added to the prompt rather than used as the total.
-        const auto maxLength = static_cast<double>(inputCount)
-                             + static_cast<double>(std::max(request.maxTokens, 1));
+        // to be added to the prompt rather than used as the total -- and then
+        // clamped to the context, so a generous reply budget cannot push a
+        // short prompt past the limit either.
+        const std::size_t wanted = inputCount
+                                 + static_cast<std::size_t>(std::max(request.maxTokens, 1));
+        const std::size_t allowed = m_contextLength > 0
+                                        ? std::min(wanted, static_cast<std::size_t>(m_contextLength))
+                                        : wanted;
+        const auto maxLength = static_cast<double>(std::max(allowed, inputCount + 1));
         params->SetSearchOption("max_length", maxLength);
         params->SetSearchOption("temperature", static_cast<double>(request.temperature));
         // Sampling only when a temperature was actually chosen above zero.
@@ -601,54 +659,6 @@ void OrtGenAiBackend::cancel() {
     m_cancelled.store(true);
 }
 
-std::size_t OrtGenAiBackend::countTokens(std::string_view text) const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-#ifdef KESTREL_HAS_ORT_GENAI
-    if (m_impl == nullptr || m_impl->tokenizer == nullptr || text.empty()) {
-        return 0;
-    }
-    try {
-        auto sequences = OgaSequences::Create();
-        m_impl->tokenizer->Encode(std::string(text).c_str(), *sequences);
-        return sequences->SequenceCount(0);
-    } catch (const std::exception&) {
-        // A tokenizer that cannot answer must not take the caller down with
-        // it; the base class's approximation is the documented fallback.
-        return 0;
-    }
-#else
-    static_cast<void>(text);
-    return 0;
-#endif
-}
-
-void OrtGenAiBackend::resetContextUsage() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_contextUsed = 0;
-    m_kvCacheBytesUsed = 0;
-    refreshStatus();
-}
-
-void OrtGenAiBackend::setSystemPrompt(std::string_view text) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_systemPrompt = std::string(text);
-}
-
-std::size_t OrtGenAiBackend::cachedPrefixTokens() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    // Zero, and the distinction matters. The system prompt is prepended to
-    // every turn but is not kept resident between them, so reporting its token
-    // count here would claim a KV-cache saving that does not happen.
-    //
-    // Keeping it resident is possible -- OgaGenerator::RewindTo() exists for
-    // exactly this -- but it constrains the generator to outlive a turn, and
-    // with it the search options that are set once at creation. Temperature
-    // arrives per request, so a generator that survived the turn would freeze
-    // the first turn's temperature for the rest of the conversation. Paying the
-    // re-decode is cheaper than a reply that ignores what the user asked for.
-    return 0;
-}
-
 #else // !KESTREL_HAS_ORT_GENAI
 
 // Every method still exists in a build without ONNX Runtime GenAI, and every one
@@ -680,11 +690,65 @@ void OrtGenAiBackend::cancel() {
     m_cancelled.store(true);
 }
 
-void OrtGenAiBackend::setContextLengthForTesting(int tokens) {
+#endif // KESTREL_HAS_ORT_GENAI
+
+// The four context-accounting overrides, in both builds.
+//
+// They are declared `override` in the header, so a build without ONNX Runtime
+// GenAI still has to define every one of them or the vtable is short and the
+// link fails -- which is not a failure anyone here would read as "the optional
+// backend is absent". Only countTokens reaches for a tokenizer, and it is the
+// one member here that is actually better with the library than without it.
+
+std::size_t OrtGenAiBackend::countTokens(std::string_view text) const {
+#ifdef KESTREL_HAS_ORT_GENAI
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_requestedContextLength = tokens > 0 ? tokens : 0;
+    if (m_impl == nullptr || m_impl->tokenizer == nullptr || text.empty()) {
+        return ModelBackend::countTokens(text);
+    }
+    try {
+        auto sequences = OgaSequences::Create();
+        m_impl->tokenizer->Encode(std::string(text).c_str(), *sequences);
+        return sequences->SequenceCount(0);
+    } catch (const std::exception&) {
+        // A tokenizer that cannot answer must not take the caller down with
+        // it; the base class's approximation is the documented fallback.
+        return ModelBackend::countTokens(text);
+    }
+#else
+    // No tokenizer to ask, so the approximation is not a degraded answer here,
+    // it is the only one there is. Returning zero instead would make a prompt
+    // look free, and this backend outranks the others in the registry, so the
+    // error would land in the context accounting of whatever loaded it.
+    return ModelBackend::countTokens(text);
+#endif
 }
 
-#endif // KESTREL_HAS_ORT_GENAI
+void OrtGenAiBackend::resetContextUsage() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_contextUsed = 0;
+    m_kvCacheBytesUsed = 0;
+    refreshStatus();
+}
+
+void OrtGenAiBackend::setSystemPrompt(std::string_view text) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_systemPrompt = std::string(text);
+}
+
+std::size_t OrtGenAiBackend::cachedPrefixTokens() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // Zero, and the distinction matters. The system prompt is prepended to
+    // every turn but is not kept resident between them, so reporting its token
+    // count here would claim a KV-cache saving that does not happen.
+    //
+    // Keeping it resident is possible -- OgaGenerator::RewindTo() exists for
+    // exactly this -- but it constrains the generator to outlive a turn, and
+    // with it the search options that are set once at creation. Temperature
+    // arrives per request, so a generator that survived the turn would freeze
+    // the first turn's temperature for the rest of the conversation. Paying the
+    // re-decode is cheaper than a reply that ignores what the user asked for.
+    return 0;
+}
 
 } // namespace kestrel::runtime

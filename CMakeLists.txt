@@ -468,12 +468,37 @@ function(kestrel_stage_llama_runtime target)
         # Reaching here means a caller got the target name wrong.
         message(FATAL_ERROR "kestrel_stage_llama_runtime: no such target '${target}'")
     endif()
+    if(NOT KESTREL_MULTI_CONFIG_GENERATOR)
+        # Nothing to do, and doing it would be the failure the configure-time
+        # copy was written to fix. In a single-config build every executable
+        # lands in CMAKE_BINARY_DIR, so the copy below already reached all of
+        # them -- and this one runs again per target, with every target copying
+        # the same files into that one directory at the same moment. That is
+        # how a 187 MB provider DLL was being written by several concurrent
+        # copies and lost the race. The per-target copy is for multi-config
+        # generators alone, where each configuration has an output directory of
+        # its own and one configure-time copy cannot reach them.
+        return()
+    endif()
 
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${KESTREL_LLAMA_CPP_DLLS} "$<TARGET_FILE_DIR:${target}>"
         COMMENT "Staging llama.cpp runtime beside ${target}")
 endfunction()
+
+# True when the generator gives each configuration its own output directory.
+#
+# Read into a cache variable so the staging functions below and the configure-time
+# copy further down agree on one answer, and so the question is asked once.
+get_property(KESTREL_MULTI_CONFIG_GENERATOR GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(KESTREL_MULTI_CONFIG_GENERATOR)
+    set(KESTREL_MULTI_CONFIG_GENERATOR ON CACHE INTERNAL
+        "Staging per target is required: each configuration has its own output directory")
+else()
+    set(KESTREL_MULTI_CONFIG_GENERATOR OFF CACHE INTERNAL
+        "Staging at configure time reaches every configuration's executables")
+endif()
 
 # The same job for ONNX Runtime GenAI, for the same reason and with the same
 # no-op guard. Separate from the llama.cpp one rather than generalised, because
@@ -486,6 +511,12 @@ function(kestrel_stage_ort_genai_runtime target)
     endif()
     if(NOT TARGET ${target})
         message(FATAL_ERROR "kestrel_stage_ort_genai_runtime: no such target '${target}'")
+    endif()
+    # Single-config builds are staged once at configure time; see the note on
+    # kestrel_stage_llama_runtime for why running this there is a regression
+    # rather than belt and braces.
+    if(NOT KESTREL_MULTI_CONFIG_GENERATOR)
+        return()
     endif()
 
     add_custom_command(TARGET ${target} POST_BUILD

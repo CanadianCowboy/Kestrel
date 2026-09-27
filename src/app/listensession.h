@@ -28,6 +28,19 @@ public:
     // `recognizer` is borrowed. The mock is used by tests and by the preview
     // build; a platform adapter can be supplied without changing anything here.
     explicit ListenSession(runtime::SpeechRecognizer& recognizer, QObject* parent = nullptr);
+    // Stops the recognizer before this object finishes dying.
+    //
+    // The recognizer outlives the session -- it is borrowed, not owned -- and
+    // it holds the two callbacks this object handed it, each of which addresses
+    // this object by raw pointer and posts to it. So a session destroyed while
+    // listening leaves a recognizer that will call into freed memory.
+    //
+    // stop() is the boundary that prevents it: the SAPI adapter waits for its
+    // worker to leave the session before returning, so once this destructor
+    // completes no callback can still be in flight. Anything the worker posted
+    // before then is discarded with this object, because Qt drops a destroyed
+    // receiver's posted events.
+    ~ListenSession() override;
 
     // Begins listening. Refuses when the recognizer is unavailable, and says
     // why in `error`, because "the microphone is not working" and "something is

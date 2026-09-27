@@ -8,11 +8,14 @@
 #include "runtime/speechrecognizer.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -733,25 +736,55 @@ void testOrtGenAiGeneratesFromRealModel() {
 
     // Cancellation must be honoured promptly and reported as a cancellation
     // rather than as a silent success, because the barge-in path depends on it.
+    //
+    // On a thread, with the cancel coming from inside the token callback. The
+    // synchronous version of this test cancelled a generate() that had already
+    // returned, so the only assertion left was one that could not fail: a
+    // backend that ignored cancellation entirely would have passed it. What is
+    // being claimed is that cancelling mid-turn stops the turn, and that can
+    // only be observed while a turn is actually running.
     {
+        std::mutex mutex;
         std::string partial;
         bool done = false;
         bool wasSuccessful = true;
-        backend.generate(runtime::GenerationRequest{
-                             "Count slowly from one to two hundred.", 0.7F, 256},
-                         [&partial](std::string_view token) { partial.append(token); },
-                         [&](bool ok, std::string_view) {
-                             wasSuccessful = ok;
-                             done = true;
-                         });
-        backend.cancel();
+        bool cancelIssued = false;
+
+        std::thread worker([&] {
+            backend.generate(
+                runtime::GenerationRequest{
+                    "Count slowly from one to two hundred.", 0.7F, 256},
+                [&](std::string_view token) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        partial.append(token);
+                        if (!cancelIssued) {
+                            // From the generating thread, which is the case that
+                            // matters: the app's cancel() arrives on the UI
+                            // thread while the worker is inside generate().
+                            cancelIssued = true;
+                            backend.cancel();
+                        }
+                    }
+                },
+                [&](bool ok, std::string_view) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    wasSuccessful = ok;
+                    done = true;
+                });
+        });
+        worker.join();
+
+        std::lock_guard<std::mutex> lock(mutex);
         assert(done);
-        // Either it finished before the cancel landed, or it was cancelled.
-        // What must never happen is a cancelled turn reporting success with no
-        // tokens at all.
-        if (!partial.empty()) {
-            assert(!wasSuccessful || !partial.empty());
-        }
+        assert(cancelIssued);
+        // A cancelled turn reports failure. The backend may have finished
+        // between the cancel and the next token, and then success is honest --
+        // but only if it actually produced something, and only after a cancel
+        // that a backend ignoring cancellation would never have seen land
+        // mid-turn. What must never happen is a full 256-token reply to a
+        // request that cancelled itself on its first token.
+        assert(!wasSuccessful || partial.size() < 256);
     }
 }
 
@@ -943,7 +976,15 @@ void testPlatformRecognizerRunsWhenAsked() {
     // A session that ends by failing is a finding, not a pass: the grammar now
     // exists, so the engine has something to listen with, and a failure here
     // names the step that failed in its own detail string.
-    assert(end != runtime::RecognitionEnd::Failed);
+    //
+    // Abort rather than assert, and the reason is NDEBUG. A Release or
+    // RelWithDebInfo build defines it, the assertion compiles away, and the
+    // test prints the failure above and then returns success. The pattern the
+    // rest of this test already uses.
+    if (end == runtime::RecognitionEnd::Failed) {
+        std::printf("  FAIL  the session failed: %s\n", ending.c_str());
+        std::abort();
+    }
 }
 
 int main() {
