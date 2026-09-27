@@ -316,6 +316,10 @@ if(KESTREL_BUILD_UI)
             src/app/generationworker.h
     src/app/speechsynthesizer.cpp
     src/app/speechsynthesizer.h
+    src/app/localmodelspeechbackend.cpp
+    src/app/localmodelspeechbackend.h
+    src/app/localvoiceengines.cpp
+    src/app/localvoiceengines.h
     src/app/kokorospeechbackend.cpp
     src/app/kokorospeechbackend.h
             src/app/listensession.cpp
@@ -377,6 +381,10 @@ if(KESTREL_BUILD_UI)
                 src/app/generationworker.h
                 src/app/speechsynthesizer.cpp
                 src/app/speechsynthesizer.h
+                src/app/localmodelspeechbackend.cpp
+                src/app/localmodelspeechbackend.h
+                src/app/localvoiceengines.cpp
+                src/app/localvoiceengines.h
                 src/app/kokorospeechbackend.cpp
                 src/app/kokorospeechbackend.h
                 src/app/listensession.cpp
