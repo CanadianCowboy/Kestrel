@@ -444,7 +444,7 @@ void AppController::setBackendForTesting(std::unique_ptr<runtime::ModelBackend> 
         return;
     }
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating) {
+    if (m_generating || m_warmupRequestId != 0) {
         return;
     }
     m_backend = std::move(backend);
@@ -534,7 +534,7 @@ void AppController::loadModelFromUrl(const QString& url) {
         m_modelLoadThread->wait();
         if (!m_discardModelLoad && result->error.isEmpty()) {
             waitForIdleGeneration(kBackendSwapTimeoutMs);
-            if (m_generating) {
+            if (m_generating || m_warmupRequestId != 0) {
                 result->error = tr("A response is still running. Stop it and try again.");
             }
         }
@@ -567,7 +567,7 @@ void AppController::loadModelFromUrl(const QString& url) {
 void AppController::usePreviewBackend() {
     m_discardModelLoad = true;
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating) {
+    if (m_generating || m_warmupRequestId != 0) {
         m_modelError = tr("A response is still running. Stop it and try again.");
         emit modelErrorChanged();
         return;
@@ -585,16 +585,19 @@ void AppController::usePreviewBackend() {
 }
 
 /// Requests cancellation and pumps a nested event loop for at most timeoutMs.
-/// Callers must check m_generating afterwards before replacing the backend.
+/// Callers must check generation and warmup afterwards before replacing the backend.
 void AppController::waitForIdleGeneration(int timeoutMs) {
-    if (!m_generating) {
+    if (!m_generating && m_warmupRequestId == 0) {
         return;
     }
     stopGeneration();
+    if (m_warmupRequestId != 0) {
+        m_worker->cancel();
+    }
     QEventLoop loop;
     const QMetaObject::Connection done =
         connect(this, &AppController::generatingChanged, &loop, [&loop, this] {
-        if (!m_generating) {
+        if (!m_generating && m_warmupRequestId == 0) {
             loop.quit();
         }
     });
@@ -637,10 +640,16 @@ void AppController::anticipate(core::PersonaTrigger trigger) {
 }
 
 void AppController::noteActivity() {
-    // Deliberately does not touch the presence snapshot: the user action is
-    // recorded explicitly at each call site, where what actually happened is
-    // known, instead of being inferred here.
-    m_idle.noteActivity(nowMs());
+    const std::uint64_t now = nowMs();
+    // A long absence earns one greeting when activity resumes, and only once
+    // the loop has had the chance to prepare one.
+    if (m_idle.userReturned(now, kReturnGreetingMs)) {
+        if (const std::string greeting = m_idle.takeGreeting(); !greeting.empty()) {
+            m_presence.noteUserAction(core::UserAction::Returned);
+            setWhisperOverride(QString::fromStdString(greeting), 0);
+        }
+    }
+    m_idle.noteActivity(now);
 }
 
 void AppController::onIdleTick() {
@@ -659,9 +668,11 @@ void AppController::onIdleTick() {
     const core::IdleTick tick = m_idle.tick(now);
     if (tick.produced) {
         m_ambientThought = QString::fromStdString(tick.thought);
-        m_idleTaskLabel = QStringLiteral("%1 \u00b7 %2")
-                              .arg(QString::fromLatin1(core::toString(tick.task.kind)),
-                                   QString::fromStdString(tick.task.detail));
+        const QString kind = QString::fromLatin1(core::toString(tick.task.kind));
+        m_idleTaskLabel = !tick.thought.empty() && !m_showIdleThoughts
+                             ? kind
+                             : QStringLiteral("%1 \u00b7 %2")
+                                   .arg(kind, QString::fromStdString(tick.task.detail));
         m_presence.applyPersona(m_persona.state());
 
         if (!tick.whisper.empty()) {
@@ -672,15 +683,6 @@ void AppController::onIdleTick() {
         } else if (tick.task.kind == core::IdleTaskKind::CreativeThought
                    || tick.task.kind == core::IdleTaskKind::SelfReflection) {
             noteAssistant(core::AssistantAction::Reflecting);
-        }
-    }
-
-    // A long absence earns one greeting, and only once the loop has had the
-    // chance to prepare one.
-    if (m_idle.userReturned(now, kReturnGreetingMs)) {
-        if (const std::string greeting = m_idle.takeGreeting(); !greeting.empty()) {
-            m_presence.noteUserAction(core::UserAction::Returned);
-            setWhisperOverride(QString::fromStdString(greeting), 0);
         }
     }
 
@@ -767,6 +769,7 @@ void AppController::onGenerationFinished(quint64 requestId,
         // consequence is that the backend is warm and its counters moved.
         m_warmupRequestId = 0;
         refreshCachedRuntime();
+        emit generatingChanged();
         emit runtimeChanged();
         emit presenceChanged();
         return;
@@ -1201,7 +1204,7 @@ void AppController::setActiveConversation(int id) {
 // reintroduces exactly the stall this exists to remove, since the backend's
 // accessors take the lock generate() is holding.
 void AppController::refreshCachedRuntime() {
-    if (m_generating) {
+    if (m_generating || m_warmupRequestId != 0) {
         return;
     }
     m_cachedStatus = m_backend->status();

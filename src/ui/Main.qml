@@ -30,43 +30,53 @@ ApplicationWindow {
     // A switch for the presence panel. Declared here rather than repeated three
     // times in the diagnostics column, because the file already styles every
     // control by hand and a stock CheckBox would not match it.
-    component IdleToggle: RowLayout {
+    component IdleToggle: Item {
         id: toggle
         required property string label
         property string hint: ""
         property bool checked: false
         signal toggled()
         Layout.fillWidth: true
-        spacing: 10
-        Rectangle {
-            width: 14
-            height: 14
-            radius: 4
-            color: toggle.checked ? window.accent : "#1a1d23"
-            border.color: toggle.checked ? window.accent : window.line
-            Behavior on color { ColorAnimation { duration: 140 } }
+        implicitWidth: content.implicitWidth
+        implicitHeight: content.implicitHeight
+        activeFocusOnTab: true
+        Keys.onSpacePressed: function(event) {
+            toggle.toggled()
+            event.accepted = true
         }
-        Text {
-            text: toggle.label
-            color: window.ink
-            font.pixelSize: 12
-            Layout.fillWidth: true
+        RowLayout {
+            id: content
+            anchors.fill: parent
+            spacing: 10
+            Rectangle {
+                Layout.preferredWidth: 14
+                Layout.preferredHeight: 14
+                radius: 4
+                color: toggle.checked ? window.accent : "#1a1d23"
+                border.color: toggle.activeFocus ? window.ink
+                                                : toggle.checked ? window.accent : window.line
+                Behavior on color { ColorAnimation { duration: 140 } }
+            }
+            Text {
+                text: toggle.label
+                color: window.ink
+                font.pixelSize: 12
+                Layout.fillWidth: true
+            }
         }
-        MouseArea {
-            Layout.preferredWidth: 14
-            Layout.preferredHeight: 14
-            cursorShape: Qt.PointingHandCursor
-            onClicked: toggle.toggled()
-        }
-        ToolTip.visible: hover.containsMouse && toggle.hint.length > 0
-        ToolTip.text: toggle.hint
-        ToolTip.delay: 400
         MouseArea {
             id: hover
             anchors.fill: parent
             hoverEnabled: true
-            acceptedButtons: Qt.NoButton
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+                toggle.forceActiveFocus(Qt.MouseFocusReason)
+                toggle.toggled()
+            }
         }
+        ToolTip.visible: hover.containsMouse && toggle.hint.length > 0
+        ToolTip.text: toggle.hint
+        ToolTip.delay: 400
     }
 
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
@@ -539,7 +549,7 @@ ApplicationWindow {
                                         // so the idle loop goes quiet before it can
                                         // decide anything.
                                         onTextChanged: appController.inputPending = length > 0
-                                        onActiveFocusChanged: appController.inputPending = activeFocus || length > 0
+                                        onActiveFocusChanged: appController.inputPending = length > 0
                                         placeholderText: "Message Kestrel..."
                                         placeholderTextColor: "#626a77"
                                         color: window.ink

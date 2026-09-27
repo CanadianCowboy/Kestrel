@@ -29,8 +29,10 @@ constexpr std::size_t kMinClauseChars = 16;
 
 // Closing characters that trail a terminator without ending the clause, e.g.
 // the quote in: He said "go." Then he left.
+constexpr std::string_view kClosingQuote = "\xe2\x80\x9d";
+
 bool isTrailingPunctuation(char c) noexcept {
-    return c == '"' || c == '\'' || c == ')' || c == ']' || c == '}' || c == '\u201d';
+    return c == '"' || c == '\'' || c == ')' || c == ']' || c == '}';
 }
 
 std::size_t skipSpace(std::string_view text, std::size_t i) noexcept {
@@ -46,8 +48,14 @@ std::size_t clauseEndFrom(std::string_view text, std::size_t start) noexcept {
         const char c = text[i];
         if (isSentenceTerminator(c)) {
             std::size_t end = i + 1;
-            while (end < text.size() && isTrailingPunctuation(text[end])) {
-                ++end;
+            while (end < text.size()) {
+                if (isTrailingPunctuation(text[end])) {
+                    ++end;
+                } else if (text.substr(end).starts_with(kClosingQuote)) {
+                    end += kClosingQuote.size();
+                } else {
+                    break;
+                }
             }
             return end;
         }
@@ -139,7 +147,8 @@ int pauseAfterClause(std::string_view text, std::size_t clauseEnd,
         return persona.clausePauseMs;
     }
     const char c = text[last - 1];
-    if (isSentenceTerminator(c) || isTrailingPunctuation(c)) {
+    if (isSentenceTerminator(c) || isTrailingPunctuation(c)
+        || text.substr(0, last).ends_with(kClosingQuote)) {
         return persona.sentencePauseMs;
     }
     return persona.clausePauseMs;
@@ -417,6 +426,7 @@ std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
         return std::nullopt;
     }
     SpeechSegment segment = planned.front();
+    segment.isFirst = base == 0;
     segment.startOffset += base;
     segment.endOffset += base;
     return segment;
