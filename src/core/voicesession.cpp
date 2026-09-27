@@ -432,6 +432,38 @@ std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
     return segment;
 }
 
+std::optional<SpeechSegment> VoiceSession::peekSpeechSegment(ResponseId id) const {
+    const VoiceResponse* response = find(id);
+    if (response == nullptr) {
+        return std::nullopt;
+    }
+    // The next segment is planned from everything still unspoken. Once that
+    // segment has been taken, the remainder is what follows it -- so the peek
+    // plans against the remainder minus the first planned segment, which is
+    // exactly the text the caller is about to be handed.
+    const std::string_view remainder = response->unspokenText();
+    if (remainder.empty()) {
+        return std::nullopt;
+    }
+    const std::size_t base = response->spokenOffset();
+    const std::vector<SpeechSegment> planned = planSpeech(
+        remainder, m_voicePersona, pauseAfterClause(
+                                 response->generatedText(), base, m_voicePersona));
+    if (planned.size() < 2) {
+        return std::nullopt;
+    }
+
+    SpeechSegment ahead = planned[1];
+    // Every planned offset is relative to the remainder, so the shift onto the
+    // response timeline is the same one applied to the segment that does get
+    // spoken. Adding the first segment's length as well would double-count it:
+    // planned[1] already starts after it.
+    ahead.startOffset += base;
+    ahead.endOffset += base;
+    ahead.isFirst = false;
+    return ahead;
+}
+
 const VoiceResponse* VoiceSession::find(ResponseId id) const noexcept {
     for (const VoiceResponse& response : m_responses) {
         if (response.m_id == id) {

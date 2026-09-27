@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QThread>
 #include <QTimer>
 #include <QVariantList>
@@ -105,6 +106,12 @@ class AppController final : public QObject {
     // are not interchangeable: each declares its own capabilities, and the point
     // of the panel is that the user can see which is which.
     Q_PROPERTY(QVariantList idleTools READ idleTools NOTIFY idleToolsChanged)
+    // The voices the current backend can speak with, and the one it is using.
+    // Empty when the platform voice is in charge: that choice belongs to the
+    // operating system, and offering a list the user cannot change would be a
+    // control that does nothing.
+    Q_PROPERTY(QStringList speechVoices READ speechVoices NOTIFY ttsChanged)
+    Q_PROPERTY(QString currentVoice READ currentVoice NOTIFY ttsChanged)
     Q_PROPERTY(QString sessionTopic READ sessionTopic NOTIFY presenceChanged)
 
     // The autonomous loop between turns, plus the two switches that keep it
@@ -224,6 +231,8 @@ public:
     [[nodiscard]] QString acknowledgement() const noexcept;
     [[nodiscard]] QString ambientThought() const;
     [[nodiscard]] QString idleTaskLabel() const;
+    [[nodiscard]] QStringList speechVoices() const;
+    [[nodiscard]] QString currentVoice() const;
     // One map per declared tool: name, summary, whether it is switched on, the
     // capabilities it declared, and which of those are still outstanding.
     [[nodiscard]] QVariantList idleTools() const;
@@ -270,6 +279,9 @@ public:
     // not there is ignored rather than inventing a tool or a capability.
     Q_INVOKABLE void setIdleToolEnabled(const QString& name, bool enabled);
     Q_INVOKABLE void setToolPermission(const QString& permission, bool granted);
+    // Changes the speaking voice. Refuses a name the backend does not have, so a
+    // stale setting cannot leave the app quietly speaking with something else.
+    Q_INVOKABLE bool setSpeechVoice(const QString& voice);
     // Speech input. A completed phrase is submitted exactly as if it had been
     // typed, which is what makes a spoken request interrupt a reply the same way
     // a typed one does. Returns false and says why when the recognizer refuses,

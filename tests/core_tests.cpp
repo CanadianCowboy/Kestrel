@@ -946,6 +946,50 @@ void testNextSpeechSegmentTracksTheSpokenCursor() {
     assert(!session.nextSpeechSegment(9999).has_value());
 }
 
+// The peek exists so a speech engine can be warned about the sentence it is
+// about to be given while the previous one is still playing. It answers "the
+// one after next", not "the next one", and it must not move the cursor -- a peek
+// that consumed would take a clause out of the reply without speaking it.
+void testPeekSpeechSegmentLooksOneClauseAhead() {
+    core::VoiceSession session;
+    const core::ResponseId id = session.queueResponse();
+    const core::GenerationId generation = session.beginGeneration(id);
+    assert(session.appendText(id, generation, "Hi. There we go. Then this."));
+
+    // Nothing has been handed out yet, so the one after next is the second
+    // clause. Offsets are on the same timeline as everything else, so a caller
+    // can compare them like with like.
+    const auto secondAhead = session.peekSpeechSegment(id);
+    assert(secondAhead.has_value());
+    assert(secondAhead->text == "There we go.");
+    assert(secondAhead->startOffset == 4);
+    assert(secondAhead->endOffset == 16);
+
+    // Peeking moved nothing: the first clause is still the one to be spoken.
+    const auto first = session.nextSpeechSegment(id, 220);
+    assert(first.has_value());
+    assert(first->text == "Hi.");
+    assert(session.advancePlayback(id, first->endOffset));
+
+    // With the cursor past the first, the peek is the third clause.
+    const auto thirdAhead = session.peekSpeechSegment(id);
+    assert(thirdAhead.has_value());
+    assert(thirdAhead->text == "Then this.");
+
+    const auto second = session.nextSpeechSegment(id);
+    assert(second.has_value());
+    assert(second->text == "There we go.");
+
+    // With only one clause left there is nothing after it to warn about.
+    assert(session.advancePlayback(id, second->endOffset));
+    assert(!session.peekSpeechSegment(id).has_value());
+    const auto last = session.nextSpeechSegment(id);
+    assert(last.has_value());
+    assert(last->text == "Then this.");
+
+    assert(!session.peekSpeechSegment(9999).has_value());
+}
+
 void testVoicePersonaIsReplaceable() {
     core::VoiceSession session;
     assert(session.voicePersona().voiceId == core::defaultVoicePersona().voiceId);
@@ -1021,6 +1065,7 @@ int main() {
     testSpeechPlanningClausesAndPauses();
     testClauseStartBefore();
     testNextSpeechSegmentTracksTheSpokenCursor();
+    testPeekSpeechSegmentLooksOneClauseAhead();
     testVoicePersonaIsReplaceable();
     return 0;
 }
