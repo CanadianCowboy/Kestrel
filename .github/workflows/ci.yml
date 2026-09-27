@@ -207,6 +207,10 @@ jobs:
         run: |
           FAKE="$RUNNER_TEMP/llama-prefix"
           mkdir -p "$FAKE/include" "$FAKE/lib"
+          # The header is what makes the prefix count as a llama.cpp root at
+          # all; without it CMake reports the backend unavailable and the
+          # libraries below are never looked at.
+          touch "$FAKE/include/llama.h"
           printf 'int kestrel_stub_placeholder(void) { return 0; }\n' > placeholder.c
           gcc -shared -fPIC -o "$FAKE/lib/libllama.so" placeholder.c
           cmake -S . -B "$RUNNER_TEMP/build-llama" \
