@@ -69,16 +69,30 @@ private:
 
 // How many sealed blobs are sitting in the process's working directory. The
 // point of the no-home-directory test is that this number does not move.
+//
+// Both the construction and the traversal carry an error_code, and the result
+// is checked. A directory that can be written to but not listed is exactly the
+// state that test is about, and an unchecked iterator reports that as an empty
+// range -- so the leak check would compare zero against zero and pass.
+//
+// Windows only, together with the assertions that use it: the count exists to
+// catch a file-backed store writing where it should not, and Windows is the
+// only backend that is file-backed.
+#if defined(_WIN32)
 int countSealedBlobsHere() {
     int found = 0;
     std::error_code code;
-    for (const auto& entry : fs::directory_iterator(fs::current_path(), code)) {
-        if (entry.path().extension() == ".sealed") {
+    const fs::directory_iterator end;
+    fs::directory_iterator entries(fs::current_path(), code);
+    for (; !code && entries != end; entries.increment(code)) {
+        if (entries->path().extension() == ".sealed") {
             found += 1;
         }
     }
+    check(!code, "the working directory can be listed: " + code.message());
     return found;
 }
+#endif
 
 // A scratch directory that removes itself, so a failing assert cannot leave a
 // profile lying around in the user's real data directory.
@@ -312,10 +326,21 @@ void testPlatformStore() {
 // Windows the install directory is an ordinary working directory.
 //
 // paths.h answers an unusable environment with an empty path and says callers
-// must treat that as "do not persist". This is the test that the platform store
-// actually honours that, and it is separate from testPlatformStore because that
-// one returns early when the store reports itself unavailable -- so on a machine
-// with no data directory it would skip the very thing this is about.
+// must treat that as "do not persist". The directory half of that is a property
+// of this codebase, and is checked here on every platform.
+//
+// The store half is a property of the platform, and only Windows has it.
+// Windows is the one file-backed backend: it writes a .sealed blob under
+// sealedBlobDirectory() and encrypts it with DPAPI, so with no data directory
+// it genuinely has nowhere to put the profile. The Linux backend asks
+// secret-tool and the macOS backend asks the login keychain, and neither of
+// those is a function of Kestrel's data directory -- on those two platforms a
+// store that sealed the profile with no HOME set has worked correctly, and
+// asserting that it failed would be asserting a bug.
+//
+// It is separate from testPlatformStore because that one returns early when the
+// store reports itself unavailable -- so on a machine with no data directory it
+// would skip the very thing this is about.
 void testPlatformStoreRefusesWithoutAHomeDirectory() {
     // All three are cleared, not just the one this platform uses: on Linux an
     // empty XDG_DATA_HOME falls back to HOME, so clearing one is not enough.
@@ -328,6 +353,7 @@ void testPlatformStoreRefusesWithoutAHomeDirectory() {
     check(storage::sealedBlobDirectory().empty(),
           "and therefore no place to keep a sealed profile");
 
+#if defined(_WIN32)
     auto store = storage::makePlatformSecretStore();
     const std::vector<std::uint8_t> secret{'n', 'o', 't', ' ', 'h', 'e', 'r', 'e'};
     const std::string account = "storage-tests-no-home";
@@ -350,6 +376,7 @@ void testPlatformStoreRefusesWithoutAHomeDirectory() {
     check(!error.empty(), "and says why that is not a success");
     check(countSealedBlobsHere() == sealedBefore,
           "and the working directory is still clean afterwards");
+#endif
 }
 
 } // namespace

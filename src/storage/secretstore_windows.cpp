@@ -123,11 +123,33 @@ public:
             unavailableReason = error;
             return false;
         }
+        // And the sealed bytes have to actually reach the disk before the
+        // removal below means anything. Deleting a file that was never written
+        // succeeds -- "was never there" is the state the caller asked for --
+        // so a probe that only sealed and then deleted was testing DPAPI and
+        // nothing else. A directory that accepts no writes, or that is
+        // read-only, passed it, and the first save of a real profile is where
+        // that would have been found instead.
+        //
+        // Under a directory of its own rather than a blob path. SecretStore
+        // takes whatever service and account a caller names, and blobPath is a
+        // hash of exactly those two strings, so a caller that happened to use
+        // this pair had its profile overwritten and then deleted by a plain
+        // availability check. Deleting the colliding blob was the pre-existing
+        // bug; writing over it first is the part just added, and the two
+        // together lose a real profile. A directory no caller can name keeps
+        // the probe out of the namespace the store shares with real secrets.
+        // writeFileAtomically creates the parent, so nothing else has to.
+        const std::filesystem::path probePath = directory / ".kestrel-probe" / "probe.sealed";
+        if (!writeFileAtomically(probePath, sealedBytes, error)) {
+            unavailableReason = "the keystore would not store a test value: " + error;
+            return false;
+        }
         // The probe has to come back out again. A failure here is not cosmetic:
         // it means the directory accepts a write and refuses a delete, which is
         // the state where "forget everything" would leave the probe behind.
         std::string cleanupError;
-        if (!removeBlob("com.kestrel.probe", "probe", cleanupError)) {
+        if (!removePath(probePath, cleanupError)) {
             unavailableReason =
                 "the keystore accepted the test value but would not remove it: " + cleanupError;
             return false;
@@ -179,7 +201,13 @@ private:
     // about to tell a user that Kestrel has forgotten them. The only status that
     // counts as success is one where the file is gone, or was never there.
     static bool removeBlob(std::string_view service, std::string_view account, std::string& error) {
-        const std::filesystem::path path = blobPath(service, account);
+        return removePath(blobPath(service, account), error);
+    }
+
+    // The same rule, for a path that is not a blob at all. The availability
+    // probe has to be removed under exactly the same conditions, and it is
+    // deliberately not addressed by a service and account any more.
+    static bool removePath(const std::filesystem::path& path, std::string& error) {
         std::error_code code;
         const bool removed = std::filesystem::remove(path, code);
         if (removed) {

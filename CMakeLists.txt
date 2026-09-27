@@ -120,8 +120,12 @@ add_library(kestrel_core
     src/runtime/tensorrtbackend.h
     src/storage/atomicfile.cpp
     src/storage/atomicfile.h
+    src/storage/json.cpp
+    src/storage/json.h
     src/storage/paths.cpp
     src/storage/paths.h
+    src/storage/profile.cpp
+    src/storage/profile.h
     src/storage/secretstore.h
     src/storage/secretstore_memory.cpp
     src/storage/sha256.cpp
@@ -212,7 +216,26 @@ if(KESTREL_BUILD_UI)
     if(Qt6_FOUND)
         qt_standard_project_setup(REQUIRES 6.6)
 
-        qt_add_executable(kestrel
+        # MACOSX_BUNDLE, which qt_add_executable does not turn on by itself --
+        # WIN32 and MACOSX_BUNDLE are both opt-in arguments there, and without
+        # them the command is a plain add_executable.
+        #
+        # A macOS application has to be a bundle. Not for tidiness: a GUI
+        # process that is not a bundle has no Info.plist, so it has no bundle
+        # identifier for the window server to associate a Dock icon with, and
+        # it cannot carry the metadata macOS expects of an app.
+        #
+        # It also does not build at all without this. Qt puts the generated
+        # QML module for a target in a directory named after that target, so
+        # with no bundle the link step tries to write a file named kestrel
+        # where a directory named kestrel already is, and ld fails with
+        # "open() failed, errno=21 (Is a directory) for 'kestrel'". Putting the
+        # executable inside kestrel.app/Contents/MacOS puts it somewhere the
+        # generated module never goes.
+        #
+        # Ignored on Windows and Linux, so this line changes nothing for the
+        # other two desktop jobs.
+        qt_add_executable(kestrel MACOSX_BUNDLE
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
@@ -359,6 +382,37 @@ if(KESTREL_BUILD_TESTS)
     # links no Qt. It does link the platform keystore, whose library is either
     # the system one or already a load-time dependency of the process. It does
     # need cudart under a CUDA build, which is handled with the other tests.
+    #
+    # Bounded, and the only test here that is. The other three are pure
+    # computation and finish in milliseconds. This one talks to the real
+    # platform keystore -- DPAPI, secret-tool, the macOS login keychain -- and
+    # each of those can block rather than answer: a locked keyring in a
+    # session with nobody present to approve it waits, and it does not come
+    # back with an error to report.
+    #
+    # That is what a macOS core run did on 2026-09-27: every other job on the
+    # same commit finished in about three minutes and this one was still going
+    # at thirteen, with nothing in the job output to say which test it was
+    # inside. A hang is worse than a failure for exactly that reason -- it
+    # costs the full job timeout and still reports nothing actionable.
+    #
+    # CTest names the test it was running when the timeout fires, so the bound
+    # turns an unactionable stall into a named failure. Five minutes is far
+    # more than a healthy keystore round trip needs and far less than the
+    # six hours it was costing.
+    set_tests_properties(kestrel_storage_tests PROPERTIES TIMEOUT 300)
+
+    # The document format the profile is written in. Separate from the storage
+    # tests because it has no keystore in it at all: a JSON parser that only
+    # runs when a platform keystore happens to be present is a JSON parser that
+    # is never run.
+    add_executable(kestrel_json_tests tests/json_tests.cpp)
+    target_link_libraries(kestrel_json_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_json_tests COMMAND kestrel_json_tests)
+
+    add_executable(kestrel_profile_tests tests/profile_tests.cpp)
+    target_link_libraries(kestrel_profile_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_profile_tests COMMAND kestrel_profile_tests)
 
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
@@ -373,7 +427,9 @@ if(KESTREL_BUILD_TESTS)
         foreach(_kestrel_cuda_test
                 kestrel_core_tests
                 kestrel_runtime_tests
-                kestrel_storage_tests)
+                kestrel_storage_tests
+                kestrel_json_tests
+                kestrel_profile_tests)
             set_tests_properties(${_kestrel_cuda_test} PROPERTIES
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
         endforeach()
