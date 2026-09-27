@@ -1,5 +1,7 @@
 #include "runtime/speechrecognizer.h"
 
+#include "runtime/sapirecognizer.h"
+
 #include <algorithm>
 #include <sstream>
 #include <utility>
@@ -141,6 +143,52 @@ void MockSpeechRecognizer::emitNextPartial() {
     if (m_phrase >= m_phrases.size()) {
         m_listening = false;
     }
+}
+
+bool preferPlatformRecognizer(Microphone microphone) noexcept {
+    // One rule, and it is the obvious one: a real engine is for a machine that
+    // has a microphone to feed it. Everywhere else the mock is not a
+    // placeholder, it is the only thing that can work, because it is the only
+    // recognizer that does not need audio hardware to produce a phrase.
+    return microphone == Microphone::Present;
+}
+
+std::unique_ptr<SpeechRecognizer> makeRecognizerFor(Microphone microphone) {
+    if (preferPlatformRecognizer(microphone)) {
+        // The probe counts devices, which is not the same as being able to
+        // listen: a machine can advertise a capture endpoint that refuses to
+        // open, and a build can have no recognizer at all. A platform adapter
+        // that says it cannot listen is an honest answer, and the mock is the
+        // honest fallback behind it -- so the user gets a working microphone
+        // button and a detail() line that says which of the two they have.
+        if (auto platform = makePlatformSpeechRecognizer();
+            platform != nullptr && platform->available()) {
+            return platform;
+        }
+    }
+    return std::make_unique<MockSpeechRecognizer>();
+}
+
+std::unique_ptr<SpeechRecognizer> makeBestSpeechRecognizer(SpeechInput preference) {
+    // The override exists for two callers that would otherwise be at the mercy
+    // of the machine. The test suite asserts on partial results, which only the
+    // mock produces, so it must not change because someone plugged in a
+    // microphone. And a user debugging dictation needs to be able to ask for
+    // the real adapter explicitly, including on a machine where the probe says
+    // there is no input device, to be shown the error rather than the mock.
+    switch (preference) {
+    case SpeechInput::Mock:
+        return std::make_unique<MockSpeechRecognizer>();
+    case SpeechInput::Platform:
+        // Asked for by name, so the name is what is given. A recognizer that
+        // cannot listen reports it through available() and detail(), and the UI
+        // says so; quietly handing back the mock here would make a broken
+        // microphone look like a working one.
+        return makePlatformSpeechRecognizer();
+    case SpeechInput::Auto:
+        break;
+    }
+    return makeRecognizerFor(probeMicrophone());
 }
 
 } // namespace kestrel::runtime

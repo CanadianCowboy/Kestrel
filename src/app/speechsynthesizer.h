@@ -12,6 +12,22 @@
 
 namespace kestrel::app {
 
+// How long a response may wait for a voice that is installed but not yet able
+// to answer, before it is delivered as text instead.
+//
+// Sized from what the real model does on the machine this was built on. Kokoro's
+// driver announces itself 1.31-1.40s after it is started, over five runs, with
+// essentially no spread: the 311MB model is in the page cache and the load is
+// compute-bound. A cold load is the case that matters, and the model lives
+// inside a synced OneDrive folder, so the read is the variable part rather than
+// the compute. At a pessimistic 40MB/s that 326MB is 8.2s of I/O on top of the
+// measured 1.35s, so a successful cold load is about 9.5s; fifteen seconds
+// clears that with roughly 1.5x to spare. Not 30s, because a user waiting half a
+// minute for a voice that is never coming has stopped believing the app. Not 10s,
+// which would cut off a legitimately slow first load after a re-sync and throw
+// away a perfectly good voice.
+constexpr int kVoiceLoadDeadlineMs = 15000;
+
 // The platform side of speech, behind an interface.
 //
 // Everything above this -- which clause comes next, where the cursor moves,
@@ -24,6 +40,13 @@ public:
     virtual ~SpeechBackend() = default;
 
     [[nodiscard]] virtual bool usable() const = 0;
+    // Whether an engine is installed at all, as distinct from whether it can
+    // answer yet. A local model is a process: it is on disk before it is ready,
+    // so a reply asked for in between has to wait for it rather than be
+    // delivered as text. False means there is nothing to wait for, which is the
+    // only honest reason to give up on speaking a response. Defaults to usable()
+    // for a platform voice, which is simply there or not there.
+    [[nodiscard]] virtual bool present() const { return usable(); }
     // Human-readable voice and locale, or why there is not one.
     [[nodiscard]] virtual QString description() const = 0;
     virtual void applyVoice(const core::VoicePersona& persona) = 0;
@@ -60,6 +83,15 @@ public:
         m_onFailed = std::move(onFailed);
     }
 
+    // The engine reporting that it can now answer, or that it has given up.
+    // A reply that is owed audio waits for one of these rather than being
+    // quietly downgraded to text because the check happened too early.
+    void setAvailabilityCallbacks(std::function<void()> onAvailable,
+                                  std::function<void()> onUnavailable) {
+        m_onAvailable = std::move(onAvailable);
+        m_onUnavailable = std::move(onUnavailable);
+    }
+
 protected:
     void reportFinished() const {
         if (m_onFinished) {
@@ -72,9 +104,25 @@ protected:
         }
     }
 
+protected:
+    // Reported by the engine at the moments its answer actually changes, never
+    // polled: a local model becomes ready when its driver says so.
+    void reportAvailable() const {
+        if (m_onAvailable) {
+            m_onAvailable();
+        }
+    }
+    void reportUnavailable() const {
+        if (m_onUnavailable) {
+            m_onUnavailable();
+        }
+    }
+
 private:
     std::function<void()> m_onFinished;
     std::function<void(const QString&)> m_onFailed;
+    std::function<void()> m_onAvailable;
+    std::function<void()> m_onUnavailable;
 };
 
 class SpeechSynthesizerPrivate;
@@ -135,6 +183,40 @@ public:
     // an error.
     [[nodiscard]] bool available() const;
 
+    // Whether a voice is installed but not yet able to answer. True here with
+    // available() false is the whole case this exists for: the engine is still
+    // coming up, and a response asked for in the meantime is owed audio rather
+    // than text.
+    [[nodiscard]] bool present() const;
+
+    // True between oweAudio() and releaseOwedAudio(): a response is being held
+    // for a voice that is installed and may still arrive. It is owed audio
+    // rather than text, and while it is owed the caller has nothing to play and
+    // the response has not been completed.
+    [[nodiscard]] bool audioOwed() const;
+
+    // Reconciles what a response is owed, at the moment one might need a voice.
+    // A voice that can answer now owes nothing; an engine that is installed and
+    // still coming up holds the response and starts the load deadline; an
+    // engine that has already let us down, or none at all, owes nothing either.
+    //
+    // The decision is made here rather than at request time because a request
+    // time check is the one that was wrong: a local model is on disk and running
+    // long before it can answer, so a reply asked for in the first seconds of a
+    // session was answered in writing and never revisited.
+    void oweAudio();
+
+    // The single way a held response ends without audio: the engine reported it
+    // will never answer, the load deadline expired, or the caller withdrew the
+    // promise because the user stopped or left the conversation. Safe to call
+    // when nothing is held, which is what lets every caller ask for the release
+    // rather than track whether one is owed.
+    void releaseOwedAudio();
+
+    // Test seam: shortens the load deadline so the give-up path can be driven
+    // without waiting out a deadline sized against a real model load.
+    void setVoiceLoadTimeout(int ms);
+
     // Human-readable voice and locale, for the diagnostics panel.
     [[nodiscard]] QString voiceDescription() const;
 
@@ -167,17 +249,43 @@ signals:
     void stopCompleted();
     // The synthesizer hit a real error, e.g. the voice disappeared mid-session.
     void failed(const QString& reason);
+    // A voice that was not yet able to answer now can, or never will. Raised by
+    // the engine itself, so the controller never has to guess when a response
+    // it is holding should be spoken or given up on. A hold has already been
+    // ended by the time this arrives with false: owedAudioReleased has said so.
+    void availabilityChanged(bool available);
+    // A response held for a voice is now text, and the caller is the only thing
+    // that can deliver it. voiceGaveUp says the engine was given up on, as
+    // opposed to the promise simply being withdrawn, because the two deserve
+    // different words in front of the user.
+    void owedAudioReleased(bool voiceGaveUp);
 
 private:
     void speakNow();
     void onBackendFinished();
     void onBackendFailed(const QString& reason);
+    void onBackendAvailable();
+    void onBackendUnavailable();
+    void onVoiceLoadDeadline();
 
     std::unique_ptr<SpeechSynthesizerPrivate> d;
     std::unique_ptr<SpeechBackend> m_backend;
     QTimer m_pauseTimer;
+    // Armed only while a response is actually held, so it costs nothing on a
+    // machine whose voice is ready when the first question is asked.
+    QTimer m_voiceLoadDeadline;
+    int m_voiceLoadTimeoutMs = 0;
+    bool m_audioOwed = false;
+    // A voice was waited for and never came. Until one announces itself, later
+    // replies are delivered as text straight away rather than each being held
+    // for the same engine that already let us down.
+    bool m_voiceGaveUp = false;
     QString m_pending;
     QString m_pendingText;
+    // A lookahead waiting for the clause in front of it to be committed. Kept
+    // rather than sent immediately so the engine is asked for clauses in the
+    // order they are spoken; see prefetch().
+    QString m_queuedPrefetch;
     bool m_stoppingAtBoundary = false;
 };
 

@@ -98,6 +98,7 @@ void PersonaState::clamp() noexcept {
     initiative = clampUnit(initiative);
     calmness = clampUnit(calmness);
     presenceIntensity = clampUnit(presenceIntensity);
+    warmth = clampUnit(warmth);
 }
 
 Persona::Persona() = default;
@@ -120,12 +121,13 @@ const PersonaState& Persona::state() const noexcept {
 }
 
 void Persona::drift(float focus, float curiosity, float initiative,
-                     float calmness, float presenceIntensity) noexcept {
+                     float calmness, float presenceIntensity, float warmth) noexcept {
     m_state.focus += focus;
     m_state.curiosity += curiosity;
     m_state.initiative += initiative;
     m_state.calmness += calmness;
     m_state.presenceIntensity += presenceIntensity;
+    m_state.warmth += warmth;
     m_state.clamp();
 }
 

@@ -345,6 +345,40 @@ The model loads in about a second and synthesises a clause faster than it can be
 
 Kokoro is 82 million parameters and Apache-2.0, which is why it is the default: it is the best quality-to-footprint ratio available for a CPU-only local voice, and it is fast enough that per-clause synthesis disappears under the speech itself. Piper is the other local engine and was measured here at roughly a third of a second per clause; it is not wired in, but `LocalVoiceEngines` and the shared `LocalModelSpeechBackend` are the seam it would plug into.
 
+### Speech input
+
+Dictation uses SAPI 5, the desktop engine that has shipped with Windows since
+2000: `CLSID_SpSharedRecognizer`, an `ISpRecoContext`, and the default capture
+device. It is an ordinary COM class, so it activates with `CoCreateInstance`, and
+every call is a vtable call through an interface declared in the Windows SDK's
+`sapi.h` — no Speech SDK install, and no `sapi.lib`. The only library it links
+is `winmm`, for the device count in the microphone probe.
+
+The Windows Runtime path is not an alternative. `Windows.Media.SpeechRecognition`
+exposes the `ISpeechRecognizer` ABI interface but no projected runtime class, so
+there is no activation factory to create and no `GetSpeechRecognizerAsync` to
+call, and its desktop flavour has no interim-text event either.
+
+Which recognizer Kestrel uses is decided at startup from a cheap capture-device
+count, so nothing has to be opened to ask the question:
+
+| Machine has | Recognizer | Reports itself as |
+| --- | --- | --- |
+| a capture device | SAPI 5, on a worker thread of its own | `Windows SAPI 5 recognizer, N capture device(s), finished phrases only` |
+| no capture device | the scripted preview recognizer | `preview recognizer (no microphone)` |
+
+`KESTREL_SPEECH_INPUT` forces either branch: `auto` (the default) probes,
+`mock` always uses the scripted recognizer, and `platform` always asks for SAPI
+and reports what the engine says rather than what a device count guessed. The
+test suite pins itself to `mock`, because it asserts on the partial words and
+the barge-in timing that only the scripted recognizer produces.
+
+SAPI reports a finished phrase rather than the words so far, so the live
+recognizer delivers one final result per phrase. Partial results remain a
+contract of `SpeechRecognizer` and of the scripted recognizer, which is what
+makes the barge-in path testable on a build machine with no audio hardware. See
+`src/runtime/sapirecognizer.h` for what an adapter of this kind has to get right.
+
 ### Voice goals
 
 - **Local-first audio path:** microphone capture, voice activity detection, speech recognition, response generation, and speech synthesis should run locally whenever the required models and hardware support it.

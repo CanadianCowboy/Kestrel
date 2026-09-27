@@ -21,6 +21,17 @@ enum class RecognitionEnd {
 
 [[nodiscard]] const char* toString(RecognitionEnd reason) noexcept;
 
+// Whether this machine has something to listen with.
+//
+// A microphone is a fact about the machine, not about the code, so it is passed
+// into the decision rather than probed inside it. That is what makes the choice
+// between a real recognizer and the mock provable on a build machine with no
+// audio hardware at all.
+enum class Microphone {
+    Present,
+    Absent,
+};
+
 // One recognition result, as it happens.
 //
 // Partial results are the whole reason a recognizer is streamed rather than
@@ -56,12 +67,11 @@ struct RecognitionResult {
 //     stop arriving shortly afterwards. A result delivered after stop() is not
 //     an error, but a caller must be able to ignore it.
 //
-// There is no platform adapter here yet. Everything above this contract is
-// already complete and tested -- the listen session, the barge-in path, the
-// interface -- and it drives MockSpeechRecognizer until a real recognizer is
-// supplied. Adding one is the same shape as the CUDA device discovery: a
-// translation unit that includes the platform header and nothing else does,
-// reporting available() honestly so the app keeps working without it.
+// The platform adapter is SapiSpeechRecognizer, declared in
+// runtime/sapirecognizer.h. It reports available() honestly, so the app keeps
+// working on a machine or a build where it cannot listen, and everything above
+// this contract -- the listen session, the barge-in path, the interface -- is
+// identical whichever recognizer is underneath it.
 class SpeechRecognizer {
 public:
     using ResultCallback = std::function<void(const RecognitionResult&)>;
@@ -118,5 +128,37 @@ private:
     ResultCallback m_onResult;
     EndCallback m_onEnd;
 };
+
+// The decision that picks a recognizer, with no platform code in it.
+//
+// Split out from makeBestSpeechRecognizer() so it can be asserted directly: the
+// one thing worth testing here is that a machine with a microphone gets the
+// platform adapter and a machine without one gets the mock, and neither
+// conclusion may depend on the audio hardware of whatever machine runs the
+// test.
+[[nodiscard]] bool preferPlatformRecognizer(Microphone microphone) noexcept;
+
+// Builds the recognizer a given microphone calls for.
+//
+// Returns the platform adapter when one is both preferred and usable, and the
+// mock otherwise. There is no third outcome: a caller always gets something it
+// can start(), and what it got says so through detail().
+[[nodiscard]] std::unique_ptr<SpeechRecognizer> makeRecognizerFor(Microphone microphone);
+
+// The recognizer this machine should actually use: the microphone probe and the
+// decision, or an explicit branch when the caller knows better.
+//
+// Reading the environment is the caller's job, not this layer's. An app already
+// has a way to read it -- KESTREL_SPEECH_INPUT, passed down as this -- and a
+// portable layer that reached for the process environment itself would be one
+// more thing to stub in a test.
+enum class SpeechInput {
+    Auto,     // probe the machine and decide
+    Mock,     // always the scripted preview recognizer
+    Platform, // always the platform adapter, which reports honestly if it
+              // cannot listen rather than quietly substituting the mock
+};
+
+[[nodiscard]] std::unique_ptr<SpeechRecognizer> makeBestSpeechRecognizer(SpeechInput preference = SpeechInput::Auto);
 
 } // namespace kestrel::runtime

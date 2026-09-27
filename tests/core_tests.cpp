@@ -374,7 +374,7 @@ void testPersonaPresenceLineIsStable() {
     assert(line.find("calm") != std::string::npos);
     assert(persona.systemPromptFragment() == line);
 
-    persona.drift(0.4F, 0.4F, 0.4F, -0.4F, 0.4F);
+    persona.drift(0.4F, 0.4F, 0.4F, -0.4F, 0.4F, 0.0F);
     assert(persona.presenceLine() == line);
 
     core::ToneProfile wry;
@@ -387,16 +387,20 @@ void testPersonaPresenceLineIsStable() {
 
 void testPersonaDialsStayInRange() {
     core::Persona persona;
-    persona.drift(5.0F, 5.0F, 5.0F, 5.0F, 5.0F);
+    persona.drift(5.0F, 5.0F, 5.0F, 5.0F, 5.0F, 5.0F);
     assert(persona.state().focus == 1.0F);
-    persona.drift(-5.0F, -5.0F, -5.0F, -5.0F, -5.0F);
+    assert(persona.state().warmth == 1.0F);
+    persona.drift(-5.0F, -5.0F, -5.0F, -5.0F, -5.0F, -5.0F);
     assert(persona.state().calmness == 0.0F);
+    assert(persona.state().warmth == 0.0F);
 
     core::PersonaState wild;
     wild.focus = 4.0F;
     wild.curiosity = -3.0F;
+    wild.warmth = 9.0F;
     persona.setState(wild);
     assert(persona.state().focus == 1.0F);
+    assert(persona.state().warmth == 1.0F);
     assert(persona.state().curiosity == 0.0F);
 
     // The mood label is a shared decision: the same dials must read the same way
@@ -446,7 +450,7 @@ void testPersonaAnticipation() {
     // An ordinary short answer only earns a closing prompt from an assistant
     // with the initiative to mean it.
     assert(!persona.react(core::PersonaTrigger::TurnCompleted).has_value());
-    persona.drift(0.0F, 0.0F, 0.2F, 0.0F, 0.0F);
+    persona.drift(0.0F, 0.0F, 0.2F, 0.0F, 0.0F, 0.0F);
     assert(persona.react(core::PersonaTrigger::TurnCompleted).has_value());
 
     // States the UI already shows are not repeated as a line.
@@ -613,7 +617,7 @@ void testIdleDriftsDialsButNeverRamps() {
     }
     const core::PersonaState& state = persona.state();
     for (const float dial : {state.focus, state.curiosity, state.initiative,
-                             state.calmness, state.presenceIntensity}) {
+                             state.calmness, state.presenceIntensity, state.warmth}) {
         assert(dial >= 0.05F && dial <= 0.95F);
     }
     // The decay has to win over the bumps. An assistant that only ever gained
@@ -623,6 +627,43 @@ void testIdleDriftsDialsButNeverRamps() {
     // One set of numbers, two readers: the loop and the persona cannot drift
     // apart because there is only one copy.
     assert(&idle.state() == &persona.state());
+}
+
+// Warmth is the one dial a user hears, so the claim that a mood change is
+// audible rests on it actually moving -- and in the direction the work implies,
+// rather than on a constant that happens to be called warmth.
+void testIdleWarmthTracksTheMood() {
+    const float resting = core::PersonaState{}.warmth;
+
+    const auto driftWith = [](core::IdlePolicy policy, int ticks) {
+        core::Persona persona;
+        core::IdlePersona idle(persona);
+        idle.setPolicy(policy);
+        idle.setIntervalMs(100);
+        idle.setQuietPeriodMs(100);
+        std::uint64_t now = 0;
+        static_cast<void>(idle.tick(now)); // anchors the clock
+        for (int i = 0; i < ticks; ++i) {
+            now += 1000;
+            static_cast<void>(idle.tick(now));
+        }
+        return persona.state().warmth;
+    };
+
+    // Only the work that cools the voice: indexing and auditing.
+    core::IdlePolicy cooling;
+    cooling.allowSelfReflection = false;
+    cooling.allowAmbientWhisper = false;
+    cooling.allowCreativeThoughts = false;
+    cooling.allowGreetingPrep = false;
+    assert(driftWith(cooling, 40) < resting);
+
+    // Only the work that warms it: reflecting and reaching towards the user.
+    core::IdlePolicy warming;
+    warming.allowContextReindex = false;
+    warming.allowCacheAudit = false;
+    warming.allowCreativeThoughts = false;
+    assert(driftWith(warming, 40) > resting);
 }
 
 void testIdleGreetsOncePerAbsence() {
@@ -990,6 +1031,41 @@ void testPeekSpeechSegmentLooksOneClauseAhead() {
     assert(!session.peekSpeechSegment(9999).has_value());
 }
 
+// Warmth only counts if it changes what the engine is asked for. The numbers
+// matter twice over: a persona that has not drifted has to come out exactly
+// where it always did, and a dial nobody can hear is not a dial.
+void testWarmthBecomesPace() {
+    const core::VoicePersona base;
+    const float neutral = core::paceFor(base);
+    // 0.5 + the default rate of 0.96: the speed the engine has always been given.
+    assert(neutral > 1.459F && neutral < 1.461F);
+
+    core::VoicePersona warm = base;
+    warm.warmth = 1.0F;
+    const float warmest = core::paceFor(warm);
+
+    core::VoicePersona cool = base;
+    cool.warmth = 0.0F;
+    const float coolest = core::paceFor(cool);
+
+    // Warmer is slower, cooler is brisker, and the swing is about a fifth in
+    // total: audible, not a different speaker.
+    assert(warmest < neutral);
+    assert(coolest > neutral);
+    assert(coolest - warmest > 0.25F && coolest - warmest < 0.35F);
+
+    // Monotone across the whole dial, because a warmth that made the voice
+    // faster when you asked for it to be warmer would not be a warmth.
+    float previous = coolest;
+    for (int step = 1; step <= 10; ++step) {
+        core::VoicePersona sample = base;
+        sample.warmth = static_cast<float>(step) / 10.0F;
+        const float pace = core::paceFor(sample);
+        assert(pace < previous);
+        previous = pace;
+    }
+}
+
 void testVoicePersonaIsReplaceable() {
     core::VoiceSession session;
     assert(session.voicePersona().voiceId == core::defaultVoicePersona().voiceId);
@@ -1054,6 +1130,8 @@ int main() {
     testIdleDefaultPolicyIsLocalOnly();
     testIdleOnlyProducesPermittedWork();
     testIdleDriftsDialsButNeverRamps();
+    testIdleWarmthTracksTheMood();
+    testWarmthBecomesPace();
     testIdleGreetsOncePerAbsence();
     testIdleStopsWhenDisabled();
     testUndeclaredToolIsRefused();

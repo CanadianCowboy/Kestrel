@@ -15,6 +15,13 @@ constexpr std::size_t kHistoryLimit = 16;
 // room to be surprising, and one pinned at 0.0 has stopped being present.
 constexpr float kDialFloor = 0.05F;
 
+// Where the warmth dial comes to rest between nudges, and the value
+// core::VoicePersona treats as neutral. Kept beside the dial floor because both
+// are the loop's opinion about where a dial belongs, and because a voice that
+// rests somewhere other than its own neutral would drift off it on the very
+// first idle cycle.
+constexpr float kRestingWarmth = 0.6F;
+
 // Every task kind, in one list. Both the count and the selection walk this
 // rather than their own enumeration, so adding a kind cannot be half-remembered
 // in one place and forgotten in the other.
@@ -199,13 +206,18 @@ std::size_t IdlePersona::chooseKind(const std::vector<IdleTaskKind>& kinds) cons
 
 void IdlePersona::applyDrift(IdleTaskKind kind) noexcept {
     PersonaState next = m_persona.state();
+    // Warmth moves with the same tasks that move the other dials, and in the
+    // direction each of them implies: reflecting and reaching towards the user
+    // warm the voice, indexing and auditing cool it. That is the whole claim
+    // that a mood change is audible rather than merely labelled, and it is
+    // cheap because the dials are already being moved here.
     switch (kind) {
-    case IdleTaskKind::SelfReflection: next.focus += 0.02F; break;
-    case IdleTaskKind::AmbientWhisper: next.presenceIntensity += 0.03F; break;
-    case IdleTaskKind::ContextReindex: next.focus += 0.03F; break;
-    case IdleTaskKind::CacheAudit: next.focus += 0.01F; break;
+    case IdleTaskKind::SelfReflection: next.focus += 0.02F; next.warmth += 0.02F; break;
+    case IdleTaskKind::AmbientWhisper: next.presenceIntensity += 0.03F; next.warmth += 0.02F; break;
+    case IdleTaskKind::ContextReindex: next.focus += 0.03F; next.warmth -= 0.02F; break;
+    case IdleTaskKind::CacheAudit: next.focus += 0.01F; next.warmth -= 0.01F; break;
     case IdleTaskKind::CreativeThought: next.curiosity += 0.05F; break;
-    case IdleTaskKind::GreetingPrep: next.presenceIntensity += 0.02F; break;
+    case IdleTaskKind::GreetingPrep: next.presenceIntensity += 0.02F; next.warmth += 0.01F; break;
     case IdleTaskKind::ModelWarmup: break; // warms the model, not the personality
     }
 
@@ -215,12 +227,19 @@ void IdlePersona::applyDrift(IdleTaskKind kind) noexcept {
     next.curiosity -= 0.012F;
     next.initiative -= 0.010F;
     next.calmness += 0.008F;
+    // Warmth eases back to where it rests rather than only being pushed one
+    // way, for the same reason the others decay: a voice that only ever warmed
+    // would, given enough idle time, become a character nobody wants to listen
+    // to. Pulling to a point rather than by a fixed step is what lets it come
+    // back down as well as up.
+    next.warmth += (kRestingWarmth - next.warmth) * 0.2F;
 
     next.focus = clampDial(next.focus);
     next.curiosity = clampDial(next.curiosity);
     next.initiative = clampDial(next.initiative);
     next.calmness = clampDial(next.calmness);
     next.presenceIntensity = clampDial(next.presenceIntensity);
+    next.warmth = clampDial(next.warmth);
     m_persona.setState(next);
 }
 

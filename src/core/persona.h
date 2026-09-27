@@ -33,7 +33,7 @@ enum class PersonaActivity {
 [[nodiscard]] const char* toString(PersonaMood mood) noexcept;
 [[nodiscard]] const char* toString(PersonaActivity activity) noexcept;
 
-// The five dials behind the mood label. Every one stays inside [0, 1].
+// The six dials behind the mood label. Every one stays inside [0, 1].
 //
 // The idle loop drifts these and then weights its own work by them, which is
 // what turns "personality" from a paragraph of prompt text into arithmetic:
@@ -44,6 +44,13 @@ struct PersonaState {
     float initiative = 0.35F;
     float calmness = 0.8F;
     float presenceIntensity = 0.4F;
+    // How warm the voice sounds. The only dial a user hears rather than reads,
+    // and the one that ties the persona to the synthesizer: it reaches
+    // core::VoicePersona and from there the local engine's pace, so a calm
+    // Kestrel sounds unhurried and an alert one sounds clipped. Rests at
+    // 0.6, which is the voice persona's own neutral, so a persona that has not
+    // drifted sounds exactly as it did before the dial existed.
+    float warmth = 0.6F;
 
     void clamp() noexcept;
 };
@@ -126,7 +133,7 @@ public:
     /// Moves each dial by the given amount and clamps back into [0, 1]. This
     /// is the only way dials change, so a caller cannot put one out of range.
     void drift(float focus, float curiosity, float initiative,
-               float calmness, float presenceIntensity) noexcept;
+               float calmness, float presenceIntensity, float warmth) noexcept;
     [[nodiscard]] PersonaMood mood() const noexcept;
 
     // The assistant-presence string injected into the shared system prompt.

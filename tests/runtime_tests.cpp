@@ -3,6 +3,8 @@
 #include "runtime/engineartifact.h"
 #include "runtime/llamacppbackend.h"
 #include "runtime/mockbackend.h"
+#include "runtime/sapirecognizer.h"
+#include "runtime/speechrecognizer.h"
 #include "runtime/tensorrtbackend.h"
 
 #include <cassert>
@@ -660,6 +662,100 @@ void testLlamaCppGeneratesFromRealModel() {
     assert(backend.cachedPrefixTokens() == 0);
 }
 
+// Which recognizer the app uses depends on the machine, so the decision is
+// tested on its own rather than by looking for a microphone. Both branches are
+// asserted here, and neither of them needs audio hardware to run: the point is
+// the choice, not the listening.
+void testRecognizerSelectionFollowsTheMicrophone() {
+    std::printf("  selection: mic present -> platform adapter, mic absent -> mock\n");
+
+    // The rule itself, with no platform code involved at all.
+    assert(runtime::preferPlatformRecognizer(runtime::Microphone::Present));
+    assert(!runtime::preferPlatformRecognizer(runtime::Microphone::Absent));
+
+    // Whether this build has the adapter at all is a property of the build, not
+    // of the test, so it is read rather than assumed. A portable build compiles
+    // the stub, which reports unavailable, and must then hand back the mock
+    // rather than something that cannot listen.
+    const auto platform = runtime::makePlatformSpeechRecognizer();
+    assert(platform != nullptr);
+    const bool platform_usable = platform->available();
+
+    const auto with_microphone = runtime::makeRecognizerFor(runtime::Microphone::Present);
+    assert(with_microphone != nullptr);
+    assert(with_microphone->available());
+    const bool gave_back_the_mock =
+        dynamic_cast<runtime::MockSpeechRecognizer*>(with_microphone.get()) != nullptr;
+    // Exactly one of the two, and which one follows from what the build can do
+    // -- never from luck about the machine running the test.
+    assert(gave_back_the_mock != platform_usable);
+    std::printf("  with a microphone: %s\n", with_microphone->detail().c_str());
+
+    const auto without_microphone = runtime::makeRecognizerFor(runtime::Microphone::Absent);
+    assert(without_microphone != nullptr);
+    assert(dynamic_cast<runtime::MockSpeechRecognizer*>(without_microphone.get()) != nullptr);
+    std::printf("  without one:       %s\n", without_microphone->detail().c_str());
+}
+
+// The mock is not a placeholder behind the fallback; the barge-in tests drive
+// partial results through it, so the branch chosen when there is no microphone
+// has to keep producing them.
+void testMockRecognizerStillStreamsPartials() {
+    std::printf("  the fallback recognizer still streams partial words\n");
+
+    auto recognizer = runtime::makeRecognizerFor(runtime::Microphone::Absent);
+    assert(recognizer != nullptr);
+
+    std::vector<runtime::RecognitionResult> seen;
+    std::string end_reason;
+    std::string failure;
+    const bool started = recognizer->start(
+        [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
+        [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
+            end_reason = runtime::toString(reason);
+        },
+        failure);
+    assert(started);
+    assert(failure.empty());
+    assert(recognizer->listening());
+
+    auto* mock = dynamic_cast<runtime::MockSpeechRecognizer*>(recognizer.get());
+    assert(mock != nullptr);
+    for (int i = 0; i < 10 && recognizer->listening(); ++i) {
+        mock->emitNextPartial();
+    }
+
+    assert(!seen.empty());
+    // Partial before final, or a consumer that renders words as they arrive has
+    // nothing to render.
+    assert(!seen.front().isFinal);
+    assert(seen.back().isFinal);
+    assert(!seen.back().text.empty());
+    assert(seen.back().text.size() > seen.front().text.size());
+    assert(end_reason == runtime::toString(runtime::RecognitionEnd::Silence));
+    assert(!recognizer->listening());
+    std::printf("  %zu results, \"%s\"\n", seen.size(), seen.back().text.c_str());
+
+    // A stop mid-phrase is a cancellation, and reports no phrase. A recognizer
+    // that handed back a half-sentence on cancel would submit words the user
+    // did not finish saying.
+    assert(recognizer->start(
+        [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
+        [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
+            end_reason = runtime::toString(reason);
+        },
+        failure));
+    mock->emitNextPartial();
+    const std::size_t before_stop = seen.size();
+    recognizer->stop();
+    assert(end_reason == runtime::toString(runtime::RecognitionEnd::Cancelled));
+    const auto& cancelled = seen.back();
+    assert(!cancelled.isFinal);
+    assert(cancelled.text.empty());
+    assert(seen.size() == before_stop + 1);
+    assert(!recognizer->listening());
+}
+
 /// Runs portable runtime checks and optional GGUF integration checks; assertions abort on failure.
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
@@ -682,6 +778,8 @@ int main() {
     KESTREL_RUN(testEngineCompatibility);
     KESTREL_RUN(testTensorRtBackendValidatesEngine);
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
+    KESTREL_RUN(testRecognizerSelectionFollowsTheMicrophone);
+    KESTREL_RUN(testMockRecognizerStillStreamsPartials);
     KESTREL_RUN(testBackendDrivenTokenCounting);
     KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);

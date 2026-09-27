@@ -116,6 +116,19 @@ const VoicePersona& defaultVoicePersona() noexcept {
     return kDefault;
 }
 
+float paceFor(const VoicePersona& persona) noexcept {
+    // The warmth the engine is left alone at, which is the voice persona's own
+    // default and the resting point of PersonaState::warmth, and how far the pace
+    // moves across the rest of the range. About a tenth of the pace in each
+    // direction: enough to hear, not enough to sound like a different person. An
+    // assistant that changed register noticeably every time it changed its mind
+    // would be tiring rather than alive.
+    constexpr float kNeutralWarmth = 0.6F;
+    constexpr float kWarmthRange = 0.30F;
+    return 0.5F + persona.rate
+         - kWarmthRange * (persona.warmth - kNeutralWarmth);
+}
+
 std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcept {
     const std::size_t limit = std::min(offset, text.size());
     std::size_t start = 0;
