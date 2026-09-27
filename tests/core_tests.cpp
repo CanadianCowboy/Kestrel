@@ -775,6 +775,18 @@ void testSpeechPlanningClausesAndPauses() {
     assert(shortClause.size() == 1);
     assert(shortClause.front().text == "Well, not at all today.");
 
+    // Closing quotes stay with the sentence, including all bytes of U+201D.
+    for (const std::string_view closing : {"\"", "'", ")", "]", "}", "\xe2\x80\x9d", "\xe2\x80\x9d)"}) {
+        const std::string sentence = std::string("He said go.") + std::string(closing);
+        const auto quoted = core::planSpeech(sentence + " Then he left.", persona);
+        assert(quoted.size() == 2);
+        assert(quoted[0].text == sentence);
+        assert(quoted[0].endOffset == sentence.size());
+        assert(quoted[1].text == "Then he left.");
+        assert(quoted[1].startOffset == sentence.size() + 1);
+        assert(quoted[1].leadingPauseMs == persona.sentencePauseMs);
+    }
+
     assert(core::planSpeech("", persona).empty());
     assert(core::planSpeech("   ", persona).empty());
 }
@@ -812,6 +824,7 @@ void testNextSpeechSegmentTracksTheSpokenCursor() {
     assert(session.advancePlayback(id, first->endOffset));
     const auto second = session.nextSpeechSegment(id);
     assert(second.has_value());
+    assert(!second->isFirst);
     assert(second->text == "There we go.");
     // The cursor sat on the space, so the next clause begins past it, and its
     // end lands exactly at the end of the generated text.
