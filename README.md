@@ -101,7 +101,7 @@ opposite of what Kestrel wants.
 
 ### Required for the core and tests
 
-- Windows 10/11 x64 or another CMake-supported development platform
+- Windows 10/11 x64, or a current Linux distribution (Ubuntu 22.04 or newer)
 - CMake 3.24 or newer
 - A compiler with C++20 support
 - Ninja or another supported CMake generator
@@ -212,6 +212,93 @@ Visual Studio provides the MSVC compiler and Windows SDK. Standalone CMake and N
 If `cl.exe`, `rc.exe`, or `mt.exe` cannot be found, open a Visual Studio Developer Command Prompt/PowerShell or initialize the Visual Studio build environment before invoking CMake. This is not a dependency on Visual Studio's bundled CMake or Ninja; it is required because MSVC and the Windows SDK use environment variables and library paths.
 
 For CUDA, verify the toolkit and driver independently before configuring a backend. A successful CMake build does not prove that a model runtime can load an engine or use the GPU.
+
+## Linux
+
+Linux is a supported build and install target. The portable core, the tests, and
+the desktop application all build there, and the runtime reports what it really
+found: a Linux box without an NVIDIA driver still gets working CPU inference
+through llama.cpp, and one without a CUDA toolkit still builds, because device
+discovery degrades to the portable stub.
+
+### Prerequisites
+
+```bash
+sudo apt-get install -y build-essential cmake ninja-build git
+sudo apt-get install -y qt6-base-dev qt6-declarative-dev
+```
+
+`qt6-base-dev` provides Qt Core and `qt6-declarative-dev` provides Qt Quick and
+Qt Quick Controls 2. Without them CMake skips the desktop target and builds the
+core and its tests, which is the same degradation a contributor without Qt gets
+on any platform.
+
+### Build, test, and install
+
+```bash
+cmake -S . -B build -G Ninja -DKESTREL_BUILD_UI=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+sudo cmake --install build
+```
+
+The install places the application where a freedesktop session looks for it:
+
+| Installed path | Contents |
+| --- | --- |
+| `bin/kestrel` | the desktop application |
+| `share/applications/io.github.canadiancowboy.kestrel.desktop` | the launcher entry |
+| `share/icons/hicolor/scalable/apps/` | the application icon |
+| `share/metainfo/` | AppStream metadata, so the app appears in software centres |
+
+To try an install without touching the system, stage one into a prefix you
+control:
+
+```bash
+cmake --install build --prefix "$HOME/.local"
+```
+
+`kestrel-engine-build` is deliberately not installed. It writes engine records
+next to an engine and is a maintainer tool, so it stays in the build tree rather
+than on an end user's `PATH`.
+
+### Linking llama.cpp
+
+llama.cpp is the portable inference path and the one most likely to be present
+on a Linux workstation. Build it as shared libraries and install it to a prefix:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cmake -S llama.cpp -B llama.cpp/build -G Ninja -DBUILD_SHARED_LIBS=ON
+cmake --build llama.cpp/build
+cmake --install llama.cpp/build --prefix "$HOME/.local"
+```
+
+Then configure Kestrel against that prefix:
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DKESTREL_BUILD_UI=ON \
+  -DKESTREL_LLAMA_CPP_ROOT="$HOME/.local"
+```
+
+llama.cpp splits its shared objects across `libllama.so`, `libggml.so`,
+`libggml-base.so`, `libggml-cpu.so`, and one more per enabled backend, so CMake
+links whichever of those the prefix actually contains and records the prefix in
+the binary's rpath. Without that rpath the installed binary would start and then
+fail to load `libllama.so`, because the Linux loader searches the system
+directories only.
+
+When llama.cpp is not found, the GGUF backend reports itself unavailable and the
+mock backend stays usable. That is the documented degradation, not a failure.
+
+### Display servers
+
+Both X11 and Wayland work. Two platform details are deliberate: `main.cpp` pins
+the Basic Quick Controls style everywhere, because the hand-drawn QML is
+discarded by a native style, and it announces Kestrel's desktop file id so the
+taskbar shows the application's name and icon instead of the bare executable
+name.
 
 ## Development workflow
 

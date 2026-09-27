@@ -10,9 +10,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  QT_VERSION: '6.9.0'
-
 jobs:
   # The portable core must build everywhere, with no optional dependency
   # present. This is the configuration a contributor on a bare machine gets,
@@ -66,12 +63,21 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
   desktop:
-    name: Desktop (Qt ${{ env.QT_VERSION }}) / ${{ matrix.os }}
+    name: Desktop (Qt ${{ matrix.qt }}) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # The one place the Qt version is written down. It has to reach the job
+        # name, and `env` is not one of the contexts available there --
+        # referencing it made the whole workflow uncompilable, which GitHub
+        # reports as a run that failed in zero seconds with no jobs at all.
+        # `matrix` is allowed in a job name, so the version lives here and the
+        # install step reads it back through a job-scoped env.
+        qt: ['6.9.0']
+    env:
+      QT_VERSION: ${{ matrix.qt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +85,12 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          modules: 'qtquickcontrols2'
+          # No `modules` list on purpose. Quick Controls 2 is part of the base
+          # Qt 6 installation rather than a separately installable module, and
+          # asking aqtinstall for it fails the step with "The packages
+          # ['qtquickcontrols2'] were not found". The input is for genuinely
+          # separate modules such as qtcharts, and nothing this project links
+          # against is one.
           cache: true
 
       - name: Configure
@@ -141,6 +152,98 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           "${{ steps.app.outputs.path }}" --print-runtime
+
+  # Linux is the only platform where CMake has to assemble the installed
+  # application itself: the binary, the desktop entry, the icon, and the
+  # AppStream metadata. Every other job here runs straight out of the build
+  # tree, so a missing install rule would go unnoticed until someone tried to
+  # install the app. This job installs into a staging prefix and then launches
+  # what was installed, which is the only way to catch an install that copies
+  # the binary but not the metadata -- or a QML module that only existed in the
+  # build directory.
+  linux-install:
+    name: Linux install tree (Qt ${{ matrix.qt }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # Keep this in step with the desktop job above; there is no way to read
+        # one job's matrix from another.
+        qt: ['6.9.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt }}
+          cache: true
+
+      - name: Install the desktop validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libxml2-utils
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DKESTREL_BUILD_UI=ON \
+            -DKESTREL_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Install into a staging prefix
+        run: cmake --install build --prefix "$RUNNER_TEMP/kestrel"
+
+      - name: The install tree is complete
+        run: |
+          STAGE="$RUNNER_TEMP/kestrel"
+          for f in \
+            bin/kestrel \
+            share/applications/io.github.canadiancowboy.kestrel.desktop \
+            share/icons/hicolor/scalable/apps/io.github.canadiancowboy.kestrel.svg \
+            share/metainfo/io.github.canadiancowboy.kestrel.metainfo.xml; do
+            if [ ! -e "$STAGE/$f" ]; then
+              echo "::error::$f was not installed"
+              exit 1
+            fi
+          done
+          # The engine tool is deliberately not installed: it writes records
+          # beside an engine, so it stays a maintainer tool in the build tree.
+          if [ -e "$STAGE/bin/kestrel-engine-build" ]; then
+            echo "::error::the engine build tool should not be installed for end users"
+            exit 1
+          fi
+          desktop-file-validate "$STAGE/share/applications/io.github.canadiancowboy.kestrel.desktop"
+          xmllint --noout "$STAGE/share/metainfo/io.github.canadiancowboy.kestrel.metainfo.xml"
+
+      # Linking and installing are not proof the installed app still loads its
+      # QML. It is started for real, from the staging prefix, and asked to quit
+      # itself once it has rendered a frame.
+      - name: The installed app starts and renders
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_FORCE_STDERR_LOGGING: '1'
+          KESTREL_SCREENSHOT: "$RUNNER_TEMP/kestrel.png"
+        run: |
+          if ! "$RUNNER_TEMP/kestrel/bin/kestrel" > install.log 2>&1; then
+            cat install.log
+            echo "::error::the installed app exited non-zero"
+            exit 1
+          fi
+          cat install.log
+          if [ ! -s "$RUNNER_TEMP/kestrel.png" ]; then
+            echo "::error::the installed app did not render a window"
+            exit 1
+          fi
+          if grep -Eiq "ReferenceError|TypeError|is not a member|Unable to assign" install.log; then
+            echo "::error::QML reported binding errors from the installed app"
+            exit 1
+          fi
 
   # The engine-build tool must be runnable, not merely compiled: it writes a
   # sidecar record and validates it, which is the only thing that proves the

@@ -162,11 +162,48 @@ if(KESTREL_LLAMA_CPP_ENABLED)
                 "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.dylib"
             )
         else()
-            target_link_libraries(kestrel_core PRIVATE
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.so"
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.so"
-            )
+            # llama.cpp splits ggml across several shared objects -- libggml.so
+            # plus libggml-base.so and libggml-cpu.so, one more per enabled
+            # backend -- and recent releases add libllama-impl.so. Naming two of
+            # them by hand links on a tree that happens to match that pair and
+            # fails to resolve the rest everywhere else, so link what is
+            # actually installed. GLOB is evaluated once per configure, which
+            # matches how the rest of this file resolves optional dependencies.
+            set(_kestrel_llama_libdir "${KESTREL_LLAMA_CPP_ROOT}/lib")
+            file(GLOB _kestrel_llama_libs
+                "${_kestrel_llama_libdir}/libllama.so"
+                "${_kestrel_llama_libdir}/libllama-impl.so"
+                "${_kestrel_llama_libdir}/libggml*.so")
+            if(NOT _kestrel_llama_libs)
+                # No unversioned development symlinks: a shared-only build tree
+                # keeps only libllama.so.1 and friends. Take the versioned names
+                # rather than declaring the backend unavailable.
+                file(GLOB _kestrel_llama_libs
+                    "${_kestrel_llama_libdir}/libllama*.so.*"
+                    "${_kestrel_llama_libdir}/libggml*.so.*")
+            endif()
+            if(NOT _kestrel_llama_libs)
+                message(WARNING
+                    "Kestrel: ${KESTREL_LLAMA_CPP_ROOT} has headers but no llama.cpp "
+                    "shared libraries in ${_kestrel_llama_libdir}, so the link will fail. "
+                    "Point KESTREL_LLAMA_CPP_ROOT at a llama.cpp install or build tree, "
+                    "or set KESTREL_ENABLE_LLAMA_CPP=OFF to build without GGUF inference.")
+            else()
+                list(SORT _kestrel_llama_libs)
+                message(STATUS "Kestrel: linking llama.cpp from ${_kestrel_llama_libdir}: "
+                               "${_kestrel_llama_libs}")
+            endif()
+            target_link_libraries(kestrel_core PRIVATE ${_kestrel_llama_libs})
         endif()
+    endif()
+
+    # llama.cpp is linked as a bare path rather than an imported target, so
+    # CMake cannot infer where the objects live. Without an rpath the installed
+    # binary starts and then fails to load libllama.so, because the Linux loader
+    # searches the system paths only -- /opt and ~/.local are not among them.
+    # kestrel_core is static, so the property belongs on the executables.
+    if(UNIX AND NOT APPLE AND KESTREL_LLAMA_CPP_ROOT)
+        set(_kestrel_llama_rpath "${KESTREL_LLAMA_CPP_ROOT}/lib")
     endif()
 endif()
 
@@ -201,6 +238,15 @@ if(KESTREL_BUILD_UI)
             Qt6::QuickControls2
         )
         target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT=1)
+
+        if(UNIX AND NOT APPLE)
+            # One identifier for the desktop entry, the icon, and the window
+            # association. A binary named kestrel that never names its own
+            # .desktop file gets a generic icon and an unlisted window menu.
+            set(KESTREL_DESKTOP_ID "io.github.canadiancowboy.kestrel")
+            target_compile_definitions(kestrel PRIVATE
+                KESTREL_DESKTOP_FILE_ID="${KESTREL_DESKTOP_ID}")
+        endif()
 
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
@@ -287,5 +333,38 @@ if(KESTREL_BUILD_TESTS)
     if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND AND WIN32)
         set_tests_properties(kestrel_runtime_tests PROPERTIES
             ENVIRONMENT "PATH=${CUDAToolkit_BIN_DIR};$ENV{PATH}")
+    endif()
+endif()
+
+# --- Linux install rules ------------------------------------------------------
+# Windows and macOS ship through their own platform tooling. Linux is the only
+# place where CMake has to assemble the installed application itself, and
+# without these rules `cmake --install` copies nothing at all: the app still
+# runs from the build tree, so the omission is invisible until someone tries to
+# install it.
+if(UNIX AND NOT APPLE)
+    include(GNUInstallDirs)
+
+    if(_kestrel_llama_rpath)
+        foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
+            if(TARGET ${_kestrel_rpath_target})
+                set_target_properties(${_kestrel_rpath_target} PROPERTIES
+                    INSTALL_RPATH "${_kestrel_llama_rpath}")
+            endif()
+        endforeach()
+    endif()
+
+    # Only the desktop app is installed. kestrel-engine-build writes engine
+    # records beside an engine and is a maintainer tool, so it stays in the
+    # build tree rather than on an end user's PATH.
+    if(TARGET kestrel)
+        install(TARGETS kestrel
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.desktop"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.svg"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.metainfo.xml"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/metainfo")
     endif()
 endif()
