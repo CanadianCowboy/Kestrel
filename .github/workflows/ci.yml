@@ -228,7 +228,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           QT_FORCE_STDERR_LOGGING: '1'
-          KESTREL_SCREENSHOT: "$RUNNER_TEMP/kestrel.png"
+          # runner.temp, not RUNNER_TEMP: an env value is a literal string to
+          # the runner, so a shell variable in one reaches the app as the
+          # characters "$RUNNER_TEMP" and the screenshot lands nowhere.
+          KESTREL_SCREENSHOT: ${{ runner.temp }}/kestrel.png
         run: |
           if ! "$RUNNER_TEMP/kestrel/bin/kestrel" > install.log 2>&1; then
             cat install.log
