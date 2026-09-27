@@ -262,7 +262,19 @@ ApplicationWindow {
                         anchors.bottomMargin: 20
                         spacing: 20
 
-                        Item { Layout.fillHeight: true; Layout.minimumHeight: 24 }
+                        // Pushes the rest of the column down while the
+                        // conversation is empty. It must not also fill once
+                        // there are messages: a ColumnLayout shares the
+                        // leftover height between everything asking to fill, so
+                        // an unconditional fill here would take half the chat
+                        // area away from the ListView below it. The ListView is
+                        // invisible (and so excluded from the layout) exactly
+                        // when count is zero, so binding the fill to the same
+                        // condition hands the space to whoever needs it.
+                        Item {
+                            Layout.fillHeight: messageList.count === 0
+                            Layout.minimumHeight: 24
+                        }
 
                         Column {
                             visible: messageList.count === 0
@@ -293,53 +305,15 @@ ApplicationWindow {
                             model: appController.messages
                             spacing: 20
                             clip: true
-                            delegate: Item {
-                                id: messageRow
-                                required property string author
-                                required property string content
-                                required property string status
-                                required property string note
-                                width: messageList.width
-                                height: bubble.implicitHeight + 4
-                                readonly property bool fromAssistant: author === "assistant"
-                                Rectangle {
-                                    id: bubble
-                                    width: Math.min(parent.width * 0.78, bubbleColumn.implicitWidth + 30)
-                                    height: bubbleColumn.implicitHeight + 24
-                                    radius: 15
-                                    anchors.left: messageRow.fromAssistant ? parent.left : undefined
-                                    anchors.right: messageRow.fromAssistant ? undefined : parent.right
-                                    color: messageRow.fromAssistant ? "#15181d" : "#243b34"
-                                    border.color: messageRow.fromAssistant ? window.line : "#385b4e"
-                                    Column {
-                                        id: bubbleColumn
-                                        anchors.fill: parent
-                                        anchors.margins: 15
-                                        spacing: 6
-                                        Text {
-                                            width: parent.width
-                                            text: messageRow.content
-                                            color: window.ink
-                                            font.pixelSize: 14
-                                            lineHeight: 1.35
-                                            wrapMode: Text.Wrap
-                                        }
-                                        // Terminal states stay visible rather than
-                                        // being discarded, so a stopped or failed
-                                        // response is still readable and recoverable.
-                                        Text {
-                                            width: parent.width
-                                            visible: messageRow.status === "stopped"
-                                                         || messageRow.status === "failed"
-                                            text: messageRow.status === "failed"
-                                                  ? "Generation failed" + (messageRow.note ? ": " + messageRow.note : "")
-                                                  : "Stopped"
-                                            color: "#8a6a74"
-                                            font.pixelSize: 11
-                                            wrapMode: Text.Wrap
-                                        }
-                                    }
-                                }
+                            delegate: MessageBubble {
+                                // ListView.view, not the bare id. A delegate
+                                // declared as its own component is not evaluated
+                                // in this file's context, so messageList.width
+                                // does not reliably reach it -- the delegates
+                                // came out zero wide, and a zero-wide row has a
+                                // zero-wide bubble however correctly the
+                                // component is sized.
+                                width: ListView.view.width
                             }
                             onCountChanged: Qt.callLater(function() { positionViewAtEnd() })
                         }
