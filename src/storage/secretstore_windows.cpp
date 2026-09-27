@@ -1,3 +1,4 @@
+#include "core/pathtext.h"
 #include "storage/secretstore.h"
 
 #include "storage/atomicfile.h"
@@ -218,7 +219,7 @@ private:
             // Never there is the state the caller asked for.
             return true;
         }
-        error = "could not remove " + path.string() + ": " +
+        error = "could not remove " + core::pathText(path) + ": " +
                 (code ? code.message() : std::string("the file is still there"));
         return false;
     }

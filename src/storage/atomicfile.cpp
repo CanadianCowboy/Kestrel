@@ -1,3 +1,4 @@
+#include "core/pathtext.h"
 #include "storage/atomicfile.h"
 
 #include <atomic>
@@ -55,7 +56,7 @@ bool flushToDevice(const fs::path& path, std::string& error) {
     HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        error = "could not reopen " + path.string() + " in order to flush it: Windows error " +
+        error = "could not reopen " + core::pathText(path) + " in order to flush it: Windows error " +
                 std::to_string(::GetLastError());
         return false;
     }
@@ -63,7 +64,7 @@ bool flushToDevice(const fs::path& path, std::string& error) {
     const DWORD flushError = ::GetLastError();
     ::CloseHandle(handle);
     if (!flushed) {
-        error = "could not flush " + path.string() + " to the device: Windows error " +
+        error = "could not flush " + core::pathText(path) + " to the device: Windows error " +
                 std::to_string(flushError);
         return false;
     }
@@ -73,7 +74,7 @@ bool flushToDevice(const fs::path& path, std::string& error) {
     // device. fsync is the only call here that reaches the disk.
     const int descriptor = ::open(path.c_str(), O_WRONLY);
     if (descriptor < 0) {
-        error = "could not reopen " + path.string() + " in order to flush it: " +
+        error = "could not reopen " + core::pathText(path) + " in order to flush it: " +
                 std::string(std::strerror(errno));
         return false;
     }
@@ -81,7 +82,7 @@ bool flushToDevice(const fs::path& path, std::string& error) {
     const int syncError = errno;
     ::close(descriptor);
     if (!synced) {
-        error = "could not flush " + path.string() + " to the device: " +
+        error = "could not flush " + core::pathText(path) + " to the device: " +
                 std::string(std::strerror(syncError));
         return false;
     }
@@ -116,7 +117,7 @@ bool flushDirectory(const fs::path& path, std::string& error) {
 #endif
     const int descriptor = ::open(path.c_str(), flags);
     if (descriptor < 0) {
-        error = "could not open " + path.string() + " in order to flush it: " +
+        error = "could not open " + core::pathText(path) + " in order to flush it: " +
                 std::string(std::strerror(errno));
         return false;
     }
@@ -124,7 +125,7 @@ bool flushDirectory(const fs::path& path, std::string& error) {
     const int syncError = errno;
     ::close(descriptor);
     if (!synced) {
-        error = "could not flush " + path.string() + " to the device: " +
+        error = "could not flush " + core::pathText(path) + " to the device: " +
                 std::string(std::strerror(syncError));
         return false;
     }
@@ -144,11 +145,16 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
     // The scratch name has to be unique per write: two saves in quick succession
     // would otherwise race on the same scratch file, and the loser's rename
     // would publish the winner's bytes.
-    const fs::path scratch = target.string() + "." + scratchSuffix() + ".tmp";
+    // Appended to the path rather than to its text form, so the name keeps its
+    // native encoding: going through string() would both throw on a name the ANSI
+    // code page cannot hold and, where it did not throw, rewrite the path in
+    // whatever that code page says the name is.
+    fs::path scratch = target;
+    scratch += "." + scratchSuffix() + ".tmp";
     {
         std::ofstream out(scratch, std::ios::binary | std::ios::trunc);
         if (!out) {
-            error = "could not open " + scratch.string() + " for writing: " + describe(code);
+            error = "could not open " + core::pathText(scratch) + " for writing: " + describe(code);
             return false;
         }
         if (!bytes.empty()) {
@@ -157,7 +163,7 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
         }
         out.flush();
         if (!out) {
-            error = "could not write " + scratch.string() + ": " + describe(code);
+            error = "could not write " + core::pathText(scratch) + ": " + describe(code);
             std::error_code ignored;
             fs::remove(scratch, ignored);
             return false;
@@ -177,7 +183,7 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
     // the ordering, and it is the one Windows will otherwise skip.
     if (!::MoveFileExW(scratch.c_str(), target.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        error = "could not replace " + target.string() + ": Windows error " +
+        error = "could not replace " + core::pathText(target) + ": Windows error " +
                 std::to_string(::GetLastError());
         std::error_code ignored;
         fs::remove(scratch, ignored);
@@ -189,7 +195,7 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
     std::error_code renameCode;
     fs::rename(scratch, target, renameCode);
     if (renameCode) {
-        error = "could not replace " + target.string() + ": " + describe(renameCode);
+        error = "could not replace " + core::pathText(target) + ": " + describe(renameCode);
         std::error_code ignored;
         fs::remove(scratch, ignored);
         return false;
@@ -223,7 +229,7 @@ bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::
     // profile as an absent one, and the next save would then overwrite whatever
     // was really there.
     if (code && code != std::errc::no_such_file_or_directory) {
-        error = "could not reach " + path.string() + ": " + describe(code);
+        error = "could not reach " + core::pathText(path) + ": " + describe(code);
         bytes.clear();
         return false;
     }
@@ -233,7 +239,7 @@ bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::
     }
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        error = "could not open " + path.string() + " for reading";
+        error = "could not open " + core::pathText(path) + " for reading";
         bytes.clear();
         return false;
     }
@@ -241,7 +247,7 @@ bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::
     const std::streamoff size = in.tellg();
     in.seekg(0, std::ios::beg);
     if (size < 0) {
-        error = "could not measure " + path.string();
+        error = "could not measure " + core::pathText(path);
         bytes.clear();
         return false;
     }
@@ -249,7 +255,7 @@ bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::
     if (size > 0) {
         in.read(reinterpret_cast<char*>(bytes.data()), size);
         if (in.gcount() != size) {
-            error = "could not read all of " + path.string();
+            error = "could not read all of " + core::pathText(path);
             bytes.clear();
             return false;
         }

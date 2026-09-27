@@ -190,7 +190,10 @@ void LlamaCppBackend::refreshStatus() {
     m_status.modelLoaded = loaded;
     if (loaded) {
         const std::filesystem::path path(m_impl->modelPath);
-        m_status.modelName = path.has_filename() ? path.filename().string() : m_impl->modelPath;
+        // core::pathText rather than filename().string(): a model file under a
+        // user name the ANSI code page cannot spell throws from string() on
+        // Windows, and this is the line that decides what the UI calls the model.
+        m_status.modelName = path.has_filename() ? core::pathText(path.filename()) : m_impl->modelPath;
         // The context window is a property of the context, not the model, so
         // this reads the live allocation rather than a training default.
         m_status.contextLimit = llama_n_ctx(m_impl->context);

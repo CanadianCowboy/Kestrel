@@ -12,6 +12,13 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+// setenv and unsetenv are POSIX rather than C++, so they are declared by
+// <stdlib.h> and not by <cstdlib>'s own declarations. Naming the header they
+// come from is cheaper than relying on it being pulled in.
+#include <stdlib.h>
+#endif
+
 namespace {
 
 using namespace kestrel;
@@ -33,38 +40,68 @@ std::string hexOf(const std::array<std::uint8_t, storage::Sha256::kDigestBytes>&
 }
 
 // std::getenv reads an environment variable; C++ has no portable spelling for
-// changing one. putenv is the spelling both platforms have, and an empty value
-// is exactly the state under test: paths.cpp collapses an absent variable and
-// an empty one into the same unusable directory, so the test does not need the
-// variable to be truly removed.
+// changing one, and the two platforms spell it differently.
 //
-// The buffer handed to putenv has to outlive the call -- putenv keeps the
-// pointer rather than copying -- so it is a member that is never touched again
-// between the putenv and the next one.
+// _putenv_s and setenv are used rather than putenv because both copy the value.
+// putenv does not: it keeps the pointer it is handed, so a buffer that goes out
+// of scope leaves the environment pointing at freed memory, and every later
+// getenv of that name reads freed memory. The old spelling had exactly that --
+// it stashed the "NAME=value" text in a member, and the destructor put that
+// member's address into the environment and then destroyed the member.
+//
+// Clearing and restoring are kept separate because the two differ on what an
+// empty value means. On Windows _putenv_s with an empty value removes the
+// variable outright; on POSIX setenv with an empty value would leave an empty
+// variable, which is not the same thing, so unsetenv removes it instead. A
+// variable that was not set in the first place is left unset rather than
+// restored to empty, which is what the old code got wrong: it turned "HOME was
+// not set" into "HOME is set to nothing" for the rest of the process. paths.cpp
+// collapses an absent variable and an empty one into the same unusable
+// directory, so the assertions below hold either way.
 class ScopedEnvironment {
 public:
     explicit ScopedEnvironment(const char* name) : m_name(name) {
         const char* value = std::getenv(name);
-        m_saved = value != nullptr ? value : "";
-        apply("");
+        m_wasSet = value != nullptr;
+        if (m_wasSet) {
+            m_saved = value;
+        }
+        clear();
     }
 
     ~ScopedEnvironment() {
-        apply(m_saved);
+        restore();
     }
 
     ScopedEnvironment(const ScopedEnvironment&) = delete;
     ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
 
 private:
-    void apply(const std::string& value) {
-        m_assignment = m_name + "=" + value;
-        ::putenv(m_assignment.data());
+    void clear() {
+#if defined(_WIN32)
+        ::_putenv_s(m_name.c_str(), "");
+#else
+        ::unsetenv(m_name.c_str());
+#endif
+    }
+
+    void restore() {
+#if defined(_WIN32)
+        // An empty value removes the variable on Windows, so this covers both
+        // the value that was there and the variable that was not.
+        ::_putenv_s(m_name.c_str(), m_wasSet ? m_saved.c_str() : "");
+#else
+        if (m_wasSet) {
+            ::setenv(m_name.c_str(), m_saved.c_str(), 1);
+        } else {
+            ::unsetenv(m_name.c_str());
+        }
+#endif
     }
 
     std::string m_name;
     std::string m_saved;
-    std::string m_assignment;
+    bool m_wasSet = false;
 };
 
 // How many sealed blobs are sitting in the process's working directory. The

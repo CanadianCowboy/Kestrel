@@ -1,5 +1,7 @@
 #include "storage/secretstore.h"
 
+#include "storage/secretsearch.h"
+
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -113,6 +115,24 @@ std::optional<std::vector<std::uint8_t>> fromHex(const std::string& text) {
     return bytes;
 }
 
+// The attribute pairs every subcommand below is asked about, quoted once, so
+// that store, clear and search cannot drift onto asking about different items.
+std::string attributesFor(std::string_view account, std::string_view service) {
+    return " service " + shellQuote(std::string(service)) +
+           " account " + shellQuote(std::string(account));
+}
+
+// The `search --unlock` command for one set of attributes, and nothing else:
+// the two callers below differ in what they do with the answer, never in how
+// the question is asked. `lookup` cannot be used for either -- it exits 1 for a
+// miss and for a failure alike, printing a reason only in the second case, so
+// any caller has to infer "nothing is stored" from silence. --unlock is what
+// makes `search` safe here: without it, locked items are skipped, and a locked
+// keyring prints nothing and looks exactly like a miss.
+std::string searchCommand(const std::string& attributes) {
+    return "secret-tool search --unlock" + attributes;
+}
+
 // The three operations below are free functions rather than members for a
 // reason that is not stylistic: available() is const, and it has to perform a
 // real write and a real delete to find out whether a locked keyring will
@@ -124,9 +144,8 @@ bool sealViaTool(std::string_view account, std::string_view service,
     // The secret goes on standard input. Passing it as an argument would put
     // the user's profile in the process list, where every other process on
     // the machine can read it.
-    const std::string command = "secret-tool store --label='Kestrel profile' service " +
-                                shellQuote(std::string(service)) + " account " +
-                                shellQuote(std::string(account));
+    const std::string command =
+        "secret-tool store --label='Kestrel profile'" + attributesFor(account, service);
     std::FILE* pipe = ::popen(command.c_str(), "w");
     if (pipe == nullptr) {
         error = "could not run secret-tool";
@@ -148,51 +167,87 @@ bool sealViaTool(std::string_view account, std::string_view service,
 std::optional<std::vector<std::uint8_t>> readViaTool(std::string_view account,
                                                      std::string_view service,
                                                      std::string& error) {
-    const std::string command = "secret-tool lookup service " + shellQuote(std::string(service)) +
-                                " account " + shellQuote(std::string(account));
+    // `search --unlock` rather than `lookup`: the two report a keyring that will
+    // not open differently, and only `search` can say which of the two things
+    // happened. The classification of what came back lives in
+    // classifySecretSearch, because "what does this report mean" is the part
+    // worth getting right and the part worth testing without a keyring.
+    const std::string attributes = attributesFor(account, service);
     std::string output;
-    const int status = runCapturing(command, output);
+    const int status = runCapturing(searchCommand(attributes), output);
     if (status < 0) {
         error = "could not run secret-tool to read the profile";
         return std::nullopt;
     }
-    const std::string said = trimmed(output);
-    if (status != 0) {
-        if (said.empty()) {
-            // libsecret's documented result for a miss: exit 1 and silence.
-            // Nothing stored is a first run, not a failure.
+
+    const SecretSearchReport report = classifySecretSearch(status, output);
+    if (report.outcome == SecretSearchOutcome::readable) {
+        auto bytes = fromHex(report.secret);
+        if (!bytes.has_value()) {
+            error = "the keyring returned something that is not a sealed profile";
             return std::nullopt;
         }
-        // Whatever it did say is the reason, and the user is going to need it.
-        error = "the keyring would not release the profile: " + said;
+        return bytes;
+    }
+    if (report.outcome == SecretSearchOutcome::absent) {
+        // Nothing matched, which libsecret says positively rather than by saying
+        // nothing. A miss is a first run and not a failure, so the error stays
+        // empty: that empty string is the whole of the SecretStore contract for
+        // "nothing stored", and Profile::load reads it that way on purpose.
         return std::nullopt;
     }
-    if (said.empty()) {
-        return std::nullopt;
-    }
-    auto bytes = fromHex(said);
-    if (!bytes.has_value()) {
-        error = "the keyring returned something that is not a sealed profile";
-        return std::nullopt;
-    }
-    return bytes;
+    // Unreadable or failed, and both must report one. An empty error here is
+    // what lets the caller treat a profile it could not read as one that was
+    // never there, which is the save that overwrites it.
+    error = report.outcome == SecretSearchOutcome::unreadable
+                ? "a profile is stored in the keyring, but the keyring would not "
+                  "release it: " + report.reason
+                : "the keyring would not release the profile: " + report.reason;
+    return std::nullopt;
 }
 
 bool forgetViaTool(std::string_view account, std::string_view service, std::string& error) {
-    const std::string command = "secret-tool clear service " + shellQuote(std::string(service)) +
-                                " account " + shellQuote(std::string(account));
+    const std::string attributes = attributesFor(account, service);
     std::string output;
-    const int status = runCapturing(command, output);
-    if (status == 0) {
-        // Which includes there being nothing to clear: libsecret's clearv
-        // succeeds on a miss, so this is the state the caller asked for.
+    if (runCapturing("secret-tool clear" + attributes, output) != 0) {
+        // Reporting "forgotten" when the keyring refused would be the one lie
+        // this store must not tell, because the profile is still in there.
+        const std::string said = trimmed(output);
+        error = "the keyring would not forget the profile: " +
+                (said.empty() ? std::string("secret-tool failed without saying why") : said);
+        return false;
+    }
+
+    // A zero status from `clear` is not evidence that anything was removed. The
+    // manual says it removes "all unlocked items that match", so against a
+    // locked keyring it removes nothing, has nothing to complain about, and
+    // exits 0 -- and the caller would then tell a user they are forgotten while
+    // their conversation is still sitting in the keyring.
+    //
+    // So the claim is checked rather than inferred. Asking the same question
+    // again through `search --unlock` is what makes the difference between "I
+    // removed it" and "nothing matching is there any more", and a miss answers
+    // the second just as well as the first did: there was nothing to remove,
+    // which is the state the caller asked for.
+    std::string report;
+    const int status = runCapturing(searchCommand(attributes), report);
+    const SecretSearchReport outcome = classifySecretSearch(status, report);
+    if (outcome.outcome == SecretSearchOutcome::absent) {
         return true;
     }
-    // Reporting "forgotten" when the keyring refused would be the one lie this
-    // store must not tell, because the profile is still in the keyring.
-    const std::string said = trimmed(output);
-    error = "the keyring would not forget the profile: " +
-            (said.empty() ? std::string("the command failed") : said);
+    if (outcome.outcome == SecretSearchOutcome::failed) {
+        error = "the keyring accepted the request but would not say whether the "
+                "profile was removed: " + outcome.reason;
+        return false;
+    }
+    if (outcome.outcome == SecretSearchOutcome::unreadable) {
+        error = "the keyring still holds the profile and would not release it, so "
+                "nothing was removed: " + outcome.reason;
+        return false;
+    }
+    // Readable and still there: the item survived a clear that reported success,
+    // which is a keyring behaving in a way this store cannot account for.
+    error = "the keyring accepted the request but the profile is still there";
     return false;
 }
 

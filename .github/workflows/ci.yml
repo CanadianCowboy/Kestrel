@@ -321,12 +321,37 @@ jobs:
       # here against a config carrying the exact key that got this wrong, and
       # it has to reject it. A validator that has only ever agreed with
       # everything is not evidence of anything.
+      #
+      # Three ways it has to say no, because the three fail differently. The
+      # first is a key in a plain mapping, which is the one this check was
+      # written for. The second is a key inside a list entry, which the walk
+      # skipped entirely until it was taught about `items` -- a path_instructions
+      # entry is nine lines of prose per key and the most likely place in the
+      # whole file to misspell something. The third is a key that simply
+      # appears twice: PyYAML keeps the last one and says nothing, so a
+      # duplicated block validates clean while half of it does nothing.
       - name: The check can still fail
         run: |
           sed 's/^    resolve_merge_conflict:/    resolve_merge_conflicts:/' \
-            .coderabbit.yaml > bad.yaml
-          if python scripts/validate_coderabbit_config.py --config bad.yaml; then
+            .coderabbit.yaml > bad-key.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-key.yaml; then
             echo "::error::the schema check accepted a key CodeRabbit does not have"
             exit 1
           fi
-          echo "rejected as it should"
+          echo "rejected a key it does not have"
+
+          sed 's/^      instructions: |/      instruction: |/' \
+            .coderabbit.yaml > bad-list-entry.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-list-entry.yaml; then
+            echo "::error::the schema check skipped the inside of a list entry"
+            exit 1
+          fi
+          echo "rejected a misspelt key inside a list entry"
+
+          { cat .coderabbit.yaml; printf '\nreviews:\n  profile: assertive\n'; } \
+            > bad-duplicate.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-duplicate.yaml; then
+            echo "::error::the schema check accepted a key written twice"
+            exit 1
+          fi
+          echo "rejected a key written twice"

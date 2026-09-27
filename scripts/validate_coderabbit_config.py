@@ -48,6 +48,40 @@ SCHEMA_URL = "https://coderabbit.ai/integrations/schema.v2.json"
 VENDORED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "coderabbit-schema.v2.json")
 
+# Defined only when PyYAML actually imported: the module sets `yaml` to None
+# above when it did not, and subclassing None would turn a missing dependency
+# into an ImportError at import time rather than the message main() prints.
+if yaml is not None:
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        """A SafeLoader that refuses a mapping that names the same key twice.
+
+        PyYAML's safe_load accepts a repeated key without a word and keeps only
+        the last value. Two `finishing_touches:` blocks, or `enabled` twice
+        under auto_review, therefore load as one block and this script reports
+        that every key is in the schema -- while the half that was dropped is
+        doing nothing at all. That is the exact failure this file was written
+        to catch, arriving through the one loader it was relying on.
+        """
+
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _value_node in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in seen
+                except TypeError:
+                    # An unhashable key is not a duplicate-key problem, and
+                    # failing to hash one is not this loader's to report.
+                    continue
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        "found the key %r a second time" % (key,),
+                        key_node.start_mark)
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
 
 def read_json(path):
     with open(path, "r", encoding="utf-8") as handle:
@@ -60,12 +94,21 @@ def fetch_schema():
 
 
 def refresh(path):
-    """Re-downloads the vendored schema. Only ever written when asked."""
+    """Re-downloads the vendored schema. Only ever written when asked.
+
+    The response is parsed before anything is written, not after. What comes
+    back can be an error page, a captive portal, or a body cut off halfway, and
+    writing first would leave the vendored schema holding that instead of a
+    schema -- after which every later run exits 2 until somebody restores the
+    file by hand. The vendored copy is the one thing that makes this check
+    hermetic, so corrupting it is the one failure this cannot recover from.
+    """
     with urllib.request.urlopen(SCHEMA_URL, timeout=30) as response:
         data = response.read()
+    schema = json.loads(data.decode("utf-8"))
     with open(path, "wb") as handle:
         handle.write(data)
-    return json.loads(data.decode("utf-8"))
+    return schema
 
 
 def child_schema(node, key):
@@ -100,11 +143,32 @@ def walk(value, schema, prefix, problems):
     an error to CodeRabbit, which reads it as absent. That is the whole reason
     this file exists, so it is also the one thing worth failing on.
 
-    Recursion stops at anything that is not a plain object with named
-    properties. That keeps a free-form map -- path_instructions and the like --
-    from being mistaken for a fixed set of keys.
+    Two shapes need handling that stopping at dicts does not give:
+
+    A list is walked through the schema's `items`, because that is where a JSON
+    Schema describes what an entry may contain. path_instructions has nine
+    entries in this repository and every one of them is a dict of named keys,
+    so without this a typo inside an entry is never looked at -- and an entry
+    is exactly where a misspelt key hides, because the key beside it is right.
+
+    A map the schema describes only through `additionalProperties` has no named
+    properties at all, and its keys are the data rather than settings:
+    mutually_exclusive_groups names its groups by whatever the author calls
+    them. Recursion stops there, because there is no list of legal names to
+    check them against, and reporting `risk` as an unknown setting would be
+    inventing a restriction the schema does not state.
     """
+    if isinstance(value, list):
+        items = schema.get("items") if isinstance(schema, dict) else None
+        if isinstance(items, dict):
+            for index, element in enumerate(value):
+                walk(element, items, "%s[%d]" % (prefix, index), problems)
+        return
     if not isinstance(value, dict):
+        return
+    if (isinstance(schema, dict) and "properties" not in schema
+            and not any(combiners in schema
+                        for combiners in ("oneOf", "anyOf", "allOf"))):
         return
     for key, child in value.items():
         path = "%s.%s" % (prefix, key) if prefix else key
@@ -159,7 +223,10 @@ def main():
 
     try:
         with open(args.config, "r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
+            # UniqueKeyLoader, not safe_load: a repeated key is silently
+            # dropped by the plain loader, and this is the check that is
+            # supposed to notice a setting that quietly stops applying.
+            config = yaml.load(handle, Loader=UniqueKeyLoader)
     except Exception as exc:  # noqa: BLE001
         print("could not read %s: %s" % (args.config, exc))
         return 2

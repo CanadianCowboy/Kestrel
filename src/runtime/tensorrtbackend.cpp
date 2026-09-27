@@ -1,5 +1,7 @@
 #include "runtime/tensorrtbackend.h"
 
+#include "core/pathtext.h"
+
 #include <filesystem>
 #include <utility>
 
@@ -13,7 +15,9 @@ namespace {
 
 std::string modelDisplayName(const std::string& modelPath) {
     const std::filesystem::path path(modelPath);
-    return path.has_filename() ? path.filename().string() : modelPath;
+    // core::pathText rather than filename().string(): a model file under a user
+    // name the ANSI code page cannot spell throws from string() on Windows.
+    return path.has_filename() ? core::pathText(path.filename()) : modelPath;
 }
 
 } // namespace

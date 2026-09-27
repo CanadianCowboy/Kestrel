@@ -100,6 +100,8 @@ endif()
 add_library(kestrel_core
     src/core/conversation.cpp
     src/core/conversation.h
+    src/core/pathtext.cpp
+    src/core/pathtext.h
     src/core/voicesession.cpp
     src/core/voicesession.h
     src/runtime/cudadevice.cpp
@@ -127,6 +129,8 @@ add_library(kestrel_core
     src/storage/profile.cpp
     src/storage/profile.h
     src/storage/secretstore.h
+    src/storage/secretsearch.cpp
+    src/storage/secretsearch.h
     src/storage/secretstore_memory.cpp
     src/storage/sha256.cpp
     src/storage/sha256.h
@@ -335,6 +339,28 @@ if(KESTREL_BUILD_UI)
                             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
                             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_kestrel_qt_prefix}/bin")
                     endforeach()
+                    # kestrel_app_tests links kestrel_core, and kestrel_core links
+                    # CUDA::cudart when CUDA is enabled, so this binary carries
+                    # the cudart dependency too and needs its bin directory on
+                    # PATH for the same reason the non-Qt tests get one further
+                    # down. The Qt fix-up above gives it the Qt directory only.
+                    #
+                    # Set here rather than by adding the name to that list further
+                    # down, because CMake treats a property set on a test that was
+                    # never defined as a configuration error rather than ignoring
+                    # it -- and this test does not exist in a build without Qt. Up
+                    # here the test is known to exist, and this is the only place
+                    # it is.
+                    #
+                    # ENVIRONMENT_MODIFICATION is replaced, not appended to, so
+                    # the Qt entry has to be restated alongside the CUDA one.
+                    # kestrel_qml_tests is deliberately left out: it links no
+                    # kestrel_core and so has no cudart to resolve.
+                    if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND)
+                        set_tests_properties(kestrel_app_tests PROPERTIES
+                            ENVIRONMENT_MODIFICATION
+                                "PATH=path_list_prepend:${_kestrel_qt_prefix}/bin;PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
+                    endif()
                 endif()
             endif()
         endif()
@@ -414,6 +440,15 @@ if(KESTREL_BUILD_TESTS)
     target_link_libraries(kestrel_profile_tests PRIVATE kestrel_core)
     add_test(NAME kestrel_profile_tests COMMAND kestrel_profile_tests)
 
+    # The secret store's report parser, tested as text in and text out so that
+    # it needs neither libsecret nor a keyring and runs on every platform. The
+    # Linux backend is the only caller, and it is only compiled on Linux, so a
+    # test that reached through the backend would only ever run on one of the
+    # three CI machines.
+    add_executable(kestrel_secretsearch_tests tests/secretsearch_tests.cpp)
+    target_link_libraries(kestrel_secretsearch_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_secretsearch_tests COMMAND kestrel_secretsearch_tests)
+
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
     # implicitly on Windows.
@@ -429,7 +464,8 @@ if(KESTREL_BUILD_TESTS)
                 kestrel_runtime_tests
                 kestrel_storage_tests
                 kestrel_json_tests
-                kestrel_profile_tests)
+                kestrel_profile_tests
+                kestrel_secretsearch_tests)
             set_tests_properties(${_kestrel_cuda_test} PROPERTIES
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
         endforeach()

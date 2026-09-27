@@ -24,6 +24,19 @@ void check(bool condition, const std::string& what) {
     ++g_failures;
 }
 
+// A document carrying the checksum its own body implies.
+//
+// fromJson compares the checksum before it reads anything else, so a document
+// written any other way is refused at the integrity check and never reaches the
+// field the case was written about. `body` is the document as fromJson will see
+// it once the checksum is erased, which is the exact text it re-serialises and
+// compares against.
+std::string documentWithChecksumOf(const std::string& body) {
+    const std::string fields = body.substr(1, body.size() - 2);
+    return "{" + (fields.empty() ? "" : fields + ",") + R"("checksum":")" +
+           Profile::checksumOf(body) + "\"}";
+}
+
 // A message containing an accented letter, an apostrophe, an emoji and a bell
 // character. Every one of those has broken a JSON writer at some point, and the
 // emoji is the one that breaks a truncating writer, because it is three bytes.
@@ -198,15 +211,22 @@ void testAnOlderDocumentStillLoads() {
 
 void testMalformedAndMistypedDocumentsAreRefused() {
     struct Case {
-        const char* document;
+        std::string document;
         const char* because;
+        const char* expectedError;
     };
+    // Each case names the error it is about, not merely that there was one. A
+    // refusal on the wrong grounds is a passing test for a document nobody can
+    // load, so a case that only checked "something was refused" would keep
+    // passing with the check it was written for deleted outright.
     const std::vector<Case> cases = {
-        {"not json at all", "text that is not a document"},
-        {"[]", "a list where a document belongs"},
-        {R"({"version":"one","checksum":"x"})", "a version that is not a number"},
-        {R"({"checksum":"x"})", "no version at all"},
-        {R"({"version":1,"checksum":5})", "a checksum that is not text"},
+        {"not json at all", "text that is not a document", "could not be read"},
+        {"[]", "a list where a document belongs", "is not a document"},
+        {documentWithChecksumOf(R"({"version":"one"})"), "a version that is not a number",
+         "version is not a number"},
+        {documentWithChecksumOf("{}"), "no version at all", "carries no version"},
+        {R"({"version":1,"checksum":5})", "a checksum that is not text",
+         "checksum is not text"},
     };
     for (const Case& one : cases) {
         Profile loaded;
@@ -214,7 +234,9 @@ void testMalformedAndMistypedDocumentsAreRefused() {
         std::string error;
         check(!Profile::fromJson(one.document, loaded, error),
               std::string("refused: ") + one.because);
-        check(!error.empty(), std::string("and says why: ") + one.because);
+        check(error.find(one.expectedError) != std::string::npos,
+              std::string("for its own reason, not another: ") + one.because +
+                  " (it said: " + error + ")");
         check(loaded.empty(), std::string("and leaves nothing behind: ") + one.because);
     }
 }
