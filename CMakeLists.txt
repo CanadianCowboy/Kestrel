@@ -309,9 +309,15 @@ if(KESTREL_BUILD_UI)
         # executable inside kestrel.app/Contents/MacOS puts it somewhere the
         # generated module never goes.
         #
-        # Ignored on Windows and Linux, so this line changes nothing for the
-        # other two desktop jobs.
-        qt_add_executable(kestrel MACOSX_BUNDLE
+        # WIN32 puts the Windows build in the GUI subsystem, which is what
+        # stops a console window opening behind the app when a user
+        # double-clicks it. The report this app can print at launch then has
+        # nowhere to write, so main() borrows the launching console when it is
+        # asked to report -- see attachToLaunchConsole() there.
+        #
+        # Each is ignored on the other platforms, so neither line changes
+        # anything for the desktop jobs that do not need it.
+        qt_add_executable(kestrel MACOSX_BUNDLE WIN32
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h

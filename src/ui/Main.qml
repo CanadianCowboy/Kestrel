@@ -463,12 +463,12 @@ ApplicationWindow {
                                 font.pixelSize: 11
                                 font.italic: true
                             }
-                        }
+                        }                            Item {
+                                id: composerDock
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: dictationLine.visible
+                                                      ? dictationLine.implicitHeight + 84 : 84
 
-                        Item {
-                            id: composerDock
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 84
 
                             // The breathing glow. Slow, wide, and close to
                             // invisible, so the field reads as alive rather than
@@ -488,6 +488,36 @@ ApplicationWindow {
                                     running: composerDock.visible
                                     easing.type: Easing.InOutSine
                                 }
+                            }
+
+                            // What dictation is doing, said where the user is
+                            // already looking. SAPI reports a finished phrase
+                            // rather than the words so far, so most of the time
+                            // this is the reason a microphone was pressed and
+                            // nothing else -- the words appear in the
+                            // transcript when the phrase lands.
+                            //
+                            // Shown only when there is something to say, so an
+                            // idle app is not carrying a status line for a
+                            // microphone nobody pressed.
+                            Text {
+                                id: dictationLine
+                                anchors.bottom: composerShell.top
+                                anchors.bottomMargin: 6
+                                anchors.left: composerShell.left
+                                anchors.right: composerShell.right
+                                anchors.leftMargin: 18
+                                visible: appController.listenError.length > 0
+                                         || appController.listening
+                                         || appController.partialTranscript.length > 0
+                                color: appController.listenError.length > 0 ? "#c98a8a" : window.muted
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                                text: appController.listenError.length > 0
+                                      ? appController.listenError
+                                      : (appController.partialTranscript.length > 0
+                                         ? appController.partialTranscript
+                                         : "Listening...")
                             }
 
                             // The audio-reactive ring. Only alive while Kestrel
@@ -547,6 +577,36 @@ ApplicationWindow {
                                                 text = ""
                                                 event.accepted = true
                                             }
+                                        }
+                                    }
+                                    // Dictation. Always offered rather than shown
+                                    // only on a machine with a microphone, because
+                                    // on a machine without one the button still
+                                    // answers: sttDetail says why, which is more
+                                    // use than a control that is mysteriously
+                                    // absent.
+                                    Button {
+                                        id: micButton
+                                        implicitWidth: 44
+                                        implicitHeight: 44
+                                        text: appController.listening ? "■" : "🎤"
+                                        onClicked: {
+                                            if (appController.listening)
+                                                appController.stopListening()
+                                            else
+                                                appController.startListening()
+                                        }
+                                        contentItem: Text {
+                                            text: micButton.text
+                                            color: appController.listening ? window.accent : window.ink
+                                            font.pixelSize: 15
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+                                        background: Rectangle {
+                                            radius: 13
+                                            color: appController.listening ? "#2a2f28" : "#232830"
+                                            border.color: appController.listening ? window.accent : window.line
                                         }
                                     }
                                     Button {

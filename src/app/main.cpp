@@ -1,5 +1,8 @@
 #include <QGuiApplication>
 #include <QEventLoop>
+#include <QImage>
+#include <QQuickItem>
+#include <QQuickItemGrabResult>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -11,7 +14,46 @@
 #include "app/appcontroller.h"
 #include "runtime/backendregistry.h"
 
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 namespace {
+
+#ifdef _WIN32
+// Points the C streams at the console that launched us, if they have nowhere
+// to go already.
+//
+// The executable is built for the GUI subsystem, which is the whole reason a
+// user double-clicking it does not get a black terminal window behind the app.
+// The cost of that is that a process with no console of its own can have an
+// invalid stdout, and --print-runtime is only worth having if its output can be
+// read.
+//
+// The existing handle is checked first and left alone when it is good, which is
+// the case that matters most: a launch that redirects stdout to a pipe or a
+// file already works, and re-opening it onto the console tears that redirect
+// loose and prints the report somewhere nobody is reading. Attaching rather
+// than allocating a console keeps the same property -- a redirected launch has
+// no parent console to attach to, and adding one would only give the report
+// somewhere to go that it was not going before.
+void attachToLaunchConsole() {
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out != nullptr && out != INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        return;
+    }
+    // A failure here means the console is attached but the stream is already
+    // usable, which is the normal case for a redirected launch, so there is
+    // nothing to report and nothing to do about it.
+    static_cast<void>(freopen("CONOUT$", "w", stdout));
+    static_cast<void>(freopen("CONOUT$", "w", stderr));
+}
+#else
+void attachToLaunchConsole() {}
+#endif
 
 // Dumps runtime and device state, then exits without opening a window.
 //
@@ -223,6 +265,7 @@ int main(int argc, char* argv[]) {
     const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
     if (reportRuntime && modelArgument.isEmpty()) {
+        attachToLaunchConsole();
         return printRuntime(controller);
     }
     if (!modelArgument.isEmpty()) {
@@ -238,6 +281,7 @@ int main(int argc, char* argv[]) {
         });
     }
     if (reportRuntime) {
+        attachToLaunchConsole();
         return app.exec();
     }
 
@@ -266,7 +310,15 @@ int main(int argc, char* argv[]) {
     engine.loadFromModule(QStringLiteral("Kestrel"), QStringLiteral("Main"));
 
     if (engine.rootObjects().isEmpty()) {
-        QTextStream(stderr) << "Kestrel failed to load its QML scene.\n";
+        // No window exists, so this is the only place a reason can be given.
+        // It goes to the launching console if there is one -- a shell launch
+        // gets the full QML error -- and is otherwise lost, which is the same
+        // as every other silent start-up failure the platform hides. Putting a
+        // dialog here instead would mean linking QtWidgets, a whole module and
+        // its runtime, for a path that only runs on a broken build.
+        attachToLaunchConsole();
+        QTextStream(stderr) << "Kestrel failed to load its QML scene.\n"
+                            << "Run with QT_LOGGING_RULES='qt.qml.*=true' for the parse errors.\n";
         return 1;
     }
 
@@ -286,6 +338,20 @@ int main(int argc, char* argv[]) {
     // happened in it, so capturing the app doing its actual job -- a
     // conversation on screen, with bubbles sized and wrapped -- needs to wait
     // for the model rather than guess. Default unchanged.
+    //
+    // The capture goes through the root item rather than QQuickWindow's own
+    // grabWindow(). grabWindow() renders through the window's surface, and the
+    // offscreen platform has no swap chain to render into, so it does not
+    // return there. An item grab goes through the scene graph's own image path,
+    // which works on every platform, display-less included.
+    //
+    // The quit is armed rather than immediate because an item grab is
+    // asynchronous, and the deadline is the second failure this mode had: a
+    // capture that never arrives must end in a process that exits rather than
+    // one that sits there holding a model load open. Qt's own way of failing
+    // here is not an exit at all -- with no platform plugin it puts up a modal
+    // dialog -- so the packaging step copies the offscreen plugin and says so
+    // if it cannot.
     const QString screenshotPath = qEnvironmentVariable("KESTREL_SCREENSHOT");
     if (!screenshotPath.isEmpty()) {
         // qEnvironmentVariableIntValue's second parameter is a bool* for
@@ -293,13 +359,25 @@ int main(int argc, char* argv[]) {
         bool delayGiven = false;
         const int requested = qEnvironmentVariableIntValue("KESTREL_SCREENSHOT_DELAY_MS", &delayGiven);
         const int delayMs = delayGiven ? requested : 1600;
+        auto* watchdog = new QTimer(&app);
+        watchdog->setSingleShot(true);
+        QObject::connect(watchdog, &QTimer::timeout, &app, &QGuiApplication::quit);
+        watchdog->start(delayMs + 15000);
         QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath] {
-            if (auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0))) {
-                if (!window->grabWindow().save(screenshotPath)) {
-                    QTextStream(stderr) << "Kestrel could not write " << screenshotPath << "\n";
-                }
+            auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0));
+            if (window == nullptr || window->contentItem() == nullptr) {
+                app.quit();
+                return;
             }
-            app.quit();
+            const QSharedPointer<QQuickItemGrabResult> grab = window->contentItem()->grabToImage();
+            QObject::connect(grab.data(), &QQuickItemGrabResult::ready, &app,
+                             [grab, screenshotPath] {
+                                 const QImage image = grab->image();
+                                 if (image.isNull() || !image.save(screenshotPath)) {
+                                     QTextStream(stderr) << "Kestrel could not write " << screenshotPath << "\n";
+                                 }
+                                 QGuiApplication::quit();
+                             });
         });
     }
 
