@@ -217,10 +217,16 @@ public:
             unavailableReason = "the keyring did not accept a test value: " + error;
             return false;
         }
-        // The probe is thrown away either way; a keyring that will not release
-        // it was already reported above.
-        std::string ignored;
-        forgetViaTool("probe", "com.kestrel.probe", ignored);
+        // The probe has to come back out again, and a keyring that will accept
+        // a write but refuse a delete is not a keyring this store can use: the
+        // probe would sit there for the life of the process, and "forget
+        // everything" would leave it behind.
+        std::string cleanupError;
+        if (!forgetViaTool("probe", "com.kestrel.probe", cleanupError)) {
+            unavailableReason =
+                "the keyring accepted the test value but would not remove it: " + cleanupError;
+            return false;
+        }
         return true;
     }
 

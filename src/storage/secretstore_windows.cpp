@@ -123,7 +123,15 @@ public:
             unavailableReason = error;
             return false;
         }
-        removeBlob("com.kestrel.probe", "probe", error);
+        // The probe has to come back out again. A failure here is not cosmetic:
+        // it means the directory accepts a write and refuses a delete, which is
+        // the state where "forget everything" would leave the probe behind.
+        std::string cleanupError;
+        if (!removeBlob("com.kestrel.probe", "probe", cleanupError)) {
+            unavailableReason =
+                "the keystore accepted the test value but would not remove it: " + cleanupError;
+            return false;
+        }
         return true;
     }
 
