@@ -88,6 +88,12 @@ endif()
 add_library(kestrel_core
     src/core/conversation.cpp
     src/core/conversation.h
+    src/core/persona.cpp
+    src/core/persona.h
+    src/core/presence.cpp
+    src/core/presence.h
+    src/core/idlepersona.cpp
+    src/core/idlepersona.h
     src/core/voicesession.cpp
     src/core/voicesession.h
     src/runtime/cudadevice.cpp
@@ -111,11 +117,22 @@ add_library(kestrel_core
 target_include_directories(kestrel_core PUBLIC src)
 target_compile_features(kestrel_core PUBLIC cxx_std_20)
 
+# Strict compile settings, shared by the portable library and the tests that
+# cover it. Sharing them is not tidiness: a test compiled more leniently than
+# the code it checks can pass against a translation unit the shipping target
+# would not build.
+#
+# /utf-8 is part of that contract rather than a nicety. The personality layer
+# spells out the punctuation it emits (an ellipsis, a middot) as real
+# characters, and those strings cross into a UTF-8 UI. Without the flag MSVC
+# decodes such literals in the machine's code page and ships mangled text.
 if(MSVC)
-    target_compile_options(kestrel_core PRIVATE /W4 /permissive-)
+    set(KESTREL_STRICT_FLAGS /W4 /permissive- /utf-8)
 else()
-    target_compile_options(kestrel_core PRIVATE -Wall -Wextra -Wpedantic)
+    set(KESTREL_STRICT_FLAGS -Wall -Wextra -Wpedantic)
 endif()
+
+target_compile_options(kestrel_core PRIVATE ${KESTREL_STRICT_FLAGS})
 
 if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND)
     target_link_libraries(kestrel_core PRIVATE CUDA::cudart)
@@ -224,6 +241,7 @@ if(KESTREL_BUILD_UI)
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
             target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui)
+            target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
 
             # A Qt-linked test needs Qt's DLLs resolvable at run time. CMake does
@@ -275,10 +293,12 @@ endif()
 if(KESTREL_BUILD_TESTS)
     add_executable(kestrel_core_tests tests/core_tests.cpp)
     target_link_libraries(kestrel_core_tests PRIVATE kestrel_core)
+    target_compile_options(kestrel_core_tests PRIVATE ${KESTREL_STRICT_FLAGS})
     add_test(NAME kestrel_core_tests COMMAND kestrel_core_tests)
 
     add_executable(kestrel_runtime_tests tests/runtime_tests.cpp)
     target_link_libraries(kestrel_runtime_tests PRIVATE kestrel_core)
+    target_compile_options(kestrel_runtime_tests PRIVATE ${KESTREL_STRICT_FLAGS})
     add_test(NAME kestrel_runtime_tests COMMAND kestrel_runtime_tests)
 
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has

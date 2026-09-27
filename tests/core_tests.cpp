@@ -1,4 +1,7 @@
 #include "core/conversation.h"
+#include "core/idlepersona.h"
+#include "core/persona.h"
+#include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/mockbackend.h"
 
@@ -358,6 +361,495 @@ void testInvariantsAndBounds() {
     assert(session.beginGeneration(core::ResponseId{9999}) == core::kInvalidGenerationId);
 }
 
+// --- Personality layer -------------------------------------------------------
+
+// The presence line is the whole persona as far as the model is concerned, and
+// it is the one part of the prompt the backend keeps cached. So it has to be
+// derived from the fixed tone profile and nothing that moves.
+void testPersonaPresenceLineIsStable() {
+    core::Persona persona;
+    const std::string line = persona.presenceLine();
+    assert(line.find("You are Kestrel") != std::string::npos);
+    assert(line.find("calm") != std::string::npos);
+    assert(persona.systemPromptFragment() == line);
+
+    persona.drift(0.4F, 0.4F, 0.4F, -0.4F, 0.4F);
+    assert(persona.presenceLine() == line);
+
+    core::ToneProfile wry;
+    wry.wry = true;
+    persona.setTone(wry);
+    assert(persona.presenceLine() != line);
+    assert(persona.presenceLine().find("wit") != std::string::npos);
+    assert(persona.tone().wry);
+}
+
+void testPersonaDialsStayInRange() {
+    core::Persona persona;
+    persona.drift(5.0F, 5.0F, 5.0F, 5.0F, 5.0F);
+    assert(persona.state().focus == 1.0F);
+    persona.drift(-5.0F, -5.0F, -5.0F, -5.0F, -5.0F);
+    assert(persona.state().calmness == 0.0F);
+
+    core::PersonaState wild;
+    wild.focus = 4.0F;
+    wild.curiosity = -3.0F;
+    persona.setState(wild);
+    assert(persona.state().focus == 1.0F);
+    assert(persona.state().curiosity == 0.0F);
+
+    // The mood label is a shared decision: the same dials must read the same way
+    // to the persona, the presence engine, and the idle loop.
+    assert(core::moodFor(persona.state()) == persona.mood());
+    assert(core::toString(core::PersonaMood::Contemplative) == std::string("contemplative"));
+}
+
+void testPersonaAcknowledgementRotates() {
+    core::Persona persona;
+    std::vector<std::string> cues;
+    for (int i = 0; i < 4; ++i) {
+        cues.push_back(persona.acknowledgement());
+        assert(!cues.back().empty());
+    }
+    for (std::size_t i = 0; i < cues.size(); ++i) {
+        for (std::size_t j = i + 1; j < cues.size(); ++j) {
+            assert(cues[i] != cues[j]);
+        }
+    }
+    assert(persona.sequence() == 4);
+    // Rotation rather than a random draw, so the cycle is reproducible.
+    assert(persona.acknowledgement() == cues.front());
+    assert(persona.acknowledgementPauseMs() > 0);
+}
+
+void testPersonaAnticipation() {
+    core::Persona persona;
+
+    const auto offer = persona.react(core::PersonaTrigger::LongResponse);
+    assert(offer.has_value());
+    assert(offer->kind == core::AnticipationKind::OfferContinue);
+    assert(offer->text == "Would you like me to continue?");
+
+    const auto correction = persona.react(core::PersonaTrigger::UserCorrection);
+    assert(correction.has_value());
+    assert(correction->kind == core::AnticipationKind::AcknowledgeCorrection);
+
+    const auto done = persona.react(core::PersonaTrigger::TaskCompleted);
+    assert(done.has_value());
+    assert(done->text == "Task complete.");
+
+    const auto back = persona.react(core::PersonaTrigger::UserReturned);
+    assert(back.has_value());
+    assert(back->kind == core::AnticipationKind::ReadyWhenYouAre);
+
+    // An ordinary short answer only earns a closing prompt from an assistant
+    // with the initiative to mean it.
+    assert(!persona.react(core::PersonaTrigger::TurnCompleted).has_value());
+    persona.drift(0.0F, 0.0F, 0.2F, 0.0F, 0.0F);
+    assert(persona.react(core::PersonaTrigger::TurnCompleted).has_value());
+
+    // States the UI already shows are not repeated as a line.
+    assert(!persona.react(core::PersonaTrigger::UserPaused).has_value());
+    assert(!persona.react(core::PersonaTrigger::UserResumed).has_value());
+    assert(!persona.react(core::PersonaTrigger::UserInterruption).has_value());
+
+    core::ToneProfile plain;
+    plain.anticipatory = false;
+    persona.setTone(plain);
+    assert(!persona.react(core::PersonaTrigger::LongResponse).has_value());
+}
+
+void testPersonaStatusWhispers() {
+    core::Persona persona;
+    assert(persona.statusWhisper(core::PersonaActivity::StandingBy) == "Standing by\u2026");
+    assert(persona.statusWhisper(core::PersonaActivity::Listening) == "Listening\u2026");
+    assert(persona.statusWhisper(core::PersonaActivity::Thinking) == "Thinking\u2026");
+    assert(persona.statusWhisper(core::PersonaActivity::Speaking) == "Speaking\u2026");
+    assert(persona.statusWhisper(core::PersonaActivity::Reflecting) == "Reflecting\u2026");
+    assert(persona.statusWhisper(core::PersonaActivity::Preparing)
+           == "Preparing response\u2026");
+}
+
+// Per-session continuity. Not storage: nothing is written anywhere, and the
+// point is that the idle loop and the greeting have something concrete to refer
+// to instead of inventing context.
+void testPersonaSessionTopic() {
+    core::Persona persona;
+    assert(persona.sessionTopic().empty());
+    assert(persona.turnCount() == 0);
+
+    persona.noteUserMessage("How do I configure the TensorRT backend?");
+    assert(persona.turnCount() == 1);
+    const std::string topic = persona.sessionTopic();
+    assert(topic.find("tensorrt") != std::string::npos);
+    assert(topic.find("backend") != std::string::npos);
+    assert(topic.find("the") == std::string::npos);
+
+    for (int i = 0; i < 8; ++i) {
+        persona.noteUserMessage("another question about caching");
+    }
+    const std::string later = persona.sessionTopic();
+    assert(later.find("tensorrt") == std::string::npos);
+    assert(later.find("caching") != std::string::npos);
+
+    // A blank message is still a turn, it just contributes no topic.
+    persona.noteUserMessage("   ");
+    assert(persona.turnCount() == 10);
+}
+
+// --- Idle loop ---------------------------------------------------------------
+
+void testIdleStaysSilentWhileTheUserIsPresent() {
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+
+    core::IdleGate gate;
+    gate.generating = true;
+    idle.setGate(gate);
+    assert(!idle.tick(0).produced);
+    // Even after a long silence, while the gate says someone is here.
+    assert(!idle.tick(600000).produced);
+    assert(idle.cycles() == 0);
+    assert(idle.history().empty());
+
+    gate.generating = false;
+    gate.voiceActive = true;
+    idle.setGate(gate);
+    assert(!idle.tick(900000).produced);
+
+    gate.voiceActive = false;
+    gate.userInputPending = true;
+    idle.setGate(gate);
+    assert(!idle.tick(1200000).produced);
+    assert(idle.cycles() == 0);
+}
+
+void testIdleDefaultPolicyIsLocalOnly() {
+    core::IdlePolicy policy;
+    // Everything that is just a string is allowed; the one capability that
+    // leaves pure computation is not.
+    assert(policy.permittedCount() == 6);
+    assert(!policy.permits(core::IdleTaskKind::ModelWarmup));
+    assert(policy.permits(core::IdleTaskKind::SelfReflection));
+    assert(policy.permits(core::IdleTaskKind::AmbientWhisper));
+    assert(policy.permits(core::IdleTaskKind::ContextReindex));
+    assert(policy.permits(core::IdleTaskKind::CacheAudit));
+    assert(policy.permits(core::IdleTaskKind::CreativeThought));
+    assert(policy.permits(core::IdleTaskKind::GreetingPrep));
+
+    // And a policy that grants nothing produces nothing, forever. This is the
+    // state a caller reaches by switching every capability off, and it is the
+    // assertion that the boundary is real rather than advisory.
+    core::IdlePolicy none;
+    none.allowSelfReflection = false;
+    none.allowAmbientWhisper = false;
+    none.allowContextReindex = false;
+    none.allowCacheAudit = false;
+    none.allowCreativeThoughts = false;
+    none.allowGreetingPrep = false;
+    none.allowModelWarmup = false;
+    assert(none.permittedCount() == 0);
+
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+    idle.setPolicy(none);
+    assert(!idle.tick(1).produced);
+    assert(!idle.tick(500000).produced);
+    assert(idle.cycles() == 0);
+}
+
+void testIdleOnlyProducesPermittedWork() {
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+
+    core::IdlePolicy policy;
+    policy.allowCreativeThoughts = false;
+    policy.allowGreetingPrep = false;
+    policy.allowCacheAudit = false;
+    policy.allowModelWarmup = false;
+    idle.setPolicy(policy);
+    idle.setTopic("tensorrt");
+
+    std::uint64_t now = 1000;
+    static_cast<void>(idle.tick(now)); // anchors the clock
+    int produced = 0;
+    for (int i = 0; i < 40; ++i) {
+        now += 20000;
+        const core::IdleTick tick = idle.tick(now);
+        if (!tick.produced) {
+            continue;
+        }
+        ++produced;
+        assert(idle.policy().permits(tick.task.kind));
+        assert(tick.task.kind == core::IdleTaskKind::SelfReflection
+               || tick.task.kind == core::IdleTaskKind::AmbientWhisper
+               || tick.task.kind == core::IdleTaskKind::ContextReindex);
+        assert(!tick.task.detail.empty());
+        // Only the whisper is meant for the interface; thoughts stay internal.
+        if (tick.task.kind == core::IdleTaskKind::AmbientWhisper) {
+            assert(!tick.whisper.empty() && tick.thought.empty());
+        }
+    }
+    assert(produced > 0);
+    assert(idle.cycles() == static_cast<std::size_t>(produced));
+    // Bounded: a process left running for a week holds the same handful.
+    assert(idle.history().size() <= 16);
+    assert(idle.nextTickAt() != 0);
+}
+
+void testIdleDriftsDialsButNeverRamps() {
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+    idle.setIntervalMs(100);
+    idle.setQuietPeriodMs(100);
+    static_cast<void>(idle.tick(0)); // anchors the clock
+
+    const float curiosityBefore = persona.state().curiosity;
+    std::uint64_t now = 0;
+    for (int i = 0; i < 800; ++i) {
+        now += 1000;
+        static_cast<void>(idle.tick(now));
+    }
+    const core::PersonaState& state = persona.state();
+    for (const float dial : {state.focus, state.curiosity, state.initiative,
+                             state.calmness, state.presenceIntensity}) {
+        assert(dial >= 0.05F && dial <= 0.95F);
+    }
+    // The decay has to win over the bumps. An assistant that only ever gained
+    // curiosity and initiative would, given enough idle time, become someone
+    // nobody wants to talk to.
+    assert(state.curiosity <= curiosityBefore);
+    // One set of numbers, two readers: the loop and the persona cannot drift
+    // apart because there is only one copy.
+    assert(&idle.state() == &persona.state());
+}
+
+void testIdleGreetsOncePerAbsence() {
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+
+    core::IdlePolicy greetings;
+    greetings.allowSelfReflection = false;
+    greetings.allowAmbientWhisper = false;
+    greetings.allowContextReindex = false;
+    greetings.allowCacheAudit = false;
+    greetings.allowCreativeThoughts = false;
+    idle.setPolicy(greetings);
+    idle.setTopic("tensorrt");
+
+    static_cast<void>(idle.tick(0));    // anchors the clock
+    assert(!idle.tick(1000).produced);   // still inside the quiet period
+    assert(idle.tick(7000).produced);
+    assert(idle.hasGreeting());
+    assert(idle.history().back().detail.find("tensorrt") != std::string::npos);
+
+    // A greeting waits for a real absence, not just any idle moment.
+    assert(!idle.userReturned(20000, 45000));
+    assert(idle.userReturned(60000, 45000));
+
+    const std::string greeting = idle.takeGreeting();
+    assert(!greeting.empty());
+    assert(!idle.hasGreeting());
+    // Once per absence. Every tick after this staying silent is what makes the
+    // greeting feel like it noticed rather than nagged.
+    assert(idle.takeGreeting().empty());
+    assert(!idle.userReturned(61000, 45000));
+
+    // And a second one is not even prepared while the absence is unended.
+    std::uint64_t later = 61000;
+    for (int i = 0; i < 6; ++i) {
+        later += 20000;
+        static_cast<void>(idle.tick(later));
+    }
+    assert(!idle.hasGreeting());
+
+    // Activity ends the absence, and the next one is greeted again.
+    idle.noteActivity(70000);
+    assert(!idle.userReturned(70000, 45000));
+    assert(idle.idleForMs(70000) == 0);
+}
+
+void testIdleStopsWhenDisabled() {
+    core::Persona persona;
+    core::IdlePersona idle(persona);
+    idle.setEnabled(false);
+    assert(!idle.enabled());
+    assert(!idle.tick(0).produced);
+    assert(!idle.tick(900000).produced);
+    assert(!idle.userReturned(900000, 1));
+    assert(idle.cycles() == 0);
+}
+
+// --- Presence engine ---------------------------------------------------------
+
+void testPresenceTracksMeaning() {
+    core::Presence presence;
+    presence.setNow(1000);
+    assert(!presence.speaking());
+    assert(!presence.busy());
+    assert(presence.activity() == core::PersonaActivity::StandingBy);
+
+    presence.noteUserAction(core::UserAction::Typed);
+    assert(presence.snapshot().lastUserAction == core::UserAction::Typed);
+    assert(presence.snapshot().lastChangeMs == 1000);
+    // Repeating the same action is not a change, and must not fake one.
+    presence.setNow(1200);
+    presence.noteUserAction(core::UserAction::Typed);
+    assert(presence.snapshot().lastChangeMs == 1000);
+
+    presence.noteAssistantAction(core::AssistantAction::Thinking);
+    presence.setVoiceState(core::ResponseState::Speaking);
+    assert(presence.speaking());
+    assert(presence.activity() == core::PersonaActivity::Thinking);
+    assert(presence.snapshot().voiceState == core::ResponseState::Speaking);
+
+    // Easing needs time to have passed, or there is nothing to ease from.
+    const float before = presence.intensity();
+    presence.setNow(2000);
+    const float after = presence.advance();
+    assert(after > before);
+    const float sameInstant = presence.advance();
+    assert(sameInstant == after);
+    presence.setNow(1000000);
+    const float jumped = presence.advance();
+    assert(jumped >= 0.0F && jumped <= 1.0F);
+
+    // A clock that goes backwards must not fling the animation backwards.
+    presence.setNow(10);
+    assert(presence.advance() >= 0.0F);
+
+    presence.setGenerating(true);
+    assert(presence.busy());
+    assert(presence.snapshot().flags.busy);
+
+    // A drifting dial must not stomp on the fact that a turn is running: busy
+    // is a fact about the generation, not a feeling.
+    core::PersonaState state;
+    state.calmness = 0.9F;
+    state.initiative = 0.2F;
+    presence.applyPersona(state);
+    assert(presence.snapshot().flags.busy);
+    assert(presence.snapshot().flags.calm);
+    assert(!presence.snapshot().flags.proactive);
+    assert(presence.snapshot().mood == core::PersonaMood::Calm);
+}
+
+// --- Voice pacing ------------------------------------------------------------
+
+void testSpeechPlanningClausesAndPauses() {
+    const core::VoicePersona& persona = core::defaultVoicePersona();
+    const std::string_view text = "Understood. I checked the cache and it is fine. All good!";
+    const std::vector<core::SpeechSegment> planned = core::planSpeech(text, persona, 220);
+
+    assert(planned.size() == 3);
+    assert(planned[0].isFirst);
+    assert(planned[0].text == "Understood.");
+    // The opening pause belongs to the first segment; a full stop earns the
+    // longer breath afterwards.
+    assert(planned[0].leadingPauseMs == 220);
+    assert(planned[1].leadingPauseMs == persona.sentencePauseMs);
+    assert(planned[2].leadingPauseMs == persona.sentencePauseMs);
+    // Segments never carry the whitespace between them, so the gap between one
+    // clause's end and the next clause's start has to be nothing but space.
+    for (std::size_t i = 1; i < planned.size(); ++i) {
+        assert(planned[i].startOffset >= planned[i - 1].endOffset);
+        const std::string_view gap = text.substr(planned[i - 1].endOffset,
+                                                 planned[i].startOffset - planned[i - 1].endOffset);
+        assert(gap.find_first_not_of(" \t\n\r") == std::string_view::npos);
+        assert(planned[i].text == text.substr(planned[i].startOffset,
+                                              planned[i].endOffset - planned[i].startOffset));
+    }
+
+    // A comma is a clause, not a sentence, and gets the shorter gap -- but only
+    // once the clause is long enough to be one.
+    const auto soft = core::planSpeech("This is a long first clause, and a second one follows.",
+                                       persona);
+    assert(soft.size() == 2);
+    assert(soft[0].text == "This is a long first clause,");
+    assert(soft[1].text == "and a second one follows.");
+    assert(soft[1].leadingPauseMs == persona.clausePauseMs);
+
+    // "Well, no" must not become two segments: a clause shorter than the
+    // minimum stays attached to what follows it.
+    const auto shortClause = core::planSpeech("Well, not at all today.", persona);
+    assert(shortClause.size() == 1);
+    assert(shortClause.front().text == "Well, not at all today.");
+
+    assert(core::planSpeech("", persona).empty());
+    assert(core::planSpeech("   ", persona).empty());
+}
+
+void testClauseStartBefore() {
+    const std::string_view sentence = "Hi. There.";
+    assert(core::clauseStartBefore(sentence, 0) == 0);
+    assert(core::clauseStartBefore(sentence, 5) == 4);
+
+    const std::string_view soft = "This is a long first clause, and a second one follows.";
+    assert(core::clauseStartBefore(soft, 40) == 29);
+    // Before the comma the whole thing is still one clause.
+    assert(core::clauseStartBefore(soft, 10) == 0);
+    assert(core::clauseStartBefore("", 5) == 0);
+    assert(core::clauseStartBefore("no terminator", 99) == 0);
+}
+
+// The reason speech can start before generation finishes: the first clause is
+// playable the moment those tokens exist, and the offsets it reports are
+// absolute so the spoken cursor can be advanced by exactly what was spoken.
+void testNextSpeechSegmentTracksTheSpokenCursor() {
+    core::VoiceSession session;
+    const core::ResponseId id = session.queueResponse();
+    const core::GenerationId generation = session.beginGeneration(id);
+    assert(session.appendText(id, generation, "Hi. There we go."));
+
+    const auto first = session.nextSpeechSegment(id, 220);
+    assert(first.has_value());
+    assert(first->text == "Hi.");
+    assert(first->isFirst);
+    assert(first->leadingPauseMs == 220);
+    assert(first->startOffset == 0);
+    assert(first->endOffset == 3);
+
+    assert(session.advancePlayback(id, first->endOffset));
+    const auto second = session.nextSpeechSegment(id);
+    assert(second.has_value());
+    assert(second->text == "There we go.");
+    // The cursor sat on the space, so the next clause begins past it, and its
+    // end lands exactly at the end of the generated text.
+    assert(second->startOffset == 4);
+    assert(second->endOffset == 16);
+    assert(second->leadingPauseMs == session.voicePersona().sentencePauseMs);
+
+    assert(session.advancePlayback(id, second->endOffset));
+    assert(!session.nextSpeechSegment(id).has_value());
+    assert(!session.nextSpeechSegment(9999).has_value());
+}
+
+void testVoicePersonaIsReplaceable() {
+    core::VoiceSession session;
+    assert(session.voicePersona().voiceId == core::defaultVoicePersona().voiceId);
+
+    core::VoicePersona brisk;
+    brisk.voiceId = "test-brisk";
+    brisk.rate = 1.2F;
+    brisk.clausePauseMs = 40;
+    brisk.sentencePauseMs = 90;
+    session.setVoicePersona(brisk);
+
+    const core::ResponseId id = session.queueResponse();
+    const core::GenerationId generation = session.beginGeneration(id);
+    assert(session.appendText(id, generation, "One. Two."));
+    const std::size_t eventsBefore = session.events().size();
+    const auto segment = session.nextSpeechSegment(id);
+    assert(segment.has_value());
+    assert(segment->leadingPauseMs == brisk.sentencePauseMs);
+
+    // A stricter voice is a pacing change only: asking what to say next is a
+    // question, not a transition, so the timeline and its event log are
+    // untouched until something is actually played.
+    assert(session.find(id)->state() == core::ResponseState::Generating);
+    assert(session.events().size() == eventsBefore);
+}
+
 void testSentenceStartBefore() {
     const std::string text = "Hello world. Second sentence here.";
     assert(core::sentenceStartBefore(text, 5) == 0);
@@ -386,5 +878,22 @@ int main() {
     testFailureRecovery();
     testInvariantsAndBounds();
     testSentenceStartBefore();
+    testPersonaPresenceLineIsStable();
+    testPersonaDialsStayInRange();
+    testPersonaAcknowledgementRotates();
+    testPersonaAnticipation();
+    testPersonaStatusWhispers();
+    testPersonaSessionTopic();
+    testIdleStaysSilentWhileTheUserIsPresent();
+    testIdleDefaultPolicyIsLocalOnly();
+    testIdleOnlyProducesPermittedWork();
+    testIdleDriftsDialsButNeverRamps();
+    testIdleGreetsOncePerAbsence();
+    testIdleStopsWhenDisabled();
+    testPresenceTracksMeaning();
+    testSpeechPlanningClausesAndPauses();
+    testClauseStartBefore();
+    testNextSpeechSegmentTracksTheSpokenCursor();
+    testVoicePersonaIsReplaceable();
     return 0;
 }

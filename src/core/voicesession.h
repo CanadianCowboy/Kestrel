@@ -65,6 +65,66 @@ struct InterruptionRecord {
 [[nodiscard]] const char* toString(ResponseState state) noexcept;
 [[nodiscard]] const char* toString(InterruptionIntent intent) noexcept;
 
+// How Kestrel sounds, and how it paces itself.
+//
+// TTS is not implemented yet, but these decisions belong here rather than in the
+// UI: a voice that clips its clauses together or hurries the first syllable is
+// a property of the response timeline, and the same decisions apply whether the
+// audio is synthesized locally or handed to a system voice later.
+struct VoicePersona {
+    // Identifies the intended voice to a synthesizer. Descriptive rather than a
+    // vendor voice name, so nothing here breaks when a platform is missing.
+    std::string voiceId = "kestrel-warm-neutral";
+    // 1.0 is the voice's natural pace; below is deliberate, unhurried.
+    float rate = 0.96F;
+    // Semitones. Neutral, because an assistant that sounds emphatic all the time
+    // sounds like it is only sometimes paying attention.
+    float pitch = 0.0F;
+    // 0 flat .. 1 warm. Drives the same knob whichever synthesizer is present.
+    float warmth = 0.6F;
+    // The gap before the very first clause.
+    int leadInMs = 90;
+    // Between clauses: after a comma, a list item, a "which" clause.
+    int clausePauseMs = 130;
+    // After a full stop. The difference between a clause and a sentence is most
+    // of what makes speech sound like a person rather than a document.
+    int sentencePauseMs = 300;
+};
+
+[[nodiscard]] const VoicePersona& defaultVoicePersona() noexcept;
+
+// One clause, ready to hand to a synthesizer.
+struct SpeechSegment {
+    std::string text;
+    // Offsets into the text this was planned from. Absolute in the response
+    // timeline when it came from VoiceSession::nextSpeechSegment, so playback
+    // can advance the spoken cursor by exactly what was spoken.
+    std::size_t startOffset = 0;
+    std::size_t endOffset = 0;
+    // The micro-pause that precedes this segment. Zero for the first one: there
+    // is nothing before it to leave a gap after.
+    int leadingPauseMs = 0;
+    bool isFirst = false;
+};
+
+// Returns the start offset of the clause containing `offset`, so playback cuts
+// on a clause boundary instead of mid-thought. Mirrors sentenceStartBefore at a
+// finer grain, and is what makes an interrupted reply resumable mid-paragraph.
+[[nodiscard]] std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcept;
+
+// The micro-pause that belongs after the clause ending at `clauseEnd`. Derived
+// from the punctuation there, so a comma and a full stop get different gaps.
+[[nodiscard]] int pauseAfterClause(std::string_view text, std::size_t clauseEnd,
+                                   const VoicePersona& persona) noexcept;
+
+// Splits text into clause-sized segments with the micro-pauses that belong
+// between them. `openingPauseMs` is applied to the first segment, which is how
+// an acknowledgement cue leaves a deliberate gap before the answer starts.
+[[nodiscard]] std::vector<SpeechSegment> planSpeech(
+    std::string_view text,
+    const VoicePersona& persona = defaultVoicePersona(),
+    int openingPauseMs = 0);
+
 // Returns the start offset of the sentence containing `offset`, so playback can
 // resume from a clean semantic boundary instead of mid-sentence.
 [[nodiscard]] std::size_t sentenceStartBefore(std::string_view text, std::size_t offset) noexcept;
@@ -162,6 +222,29 @@ public:
     bool cancel(ResponseId id);
     bool fail(ResponseId id, std::string error);
 
+    // Pacing for this session. Independent of the responses themselves, so the
+    // voice can be adjusted without disturbing the timeline.
+    void setVoicePersona(VoicePersona persona);
+    [[nodiscard]] const VoicePersona& voicePersona() const noexcept;
+
+    // The next unspoken clause of `id`, with the micro-pause that precedes it
+    // and absolute offsets into the response, so the caller can speak it and
+    // then advance the spoken cursor to exactly segment.endOffset.
+    //
+    // This is the whole reason speech can start before generation finishes: the
+    // first clause is playable the moment those tokens exist, so the reply is
+    // already audible while the rest is still being decoded.
+    //
+    // `openingPauseMs` overrides the gap before the clause. Leave it at zero for
+    // a continuation: the pause implied by whatever was last spoken is used
+    // instead, so a clause-by-clause caller does not have to track it. Pass a
+    // real value when something was said between the clauses -- an
+    // acknowledgement cue, most often.
+    //
+    // Returns nullopt when the response is fully spoken or does not exist.
+    [[nodiscard]] std::optional<SpeechSegment> nextSpeechSegment(ResponseId id,
+                                                                  int openingPauseMs = 0) const;
+
     [[nodiscard]] const VoiceResponse* find(ResponseId id) const noexcept;
     [[nodiscard]] ResponseId activeResponseId() const noexcept;
     [[nodiscard]] const std::vector<VoiceResponse>& responses() const noexcept { return m_responses; }
@@ -175,6 +258,7 @@ private:
 
     std::vector<VoiceResponse> m_responses;
     std::vector<VoiceEvent> m_events;
+    VoicePersona m_voicePersona = defaultVoicePersona();
     ResponseId m_nextResponseId = 1;
     GenerationId m_nextGenerationId = 1;
 };

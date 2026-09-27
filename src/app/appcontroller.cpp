@@ -45,6 +45,28 @@ constexpr int kBackendSwapTimeoutMs = 15000;
 // every token would flood the binding with updates faster than the UI repaints.
 constexpr qint64 kMetricsIntervalMs = 100;
 
+// How often the controller offers the idle loop a moment to think. The loop
+// decides whether it is this tick's turn; the timer only keeps time passing.
+constexpr int kIdleTickMs = 700;
+
+// How long Kestrel must be left alone before the loop starts, how long before
+// it is worth greeting someone back, and how long an anticipatory line holds
+// the status line before the activity whisper takes over. The last one is
+// generous because a line nobody had time to read is not a line.
+constexpr std::uint64_t kIdleQuietPeriodMs = 6000;
+constexpr std::uint64_t kReturnGreetingMs = 45000;
+constexpr qint64 kWhisperHoldMs = 9000;
+
+// Responses longer than this earn "Would you like me to continue?" rather than
+// a closing prompt, because at this size the answer really is unfinished.
+constexpr int kLongResponseChars = 420;
+
+// The prewarm request. One short, unremarkable generation whose tokens are
+// discarded: the point is that the weights and the KV cache are resident and
+// the clocks are up, not that anything was said.
+const QString kWarmupPrompt = QStringLiteral("Assistant: Ready.");
+constexpr int kWarmupMaxTokens = 8;
+
 QString deriveTitle(const QString& text) {
     const QString line = text.section(QLatin1Char('\n'), 0, 0).simplified();
     if (line.size() <= kTitleLimit) {
@@ -55,9 +77,12 @@ QString deriveTitle(const QString& text) {
 
 } // namespace
 
-/// Initializes preview mode, the default system prompt, a generation worker, and a conversation.
+/// Initializes preview mode, the persona-backed system prompt, a generation worker,
+/// the presence projection, the idle loop, and a conversation.
 AppController::AppController(QObject* parent)
-    : QObject(parent), m_backend(runtime::selectBackend(runtime::BackendKind::Mock)) {
+    : QObject(parent)
+    , m_backend(runtime::selectBackend(runtime::BackendKind::Mock))
+    , m_idle(m_persona) {
     m_messageModel = new MessageModel(this);
     m_conversationModel = new ConversationModel(&m_entries, this);
 
@@ -70,8 +95,12 @@ AppController::AppController(QObject* parent)
     m_generationThread.start();
 
     // Declare the shared prefix before any turn runs. The backend decodes it
-    // on the first generate() and keeps it from then on.
-    m_systemPrompt = kDefaultSystemPrompt;
+    // on the first generate() and keeps it from then on. The persona's presence
+    // line is part of it, and is derived from the fixed tone profile rather
+    // than the drifting dials, so it stays byte-identical every turn and the
+    // cache behind it is never thrown away.
+    m_systemPrompt = kDefaultSystemPrompt + QLatin1Char('\n')
+        + QString::fromStdString(m_persona.systemPromptFragment());
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
 
     // The worker emits from its own thread, so these connections are queued and
@@ -84,9 +113,26 @@ AppController::AppController(QObject* parent)
     ConversationEntry* entry = createConversation();
     m_conversationModel->refilter();
     setActiveConversation(entry->id);
+
+    // The clock every core subsystem is handed, so none of them reaches for a
+    // clock of its own and the whole thing stays testable.
+    m_clock.start();
+    m_presence.setNow(0);
+    m_presence.applyPersona(m_persona.state());
+    m_idle.setQuietPeriodMs(kIdleQuietPeriodMs);
+    m_idle.noteActivity(0);
+    noteAssistant(core::AssistantAction::Idle);
+
+    connect(&m_idleTimer, &QTimer::timeout, this, &AppController::onIdleTick);
+    m_idleTimer.start(kIdleTickMs);
 }
 
 AppController::~AppController() {
+    // The idle loop is a child of this object and its timer is stopped first:
+    // a tick arriving during teardown would call into a half-destroyed
+    // controller.
+    m_idleTimer.stop();
+
     // Order matters: cancel so a blocked generate() returns, then stop the event
     // loop, then wait. Only once the thread is idle is it safe to destroy an
     // object whose affinity was that thread.
@@ -229,6 +275,108 @@ bool AppController::canResume() const noexcept {
 
 bool AppController::canBargeIn() const noexcept {
     return canPause();
+}
+
+QString AppController::presenceState() const {
+    return QString::fromLatin1(core::toString(m_presence.activity()));
+}
+
+double AppController::presenceIntensity() const noexcept {
+    return m_presence.intensity();
+}
+
+bool AppController::presenceSpeaking() const noexcept {
+    return m_presence.speaking();
+}
+
+QString AppController::personaMood() const {
+    return QString::fromLatin1(core::toString(m_presence.snapshot().mood));
+}
+
+QString AppController::statusWhisper() const {
+    // An anticipatory line outranks the activity whisper while it is fresh, and
+    // then lets it back: the status line must return to saying what Kestrel is
+    // doing, or a single "Would you like me to continue?" would sit there for
+    // the rest of the session.
+    if (!m_statusWhisperOverride.isEmpty() && nowMs() < static_cast<std::uint64_t>(m_whisperOverrideUntilMs)) {
+        return m_statusWhisperOverride;
+    }
+    return QString::fromStdString(m_persona.statusWhisper(m_presence.activity()));
+}
+
+QString AppController::acknowledgement() const noexcept {
+    return m_acknowledgement;
+}
+
+QString AppController::ambientThought() const {
+    return m_ambientThought;
+}
+
+QString AppController::idleTaskLabel() const {
+    return m_idleTaskLabel;
+}
+
+QString AppController::sessionTopic() const {
+    return QString::fromStdString(m_persona.sessionTopic());
+}
+
+bool AppController::idleLoopEnabled() const noexcept {
+    return m_idle.enabled();
+}
+
+bool AppController::idlePrewarmEnabled() const noexcept {
+    return m_idle.policy().allowModelWarmup;
+}
+
+bool AppController::showIdleThoughts() const noexcept {
+    return m_showIdleThoughts;
+}
+
+bool AppController::inputPending() const noexcept {
+    return m_inputPending;
+}
+
+void AppController::setIdleLoopEnabled(bool enabled) {
+    if (m_idle.enabled() == enabled) {
+        return;
+    }
+    m_idle.setEnabled(enabled);
+    if (!enabled) {
+        m_ambientThought.clear();
+        m_idleTaskLabel.clear();
+    }
+    emit presenceChanged();
+}
+
+void AppController::setIdlePrewarmEnabled(bool enabled) {
+    core::IdlePolicy policy = m_idle.policy();
+    if (policy.allowModelWarmup == enabled) {
+        return;
+    }
+    policy.allowModelWarmup = enabled;
+    m_idle.setPolicy(policy);
+    emit presenceChanged();
+}
+
+void AppController::setShowIdleThoughts(bool show) {
+    if (m_showIdleThoughts == show) {
+        return;
+    }
+    m_showIdleThoughts = show;
+    emit presenceChanged();
+}
+
+void AppController::setInputPending(bool pending) {
+    if (m_inputPending == pending) {
+        return;
+    }
+    m_inputPending = pending;
+    // Something half-typed is the strongest possible signal that someone is
+    // here, so the loop is told before it can decide anything.
+    if (pending) {
+        noteActivity();
+    }
+    emit presenceChanged();
 }
 
 bool AppController::gpuAvailable() const {
@@ -399,6 +547,10 @@ void AppController::loadModelFromUrl(const QString& url) {
                 m_backend->setSystemPrompt(m_systemPrompt.toStdString());
                 refreshCachedRuntime();
                 rebuildDiagnostics();
+                // Loading a model is the one file operation this app performs,
+                // so it is also the one place a finished task is worth
+                // reporting.
+                anticipate(core::PersonaTrigger::TaskCompleted);
                 emit runtimeChanged();
                 emit metricsChanged();
             }
@@ -449,6 +601,102 @@ void AppController::waitForIdleGeneration(int timeoutMs) {
     QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
     loop.exec();
     disconnect(done);
+}
+
+std::uint64_t AppController::nowMs() const noexcept {
+    // m_clock is only invalid between construction and start(), which no caller
+    // can observe: the clock is started in the constructor and the tick timer
+    // is not connected until after that.
+    return static_cast<std::uint64_t>(m_clock.isValid() ? m_clock.elapsed() : 0);
+}
+
+void AppController::noteAssistant(core::AssistantAction action) {
+    m_presence.noteAssistantAction(action);
+    if (const core::VoiceResponse* response = m_voice.find(m_activeResponse)) {
+        m_presence.setVoiceState(response->state());
+    }
+    m_presence.setGenerating(m_generating);
+    m_presence.applyPersona(m_persona.state());
+    emit presenceChanged();
+}
+
+void AppController::setWhisperOverride(const QString& text, int holdMs) {
+    if (text.isEmpty()) {
+        return;
+    }
+    m_statusWhisperOverride = text;
+    m_whisperOverrideUntilMs = static_cast<qint64>(nowMs())
+        + kWhisperHoldMs + static_cast<qint64>(holdMs);
+    emit presenceChanged();
+}
+
+void AppController::anticipate(core::PersonaTrigger trigger) {
+    if (const auto line = m_persona.react(trigger)) {
+        setWhisperOverride(QString::fromStdString(line->text), line->microPauseMs);
+    }
+}
+
+void AppController::noteActivity() {
+    // Deliberately does not touch the presence snapshot: the user action is
+    // recorded explicitly at each call site, where what actually happened is
+    // known, instead of being inferred here.
+    m_idle.noteActivity(nowMs());
+}
+
+void AppController::onIdleTick() {
+    const std::uint64_t now = nowMs();
+
+    core::IdleGate gate;
+    gate.generating = m_generating;
+    // A live response owns the timeline, and an in-flight prewarm owns the
+    // worker. Either one means there is no thinking space to be had.
+    gate.voiceActive = m_voice.activeResponseId() != core::kInvalidResponseId
+                       || m_warmupRequestId != 0;
+    gate.userInputPending = m_inputPending;
+    m_idle.setGate(gate);
+    m_idle.setTopic(m_persona.sessionTopic());
+
+    const core::IdleTick tick = m_idle.tick(now);
+    if (tick.produced) {
+        m_ambientThought = QString::fromStdString(tick.thought);
+        m_idleTaskLabel = QStringLiteral("%1 \u00b7 %2")
+                              .arg(QString::fromLatin1(core::toString(tick.task.kind)),
+                                   QString::fromStdString(tick.task.detail));
+        m_presence.applyPersona(m_persona.state());
+
+        if (!tick.whisper.empty()) {
+            setWhisperOverride(QString::fromStdString(tick.whisper), 0);
+        }
+        if (tick.task.kind == core::IdleTaskKind::ModelWarmup) {
+            noteAssistant(core::AssistantAction::Preparing);
+        } else if (tick.task.kind == core::IdleTaskKind::CreativeThought
+                   || tick.task.kind == core::IdleTaskKind::SelfReflection) {
+            noteAssistant(core::AssistantAction::Reflecting);
+        }
+    }
+
+    // A long absence earns one greeting, and only once the loop has had the
+    // chance to prepare one.
+    if (m_idle.userReturned(now, kReturnGreetingMs)) {
+        if (const std::string greeting = m_idle.takeGreeting(); !greeting.empty()) {
+            m_presence.noteUserAction(core::UserAction::Returned);
+            setWhisperOverride(QString::fromStdString(greeting), 0);
+        }
+    }
+
+    // The prewarm is the one idle task that leaves pure computation, so it only
+    // runs when the policy allows it, a model is actually loaded, and the
+    // worker is free. Its tokens are discarded: the point is warm caches, not
+    // something said.
+    if (tick.produced && tick.task.kind == core::IdleTaskKind::ModelWarmup
+        && m_warmupRequestId == 0 && runtimeAvailable() && !m_generating) {
+        m_warmupRequestId = m_nextRequestId++;
+        m_worker->start(m_warmupRequestId, kWarmupPrompt, 0.1F, kWarmupMaxTokens);
+    }
+
+    m_presence.setNow(now);
+    m_presence.advance();
+    emit presenceChanged();
 }
 
 void AppController::setSearchQuery(const QString& query) {
@@ -514,6 +762,15 @@ void AppController::onGenerationToken(quint64 requestId, const QString& token) {
 void AppController::onGenerationFinished(quint64 requestId,
                                          bool success,
                                          const QString& error) {
+    if (requestId == m_warmupRequestId) {
+        // An idle prewarm, not a reply. Its output was never shown; the only
+        // consequence is that the backend is warm and its counters moved.
+        m_warmupRequestId = 0;
+        refreshCachedRuntime();
+        emit runtimeChanged();
+        emit presenceChanged();
+        return;
+    }
     if (requestId != m_activeRequestId) {
         return;
     }
@@ -549,7 +806,20 @@ void AppController::onGenerationFinished(quint64 requestId,
     // as generation finishes. That is the text-only fallback VoiceSession
     // defines for exactly this situation.
     m_voice.complete(m_activeResponse);
+    m_acknowledgement.clear();
     finalizeStream(MessageStatus::Complete, {});
+    noteAssistant(core::AssistantAction::Waiting);
+
+    // Whether a long answer is offered to continue depends on how long it
+    // actually turned out to be, so the judgement is made here rather than
+    // guessed at the start.
+    const int lastRow = m_messageModel->rowCount() - 1;
+    const QString delivered = lastRow >= 0
+        ? m_messageModel->data(m_messageModel->index(lastRow, 0),
+                               MessageModel::ContentRole).toString()
+        : QString();
+    anticipate(delivered.size() > kLongResponseChars ? core::PersonaTrigger::LongResponse
+                                                     : core::PersonaTrigger::TurnCompleted);
     emit voiceChanged();
 }
 
@@ -568,6 +838,7 @@ void AppController::startGeneration(const QString& userText) {
     m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
     m_activeRequestId = m_nextRequestId++;
 
+    noteAssistant(core::AssistantAction::Thinking);
     emit generatingChanged();
     emit voiceChanged();
     refreshCanRegenerate();
@@ -583,12 +854,13 @@ void AppController::startGeneration(const QString& userText) {
     // The voice timeline tracks the user's words; the model gets the assembled
     // conversation. The system prompt is not in it -- the backend holds that as
     // a cached prefix, and repeating it here would undo the caching.
-    m_worker->start(m_activeRequestId, buildPrompt(userText), 0.7F, 512);
+    m_worker->start(m_activeRequestId, buildPrompt(), 0.7F, 512);
 }
 
 /// Formats nonempty user/assistant messages among the latest eight entries, then an assistant cue.
-/// Excludes the shared system prompt; userText is currently unused.
-QString AppController::buildPrompt(const QString& userText) const {
+/// Excludes the shared system prompt: it is the backend's cached prefix, and repeating it
+/// here would undo the caching.
+QString AppController::buildPrompt() const {
     QString prompt;
     const ConversationEntry* entry = activeEntry();
     if (entry != nullptr) {
@@ -661,11 +933,22 @@ void AppController::sendMessage(const QString& text) {
             m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement));
         m_userStopped = true;
         m_worker->cancel();
+        m_presence.noteUserAction(core::UserAction::Interrupted);
         emit voiceChanged();
     }
 
     const bool firstMessage = entry->conversation.size() == 0;
     m_messageModel->appendMessage(core::MessageRole::User, trimmed, MessageStatus::Complete);
+
+    // Everything the persona needs to be Kestrel for this turn: the request is
+    // accepted out loud, the message joins the session's continuity, and the
+    // idle loop is told a person is here.
+    m_acknowledgement = QString::fromStdString(m_persona.acknowledgement());
+    m_persona.noteUserMessage(trimmed.toStdString());
+    m_idle.setTopic(m_persona.sessionTopic());
+    noteActivity();
+    m_presence.noteUserAction(core::UserAction::Typed);
+
     if (firstMessage) {
         entry->conversation.setTitle(deriveTitle(trimmed).toStdString());
         emit activeConversationChanged();
@@ -681,6 +964,10 @@ void AppController::stopGeneration() {
     m_userStopped = true;
     m_worker->cancel();
     m_voice.cancel(m_activeResponse);
+    m_acknowledgement.clear();
+    noteActivity();
+    m_presence.noteUserAction(core::UserAction::Interrupted);
+    noteAssistant(core::AssistantAction::Waiting);
     emit voiceChanged();
 }
 
@@ -694,6 +981,12 @@ void AppController::pauseConversation() {
     m_voice.pause(m_activeResponse, QStringLiteral("user paused").toStdString());
     m_userPaused = true;
     m_worker->cancel();
+    m_acknowledgement.clear();
+    noteActivity();
+    m_presence.noteUserAction(core::UserAction::Paused);
+    // Pausing says nothing on the status line: the state is already on screen,
+    // and a whisper on top of it would be noise.
+    noteAssistant(core::AssistantAction::Waiting);
     emit voiceChanged();
 }
 
@@ -710,6 +1003,9 @@ void AppController::resumeConversation() {
     m_activeGeneration = *generation;
     m_userPaused = false;
     m_generationClock.invalidate();
+    noteActivity();
+    m_presence.noteUserAction(core::UserAction::Resumed);
+    noteAssistant(core::AssistantAction::Thinking);
 
     if (*generation != core::kInvalidGenerationId) {
         resetMetrics();
