@@ -123,17 +123,22 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          # Match the runner's own architecture. Left to itself the action has
-          # been resolving an x86_64 Qt for the arm64 macOS runner, and the
-          # x86_64 slice of Qt's macOS libraries references AGL -- the legacy
-          # 32-bit OpenGL framework, which does not exist on arm64. The link
-          # then fails with "ld: framework 'AGL' not found".
+          # No `arch` input. There was one here for a long time, spelled
+          # `architecture`, which the action does not know: on macOS it failed
+          # the step outright with "Unexpected input(s) 'architecture'", and
+          # everywhere else it was silently ignored. So the comment that came
+          # with it -- that the action was resolving an x86_64 Qt on the arm64
+          # macOS runner and that the x86_64 slice of Qt's macOS libraries
+          # reference the removed AGL framework -- described a failure that this
+          # step had never once been in a position to have. It is a hypothesis
+          # about a job that is not gating, written as though it were a
+          # measurement, and correcting the spelling to `arch` only made the
+          # Linux and Windows jobs start failing on it.
           #
-          # The input is `arch`. It was spelled `architecture`, which the action
-          # rejects outright -- "Unexpected input(s) 'architecture'" -- so this
-          # step had never once installed anything on any platform, and the AGL
-          # link failure it was written to prevent was never actually reached.
-          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          # The action's own default is what the Linux and Windows jobs have
+          # been building against all along, and they are the ones that matter.
+          # If somebody with a Mac finds a real AGL failure here, the fix is to
+          # add `arch: arm64` and find out whether it helps.
           # No `modules` list on purpose. Quick Controls 2 is part of the base
           # Qt 6 installation rather than a separately installable module, and
           # asking aqtinstall for it fails the step on every platform with
