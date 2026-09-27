@@ -244,6 +244,12 @@ public:
     // Returns nullopt when the response is fully spoken or does not exist.
     [[nodiscard]] std::optional<SpeechSegment> nextSpeechSegment(ResponseId id,
                                                                   int openingPauseMs = 0) const;
+    // The segment that would come after `nextSpeechSegment` returns right now,
+    // without moving the spoken cursor. Lets a caller warn a speech engine about
+    // the sentence it is about to be given, so the engine can start work on it
+    // while the previous one is still playing. Returns nullopt at the end of the
+    // response, or before anything has been handed out yet.
+    [[nodiscard]] std::optional<SpeechSegment> peekSpeechSegment(ResponseId id) const;
 
     [[nodiscard]] const VoiceResponse* find(ResponseId id) const noexcept;
     [[nodiscard]] ResponseId activeResponseId() const noexcept;

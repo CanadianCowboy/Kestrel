@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 
 #include <functional>
@@ -27,6 +28,10 @@ public:
     [[nodiscard]] virtual QString description() const = 0;
     virtual void applyVoice(const core::VoicePersona& persona) = 0;
     virtual void speak(const QString& text) = 0;
+    // Asks the engine to have `text` ready before it is asked to speak it. A
+    // backend that can start work early does; one that cannot ignores it, which
+    // is not an error and must not slow the pump down waiting to find out.
+    virtual void prefetch(const QString&) {}
     // Stop at the next utterance boundary: the clause in flight is allowed to
     // finish. This is what makes a barge-in land between clauses.
     virtual void stop() = 0;
@@ -35,6 +40,16 @@ public:
     // True while an utterance is in flight, which is what distinguishes "let
     // the clause finish" from "there is nothing to wait for".
     [[nodiscard]] virtual bool speakingNow() const = 0;
+
+    // The voices this backend can speak with, best first, and the one it is
+    // currently using. Empty means the choice is not this backend's to make --
+    // a platform voice is whatever the operating system registered, and there
+    // is nothing useful to offer a list of.
+    [[nodiscard]] virtual QStringList voiceChoices() const { return {}; }
+    [[nodiscard]] virtual QString currentVoice() const { return {}; }
+    // Returns false when the name is not one this backend has, so a stale
+    // setting cannot quietly leave the app speaking with something else.
+    virtual bool setVoice(const QString&) { return false; }
 
     // Called when an utterance reaches its end, and when the engine fails.
     // The backend is handed these at construction rather than reaching back for
@@ -97,6 +112,23 @@ public:
     // better local voice installed hands one over, rather than being limited to
     // whatever voices the operating system happened to register.
     void adoptBackend(std::unique_ptr<SpeechBackend> backend);
+
+    // The voices the current backend can speak with, and the one it is using.
+    // Empty when the platform voice is in charge, because that choice is the
+    // operating system's rather than the app's.
+    [[nodiscard]] QStringList voiceChoices() const;
+    // Hands the backend the text that is coming next. Separate from speak(),
+    // which commits to speaking something now.
+    void prefetch(const QString& text);
+    // Hands the backend the clause that is coming next, if there is one. Called
+    // as soon as the current clause is handed over, so a slow engine can be
+    // working on the next sentence while the current one is still being heard.
+    void prefetchNext();
+    [[nodiscard]] QString currentVoice() const;
+    // Changes voice mid-sentence. The clause in flight is not re-spoken: it is
+    // already audio, and swapping it out from under the user would be worse
+    // than finishing this sentence in the old voice.
+    Q_INVOKABLE bool setVoice(const QString& voice);
 
     // True when a real voice is installed and reachable. False means the
     // response is delivered as text, which is a supported outcome rather than

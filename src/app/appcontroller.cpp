@@ -505,6 +505,24 @@ void AppController::setToolPermission(const QString& permission, bool granted) {
     }
 }
 
+QStringList AppController::speechVoices() const {
+    return m_speech != nullptr ? m_speech->voiceChoices() : QStringList();
+}
+
+QString AppController::currentVoice() const {
+    return m_speech != nullptr ? m_speech->currentVoice() : QString();
+}
+
+bool AppController::setSpeechVoice(const QString& voice) {
+    if (m_speech == nullptr || !m_speech->setVoice(voice)) {
+        return false;
+    }
+    // The description carries the voice name, so the panel updates from the same
+    // signal that publishes it rather than needing a notification of its own.
+    emit ttsChanged();
+    return true;
+}
+
 QString AppController::idleTaskLabel() const {
     if (m_idleTaskKind.isEmpty()) {
         return {};
@@ -614,6 +632,15 @@ void AppController::pumpNextSegment() {
     m_hasPendingSegment = true;
     m_pendingSegmentEnd = segment->endOffset;
     m_speech->speak(QString::fromStdString(segment->text), segment->leadingPauseMs);
+
+    // Look one clause ahead. A synthesising engine needs real time to produce a
+    // sentence, and asking it only once the previous one has finished puts that
+    // time on the record as silence between sentences. The engine already
+    // holding the text makes it sound like a person pausing to think rather than
+    // a program waiting on a file.
+    if (const auto ahead = m_voice.peekSpeechSegment(m_activeResponse); ahead.has_value()) {
+        m_speech->prefetch(QString::fromStdString(ahead->text));
+    }
 }
 
 void AppController::finishPlayback() {

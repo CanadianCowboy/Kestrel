@@ -2,9 +2,12 @@
 
 #include "app/speechsynthesizer.h"
 
+#include <QHash>
+#include <QList>
 #include <QObject>
 #include <QProcess>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 #include <memory>
@@ -56,17 +59,25 @@ public:
 
     void applyVoice(const core::VoicePersona& persona) override;
     void speak(const QString& text) override;
+    // Synthesises ahead of time and remembers the result, so speak() is usually
+    // a file read rather than a wait. This is what removes the gap between one
+    // sentence and the next.
+    void prefetch(const QString& text) override;
     void stop() override;
     void stopImmediately() override;
     [[nodiscard]] bool speakingNow() const override;
 
-    // Kokoro names its voices af_*/am_*/bf_*/bm_*. The British male set suits
-    // an assistant better than the American one, which is why it is the
-    // default.
-    void setVoice(const QString& voice);
+    // Kokoro names its voices af_*/am_*/bf_*/bm_*. The British male set suits an
+    // assistant better than the American one, which is why it is the default.
+    [[nodiscard]] QStringList voiceChoices() const override;
+    [[nodiscard]] QString currentVoice() const override { return m_voice; }
+    bool setVoice(const QString& voice) override;
 
 private:
     void onReadyRead();
+    // Text already synthesised, waiting to be played.
+    [[nodiscard]] QString takePrefetched(const QString& text);
+    void requestSynthesis(const QString& text, const QString& path, bool playsNow);
     void onProcessError(QProcess::ProcessError error);
     void onProcessFinished(int exitCode, QProcess::ExitStatus status);
     void onMediaStatusChanged();
@@ -85,6 +96,17 @@ private:
     int m_clause = 0;
 
     QProcess* m_process = nullptr;
+    QHash<QString, QString> m_prefetched;
+    // What is outstanding on the pipe. Two can be at once: the clause being
+    // spoken and the one the caller warned about while it was being asked for.
+    // The server answers in the order it was written, so replies are matched to
+    // requests by taking the front -- which is only correct if this really is a
+    // queue and not a single slot.
+    struct PendingRequest {
+        QString text;
+        bool playsNow = false;
+    };
+    QList<PendingRequest> m_pending;
     QMediaPlayer* m_player = nullptr;
     QAudioOutput* m_audio = nullptr;
     std::unique_ptr<QTemporaryDir> m_scratch;

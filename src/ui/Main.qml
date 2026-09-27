@@ -723,6 +723,60 @@ ApplicationWindow {
                             }
                         }
 
+                        // Voice choice, when the backend has a choice to offer.
+                        // Hidden otherwise rather than shown empty: a picker with
+                        // nothing in it is a control that cannot be used, and on
+                        // a machine using the platform voice there is genuinely
+                        // nothing to choose between.
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: appController.speechVoices.length > 0
+                            spacing: 4
+
+                            Text {
+                                text: "VOICE PROFILE"
+                                color: window.muted
+                                font.pixelSize: 10
+                                font.letterSpacing: 1.2
+                            }
+
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: 6
+
+                                Repeater {
+                                    model: appController.speechVoices
+                                    delegate: Rectangle {
+                                        required property string modelData
+                                        readonly property bool selected:
+                                            modelData === appController.currentVoice
+                                        width: profileText.implicitWidth + 16
+                                        height: 22
+                                        radius: 11
+                                        color: selected ? window.accent : "#1a1d23"
+                                        border.color: selected ? window.accent : window.line
+                                        Behavior on color { ColorAnimation { duration: 140 } }
+
+                                        Text {
+                                            id: profileText
+                                            anchors.centerIn: parent
+                                            text: parent.modelData
+                                            color: parent.selected ? "#0d1015" : window.muted
+                                            font.pixelSize: 11
+                                        }
+
+                                        MouseArea {
+                                            id: profileHit
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: appController.setSpeechVoice(parent.modelData)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // The three switches that keep the idle loop inside its
                         // box: whether it runs at all, whether it may touch the
                         // GPU, and whether its private thoughts are shown.

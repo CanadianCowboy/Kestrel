@@ -241,6 +241,25 @@ void SpeechSynthesizer::adoptBackend(std::unique_ptr<SpeechBackend> backend) {
     setBackendForTesting(std::move(backend));
 }
 
+void SpeechSynthesizer::prefetch(const QString& text) {
+    if (m_backend == nullptr || text.trimmed().isEmpty()) {
+        return;
+    }
+    m_backend->prefetch(text);
+}
+
+QStringList SpeechSynthesizer::voiceChoices() const {
+    return m_backend != nullptr ? m_backend->voiceChoices() : QStringList();
+}
+
+QString SpeechSynthesizer::currentVoice() const {
+    return m_backend != nullptr ? m_backend->currentVoice() : QString();
+}
+
+bool SpeechSynthesizer::setVoice(const QString& voice) {
+    return m_backend != nullptr && m_backend->setVoice(voice);
+}
+
 void SpeechSynthesizer::setBackendForTesting(std::unique_ptr<SpeechBackend> backend) {
     if (backend == nullptr) {
         return;

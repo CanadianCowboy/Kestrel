@@ -1,5 +1,6 @@
 #include "app/kokorospeechbackend.h"
 
+#include <QAudioDevice>
 #include <QAudioOutput>
 #include <QDir>
 #include <QJsonDocument>
@@ -56,6 +57,16 @@ KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript, Q
 }
 
 KokoroSpeechBackend::~KokoroSpeechBackend() {
+    // Release the audio before the scratch directory goes. A player still
+    // holding the last clause keeps a handle on it, and a temporary directory
+    // that cannot delete itself leaves a file behind on every run.
+    if (m_player != nullptr) {
+        m_player->stop();
+        m_player->setSource(QUrl());
+    }
+    if (m_audio != nullptr) {
+        m_audio->setDevice(QAudioDevice());
+    }
     if (m_process != nullptr && m_process->state() != QProcess::NotRunning) {
         m_process->closeWriteChannel();
         m_process->kill();
@@ -85,10 +96,45 @@ QString KokoroSpeechBackend::description() const {
     return tr("%1 (Kokoro, local)").arg(m_voice);
 }
 
-void KokoroSpeechBackend::setVoice(const QString& voice) {
-    if (!voice.isEmpty()) {
-        m_voice = voice;
+// The English voices in the shipped model. Listed rather than discovered at
+// runtime: the voice table is a file on disk, and parsing it to build a list for
+// a picker would be a second source of truth to keep in step with the model's
+// contents. Grouped the way the picker reads best -- by accent and gender --
+// because "am_michael" means nothing to anyone who has not read the model card.
+QStringList KokoroSpeechBackend::voiceChoices() const {
+    static const QStringList kVoices = {
+        // British male, first: this is the register the voice was chosen for.
+        QStringLiteral("bm_george"),  QStringLiteral("bm_fable"),
+        QStringLiteral("bm_daniel"),   QStringLiteral("bm_lewis"),
+        // American male.
+        QStringLiteral("am_michael"),  QStringLiteral("am_onyx"),
+        QStringLiteral("am_fenrir"),   QStringLiteral("am_adam"),
+        QStringLiteral("am_echo"),     QStringLiteral("am_eric"),
+        QStringLiteral("am_liam"),     QStringLiteral("am_puck"),
+        QStringLiteral("am_santa"),
+        // British female.
+        QStringLiteral("bf_emma"),     QStringLiteral("bf_isabella"),
+        QStringLiteral("bf_alice"),    QStringLiteral("bf_lily"),
+        // American female.
+        QStringLiteral("af_heart"),    QStringLiteral("af_bella"),
+        QStringLiteral("af_nicole"),   QStringLiteral("af_sarah"),
+        QStringLiteral("af_jessica"),  QStringLiteral("af_nova"),
+        QStringLiteral("af_sky"),      QStringLiteral("af_river"),
+        QStringLiteral("af_kore"),     QStringLiteral("af_alloy"),
+        QStringLiteral("af_aoede"),
+    };
+    return kVoices;
+}
+
+bool KokoroSpeechBackend::setVoice(const QString& voice) {
+    if (!voiceChoices().contains(voice)) {
+        // Refused rather than accepted and hoped for: a name the model does not
+        // have would fail at synthesis time, in the middle of a reply, which is
+        // the worst moment to discover a typo.
+        return false;
     }
+    m_voice = voice;
+    return true;
 }
 
 void KokoroSpeechBackend::applyVoice(const core::VoicePersona& persona) {
@@ -100,22 +146,61 @@ void KokoroSpeechBackend::applyVoice(const core::VoicePersona& persona) {
     m_speed = 0.5 + static_cast<double>(persona.rate);
 }
 
+void KokoroSpeechBackend::requestSynthesis(const QString& text, const QString& path,
+                                           bool playsNow) {
+    m_pending.append(PendingRequest{text, playsNow});
+    QJsonObject request;
+    request.insert(QStringLiteral("text"), text);
+    request.insert(QStringLiteral("voice"), m_voice);
+    request.insert(QStringLiteral("speed"), m_speed);
+    request.insert(QStringLiteral("out"), path);
+    m_process->write(QJsonDocument(request).toJson(QJsonDocument::Compact) + "\n");
+}
+
+void KokoroSpeechBackend::prefetch(const QString& text) {
+    if (!m_started || m_process == nullptr || text.trimmed().isEmpty()) {
+        return;
+    }
+    if (m_prefetched.contains(text)) {
+        return;
+    }
+    for (const PendingRequest& request : m_pending) {
+        if (request.text == text) {
+            return;
+        }
+    }
+    requestSynthesis(text, m_scratch->filePath(clauseName(m_clause++)), false);
+}
+
+QString KokoroSpeechBackend::takePrefetched(const QString& text) {
+    const auto match = m_prefetched.find(text);
+    if (match == m_prefetched.end()) {
+        return {};
+    }
+    const QString path = match.value();
+    m_prefetched.erase(match);
+    return path;
+}
+
 void KokoroSpeechBackend::speak(const QString& text) {
     if (!m_started || m_speaking || m_process == nullptr || text.trimmed().isEmpty()) {
         return;
     }
     m_speaking = true;
 
-    QJsonObject request;
-    request.insert(QStringLiteral("text"), text);
-    request.insert(QStringLiteral("voice"), m_voice);
-    request.insert(QStringLiteral("speed"), m_speed);
-    request.insert(QStringLiteral("out"),
-                   m_scratch->filePath(clauseName(m_clause++)));
+    // Already made: the common case, because the caller warns the engine about a
+    // clause while the previous one is still being spoken.
+    const QString ready = takePrefetched(text);
+    if (!ready.isEmpty() && QFileInfo::exists(ready)) {
+        m_player->setSource(QUrl::fromLocalFile(ready));
+        m_player->play();
+        return;
+    }
+
+    requestSynthesis(text, m_scratch->filePath(clauseName(m_clause++)), true);
     // The model answers asynchronously, so nothing is played yet. The
     // synthesizer treats this exactly like an engine that has not finished
     // speaking: the cursor does not move until the clause has been heard.
-    m_process->write(QJsonDocument(request).toJson(QJsonDocument::Compact) + "\n");
 }
 
 void KokoroSpeechBackend::stop() {
@@ -155,9 +240,23 @@ void KokoroSpeechBackend::onReadyRead() {
             failWith(reply.value(QStringLiteral("error")).toString());
             continue;
         }
-        m_player->setSource(QUrl::fromLocalFile(
-            reply.value(QStringLiteral("out")).toString()));
-        m_player->play();
+        const QString out = reply.value(QStringLiteral("out")).toString();
+        if (m_pending.isEmpty()) {
+            // Nothing asked for this. Playing it anyway would speak a clause
+            // the user has moved past, so it is dropped.
+            continue;
+        }
+        // The server answers in the order it was written to, so the front of
+        // the queue is what this reply belongs to.
+        const PendingRequest request = m_pending.takeFirst();
+        if (request.playsNow) {
+            m_player->setSource(QUrl::fromLocalFile(out));
+            m_player->play();
+        } else if (!request.text.isEmpty()) {
+            // Asked for early, so it waits rather than cutting off the clause
+            // the user is hearing right now.
+            m_prefetched.insert(request.text, out);
+        }
     }
 }
 
