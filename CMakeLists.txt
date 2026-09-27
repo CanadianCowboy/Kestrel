@@ -248,8 +248,10 @@ if(KESTREL_BUILD_UI)
             src/app/appcontroller.h
             src/app/generationworker.cpp
             src/app/generationworker.h
-            src/app/speechsynthesizer.cpp
-            src/app/speechsynthesizer.h
+    src/app/speechsynthesizer.cpp
+    src/app/speechsynthesizer.h
+    src/app/kokorospeechbackend.cpp
+    src/app/kokorospeechbackend.h
             src/app/listensession.cpp
             src/app/listensession.h
             src/app/conversationentry.h
@@ -281,6 +283,19 @@ if(KESTREL_BUILD_UI)
             message(STATUS "Kestrel: Qt TextToSpeech not found; responses are text-only")
         endif()
 
+        # The local neural voice plays its own audio rather than going through
+        # the text-to-speech module, so it needs the media module directly. It is
+        # optional for the same reason: a Qt install without it falls back to
+        # whatever the platform offers.
+        find_package(Qt6Multimedia QUIET)
+        if(TARGET Qt6::Multimedia)
+            target_link_libraries(kestrel PRIVATE Qt6::Multimedia)
+            target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
+            message(STATUS "Kestrel: Qt Multimedia found; a local neural voice can play")
+        else()
+            message(STATUS "Kestrel: Qt Multimedia not found; no local neural voice")
+        endif()
+
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
         if(KESTREL_BUILD_TESTS)
@@ -295,6 +310,8 @@ if(KESTREL_BUILD_UI)
                 src/app/generationworker.h
                 src/app/speechsynthesizer.cpp
                 src/app/speechsynthesizer.h
+                src/app/kokorospeechbackend.cpp
+                src/app/kokorospeechbackend.h
                 src/app/listensession.cpp
                 src/app/listensession.h
                 src/app/appcontroller.cpp
@@ -311,6 +328,10 @@ if(KESTREL_BUILD_UI)
             if(TARGET Qt6::TextToSpeech)
                 target_link_libraries(kestrel_app_tests PRIVATE Qt6::TextToSpeech)
                 target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_TEXT_TO_SPEECH=1)
+            endif()
+            if(TARGET Qt6::Multimedia)
+                target_link_libraries(kestrel_app_tests PRIVATE Qt6::Multimedia)
+                target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
             endif()
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
 

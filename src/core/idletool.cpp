@@ -141,6 +141,20 @@ IdleToolDeclaration indexThreadsDeclaration() {
     return declaration;
 }
 
+IdleToolDeclaration summariseSessionDeclaration() {
+    IdleToolDeclaration declaration;
+    declaration.name = std::string(kSummariseSessionTool);
+    declaration.summary = "Ask the model to write down what this session was about.";
+    // ReadConversations to assemble the material, RunGeneration because it
+    // genuinely spends tokens. Both are declared, so both have to be granted:
+    // the cost is the user's to agree to, and it is the sort of thing that
+    // should never happen quietly on a background timer.
+    declaration.permissions = {ToolPermission::ReadConversations,
+                               ToolPermission::RunGeneration};
+    declaration.enabledByDefault = false;
+    return declaration;
+}
+
 namespace {
 
 // Words that carry no topic. Kept short on purpose: a longer list starts

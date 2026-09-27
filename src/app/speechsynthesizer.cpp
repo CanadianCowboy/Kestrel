@@ -5,6 +5,8 @@
 #include <algorithm>
 
 #if KESTREL_HAS_TEXT_TO_SPEECH
+#include <QLocale>
+#include <QStringList>
 #include <QTextToSpeech>
 #include <QVoice>
 #endif
@@ -22,6 +24,86 @@ constexpr int kMaxPauseMs = 1200;
 // an octave at either end of the scale, and stops short of the point where it
 // stops sounding like a person and starts sounding broken.
 constexpr float kPitchPerSemitone = 4.0F;
+
+#if KESTREL_HAS_TEXT_TO_SPEECH
+
+// Choosing which voice to speak with.
+//
+// A machine usually has several, and they are not equally good: the ones that
+// ship with Windows are decades-old concatenative recordings that were
+// intelligible rather than pleasant, and they are not updated the way software
+// is. The neural engines that sound like a person -- Kokoro or Piper registered
+// as system voices, which is how a Windows user would install one -- are a single
+// download away and are usually far better than anything already present.
+//
+// So the first voice in the list is not a safe default. Alphabetically, on a
+// stock English install, it is "Microsoft David", which is exactly the voice
+// that makes an assistant sound like a 2003 navigation system. The rules below
+// are about preferring a better voice when the machine has one, and degrading to
+// a pleasant one when it does not -- never about refusing to speak.
+
+// Words in a voice's name that mark it as a neural or recorded voice rather than
+// a legacy synthesiser. Matched loosely because every project names its own.
+bool soundsLikeNeuralVoice(const QString& name) {
+    static const QStringList kMarkers = {
+        QStringLiteral("kokoro"),   QStringLiteral("piper"),    QStringLiteral("neural"),
+        QStringLiteral("natural"),  QStringLiteral("onnx"),     QStringLiteral("eleven"),
+        QStringLiteral("azure"),    QStringLiteral("sonify"),   QStringLiteral("alloy"),
+        QStringLiteral("jenny"),    QStringLiteral("guy"),      QStringLiteral("aria"),
+    };
+    const QString lowered = name.toLower();
+    for (const QString& marker : kMarkers) {
+        if (lowered.contains(marker)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Windows marks its thin legacy voices by naming them "Compact" in the voice's
+// own name, which is the only hint available about how one actually sounds. The
+// compact set is intelligible rather than pleasant, and it is what a machine
+// falls back to when nothing better is installed.
+bool soundsStrained(const QVoice& voice) {
+    const QString name = voice.name().toLower();
+    return name.contains(QStringLiteral("compact"))
+        || name.contains(QStringLiteral("whisper"))
+        || name.contains(QStringLiteral("babble"));
+}
+
+int scoreVoice(const QVoice& voice, const QLocale& preferred) {
+    if (soundsLikeNeuralVoice(voice.name())) {
+        return 100;
+    }
+    int score = 0;
+    // A voice the user can actually understand matters more than one that merely
+    // exists, so the language match is checked before the niceness of the name.
+    if (voice.locale().language() == preferred.language()) {
+        score += 40;
+    }
+    if (!soundsStrained(voice)) {
+        score += 20;
+    }
+    return score;
+}
+
+// The best voice available, or the first one when they are all the same. Ties
+// keep the platform's own order, because there is no better information and
+// inventing a preference here would be noise.
+QVoice chooseVoice(const QList<QVoice>& voices, const QLocale& preferred) {
+    QVoice best = voices.first();
+    int bestScore = scoreVoice(best, preferred);
+    for (const QVoice& voice : voices) {
+        const int score = scoreVoice(voice, preferred);
+        if (score > bestScore) {
+            best = voice;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+#endif // KESTREL_HAS_TEXT_TO_SPEECH
 
 } // namespace
 
@@ -140,8 +222,12 @@ SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
         platform->setAvailability(
             false, QStringLiteral("no speech engine is available on this machine"));
     } else {
-        platform->voice().setVoice(voices.first());
-        platform->setAvailability(true, voices.first().name());
+        // The system's preferred language decides the match, not the user's
+        // locale: a voice has to be able to say the words.
+        const QLocale systemLocale = QLocale::system();
+        const QVoice chosen = chooseVoice(voices, systemLocale);
+        platform->voice().setVoice(chosen);
+        platform->setAvailability(true, chosen.name());
         connect(&platform->voice(), &QTextToSpeech::stateChanged, this, [this] {
             static_cast<PlatformSpeechBackend*>(m_backend.get())->observeState();
         });
@@ -150,6 +236,10 @@ SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
 }
 
 SpeechSynthesizer::~SpeechSynthesizer() = default;
+
+void SpeechSynthesizer::adoptBackend(std::unique_ptr<SpeechBackend> backend) {
+    setBackendForTesting(std::move(backend));
+}
 
 void SpeechSynthesizer::setBackendForTesting(std::unique_ptr<SpeechBackend> backend) {
     if (backend == nullptr) {

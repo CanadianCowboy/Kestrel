@@ -3,6 +3,12 @@
 #include "app/generationworker.h"
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
+#if KESTREL_HAS_QT_MULTIMEDIA
+#include "app/kokorospeechbackend.h"
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#endif
 #include "runtime/backendregistry.h"
 #include "runtime/llamacppbackend.h"
 
@@ -68,6 +74,12 @@ constexpr int kLongResponseChars = 420;
 // the clocks are up, not that anything was said.
 const QString kWarmupPrompt = QStringLiteral("Assistant: Ready.");
 constexpr int kWarmupMaxTokens = 8;
+// How much of the session a background summary is shown, and how long it is
+// allowed to be. Both bounded on purpose: this runs on a timer the user did not
+// start, and an unbounded summary of an unbounded transcript is a bill nobody
+// agreed to.
+constexpr int kSummaryMaterialChars = 4000;
+constexpr int kSummaryMaxTokens = 96;
 
 QString deriveTitle(const QString& text) {
     const QString line = text.section(QLatin1Char('\n'), 0, 0).simplified();
@@ -89,6 +101,7 @@ AppController::AppController(QObject* parent)
     // show what exists, and a tool stays inert until the user both switches it
     // on and grants what it declared.
     m_idleTools.declare(core::indexThreadsDeclaration());
+    m_idleTools.declare(core::summariseSessionDeclaration());
     m_messageModel = new MessageModel(this);
     m_conversationModel = new ConversationModel(&m_entries, this);
 
@@ -136,6 +149,27 @@ AppController::AppController(QObject* parent)
     // The synthesizer still exists; it reports itself unavailable and the
     // text-only path below is what the app takes.
     m_speech = std::make_unique<SpeechSynthesizer>(this);
+
+#if KESTREL_HAS_QT_MULTIMEDIA
+    // A local neural voice, if one has been installed. It is preferred over the
+    // platform voice because the platform voice on a stock Windows install is a
+    // recording from the early 2000s, and a better one is a single download
+    // away. Found by looking rather than by asking the user, and absent without
+    // complaint: the platform voice underneath is a perfectly good fallback.
+    {
+        const QString root = QCoreApplication::applicationDirPath()
+            + QStringLiteral("/../");
+        const QString python = qEnvironmentVariable(
+            "KESTREL_VOICE_PYTHON",
+            QDir(root).filePath(QStringLiteral(".kestrel-voice/Scripts/python.exe")));
+        const QString script = QDir(root).filePath(
+            QStringLiteral("tools/kokoro_voice_server.py"));
+        if (QFileInfo::exists(python) && QFileInfo::exists(script)) {
+            m_speech->adoptBackend(
+                std::make_unique<KokoroSpeechBackend>(python, script));
+        }
+    }
+#endif
     connect(m_speech.get(), &SpeechSynthesizer::segmentFinished,
             this, &AppController::onSpeechSegmentFinished);
     connect(m_speech.get(), &SpeechSynthesizer::stopCompleted,
@@ -483,6 +517,12 @@ QString AppController::idleTaskLabel() const {
     }
     if (!m_showIdleThoughts && !m_ambientThought.isEmpty()) {
         return m_idleTaskKind;
+    }
+    // A tool that was refused is reported instead of the task that wanted to
+    // run it. The task happened either way, but the part the user is being
+    // asked about is why nothing came of it.
+    if (!m_idleToolNotice.isEmpty()) {
+        return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleToolNotice);
     }
     return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleTaskDetail);
 }
@@ -965,17 +1005,62 @@ void AppController::runIdleToolIfPermitted() {
     if (entry == nullptr) {
         return;
     }
-    const core::ToolRunResult outcome = core::runIdleTool(
-        m_idleTools, core::kIndexThreadsTool, entry->conversation.messages());
-    if (!outcome.ran) {
-        // Refused. Nothing is written to the transcript: a line saying a tool
-        // could not run is noise, and the panel already says why.
+
+    // A refusal is reported rather than swallowed. A tool that was skipped
+    // silently is indistinguishable from one that ran and found nothing, and
+    // the user who granted a capability deserves to know it went unused.
+
+    if (m_idleTools.granted(core::ToolPermission::ReadConversations)) {
+        const core::ToolRunResult outcome = core::runIdleTool(
+            m_idleTools, core::kIndexThreadsTool, entry->conversation.messages());
+        if (outcome.ran) {
+            m_messageModel->appendMessage(core::MessageRole::Tool,
+                                          QString::fromStdString(outcome.summary),
+                                          MessageStatus::Complete);
+        } else {
+            m_idleToolNotice = QString::fromStdString(outcome.summary);
+        }
+    } else {
+        m_idleToolNotice = tr("No idle tool can run until you grant a capability.");
+    }
+
+    // The summariser costs tokens, so it is gated on more than permission: the
+    // model has to exist, and the worker has to be free of both a reply and the
+    // prewarm. A tool that competed with a real question for the worker would
+    // lose, and the user would watch their own answer stall behind a background
+    // summary they may not even know is running.
+    if (m_idleTools.permits(core::kSummariseSessionTool) && runtimeAvailable()
+        && m_warmupRequestId == 0 && m_toolRequestId == 0 && !m_generating && !m_speaking) {
+        startSessionSummary();
         return;
     }
-    m_messageModel->appendMessage(core::MessageRole::Tool,
-                                  QString::fromStdString(outcome.summary),
-                                  MessageStatus::Complete);
     emit presenceChanged();
+}
+
+void AppController::startSessionSummary() {
+    const ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) {
+        return;
+    }
+    // The material goes in the prompt rather than into the system prompt, so a
+    // background summary cannot quietly change how every later reply is
+    // answered.
+    QString material;
+    for (const core::Message& message : entry->conversation.messages()) {
+        const QString prefix = message.role == core::MessageRole::User
+            ? QStringLiteral("User: ")
+            : QStringLiteral("Kestrel: ");
+        material += prefix + QString::fromStdString(message.content) + QLatin1Char('\n');
+        if (material.size() > kSummaryMaterialChars) {
+            material.truncate(kSummaryMaterialChars);
+            break;
+        }
+    }
+    m_toolRequestId = m_nextRequestId++;
+    m_worker->start(m_toolRequestId,
+                    QStringLiteral("Assistant: ") + material
+                        + QStringLiteral("\nIn two sentences, what is this session about?"),
+                    0.3F, kSummaryMaxTokens);
 }
 
 void AppController::onIdleTick() {
@@ -1100,6 +1185,31 @@ void AppController::onGenerationFinished(quint64 requestId,
         // An idle prewarm, not a reply. Its output was never shown; the only
         // consequence is that the backend is warm and its counters moved.
         m_warmupRequestId = 0;
+        refreshCachedRuntime();
+        emit generatingChanged();
+        emit runtimeChanged();
+        emit presenceChanged();
+        return;
+    }
+    if (requestId == m_toolRequestId) {
+        // A permissioned idle run, not a reply. It is recorded in the
+        // transcript as what it is -- a note Kestrel wrote to itself while the
+        // user was away -- and then released, so the worker is free for the
+        // next real question.
+        m_toolRequestId = 0;
+        const int lastRow = m_messageModel->rowCount() - 1;
+        const QString said = success && lastRow >= 0
+            ? m_messageModel->data(m_messageModel->index(lastRow, 0),
+                                   MessageModel::ContentRole).toString()
+            : QString();
+        m_messageModel->setLastMessageStatus(MessageStatus::Complete, {});
+        if (!said.trimmed().isEmpty()) {
+            m_idleToolNotice = tr("Summarised the session.");
+        } else {
+            m_idleToolNotice = error.isEmpty()
+                ? tr("The session summary came back empty.")
+                : tr("Session summary failed: %1").arg(error);
+        }
         refreshCachedRuntime();
         emit generatingChanged();
         emit runtimeChanged();
