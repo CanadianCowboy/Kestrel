@@ -120,6 +120,8 @@ add_library(kestrel_core
     src/runtime/tensorrtbackend.h
     src/storage/atomicfile.cpp
     src/storage/atomicfile.h
+    src/storage/json.cpp
+    src/storage/json.h
     src/storage/paths.cpp
     src/storage/paths.h
     src/storage/secretstore.h
@@ -360,6 +362,14 @@ if(KESTREL_BUILD_TESTS)
     # the system one or already a load-time dependency of the process. It does
     # need cudart under a CUDA build, which is handled with the other tests.
 
+    # The document format the profile is written in. Separate from the storage
+    # tests because it has no keystore in it at all: a JSON parser that only
+    # runs when a platform keystore happens to be present is a JSON parser that
+    # is never run.
+    add_executable(kestrel_json_tests tests/json_tests.cpp)
+    target_link_libraries(kestrel_json_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_json_tests COMMAND kestrel_json_tests)
+
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
     # implicitly on Windows.
@@ -373,7 +383,8 @@ if(KESTREL_BUILD_TESTS)
         foreach(_kestrel_cuda_test
                 kestrel_core_tests
                 kestrel_runtime_tests
-                kestrel_storage_tests)
+                kestrel_storage_tests
+                kestrel_json_tests)
             set_tests_properties(${_kestrel_cuda_test} PROPERTIES
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
         endforeach()
