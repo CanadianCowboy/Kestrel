@@ -4,14 +4,11 @@
   <metadata_license>CC0-1.0</metadata_license>
   <!--
     The LICENSE file is MIT with an additive express patent grant, which is not
-    an SPDX identifier. AppStream's custom form is the documented way to say so
-    honestly; claiming plain MIT would understate the patent terms in whatever
-    software centre reads this.
+    an SPDX identifier, so it is named with a LicenseRef rather than claimed as
+    plain MIT. That would understate the patent terms in any software centre
+    that reads this.
   -->
-  <project_license type="custom">
-    <license_ref>LicenseRef-Kestrel-MIT-Patent</license_ref>
-    <name>MIT with express patent grant</name>
-  </project_license>
+  <project_license>LicenseRef-Kestrel-MIT-Patent</project_license>
   <name>Kestrel</name>
   <summary>Chat privately with local models on your own machine</summary>
   <description>
@@ -28,6 +25,9 @@
   <launchable type="desktop-id">io.github.canadiancowboy.kestrel.desktop</launchable>
   <url type="homepage">https://github.com/CanadianCowboy/Kestrel</url>
   <url type="bugtracker">https://github.com/CanadianCowboy/Kestrel/issues</url>
+  <developer id="io.github.canadiancowboy">
+    <name>JoshLynes</name>
+  </developer>
   <provides>
     <binary>kestrel</binary>
   </provides>

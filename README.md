@@ -101,7 +101,8 @@ opposite of what Kestrel wants.
 
 ### Required for the core and tests
 
-- Windows 10/11 x64, or a current Linux distribution (Ubuntu 22.04 or newer)
+- Windows 10/11 x64, or a current Linux distribution (Ubuntu 24.04 or newer;
+  22.04 works once CMake is upgraded, as noted below)
 - CMake 3.24 or newer
 - A compiler with C++20 support
 - Ninja or another supported CMake generator
@@ -223,20 +224,42 @@ discovery degrades to the portable stub.
 
 ### Prerequisites
 
+The distribution packages cover the core build; the desktop target needs
+versions Ubuntu does not currently ship, so the two are listed separately.
+
 ```bash
-sudo apt-get install -y build-essential cmake ninja-build git
-sudo apt-get install -y qt6-base-dev qt6-declarative-dev
+sudo apt-get install -y build-essential ninja-build git python3-pip
 ```
 
-`qt6-base-dev` provides Qt Core and `qt6-declarative-dev` provides Qt Quick and
-Qt Quick Controls 2. Without them CMake skips the desktop target and builds the
-core and its tests, which is the same degradation a contributor without Qt gets
-on any platform.
+For the core, tests, and the engine-build tool, any CMake 3.24 or newer:
+
+```bash
+sudo apt-get install -y cmake       # 3.28 on Ubuntu 24.04
+```
+
+Ubuntu 22.04 ships CMake 3.22, which is below the minimum. `pip install cmake`
+or Kitware's APT repository fixes that; nothing else in the core build needs
+changing.
+
+For the desktop application, Qt 6.6 or newer. No Ubuntu release ships it: 22.04
+has 6.2.4 and 24.04 has 6.4.2, so `apt install qt6-base-dev` will not do. Get it
+from qt.io or install the same build the CI uses:
+
+```bash
+pip install --user aqtinstall
+~/.local/bin/aqt install-qt linux desktop 6.9.0 gcc_64 -O "$HOME/Qt"
+```
+
+That provides Qt Core, Qt Quick, and Qt Quick Controls 2. Without a Qt 6.6 or
+newer prefix, CMake skips the desktop target and builds the core and its tests,
+which is the same degradation a contributor without Qt gets on any platform.
 
 ### Build, test, and install
 
 ```bash
-cmake -S . -B build -G Ninja -DKESTREL_BUILD_UI=ON
+cmake -S . -B build -G Ninja \
+  -DKESTREL_BUILD_UI=ON \
+  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.0/gcc_64"
 cmake --build build
 ctest --test-dir build --output-on-failure
 sudo cmake --install build

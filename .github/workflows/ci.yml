@@ -183,7 +183,7 @@ jobs:
       - name: Install the desktop validators
         run: |
           sudo apt-get update
-          sudo apt-get install -y desktop-file-utils libxml2-utils
+          sudo apt-get install -y desktop-file-utils appstream
 
       - name: Configure
         run: |
@@ -246,7 +246,11 @@ jobs:
             exit 1
           fi
           desktop-file-validate "$STAGE/share/applications/io.github.canadiancowboy.kestrel.desktop"
-          xmllint --noout "$STAGE/share/metainfo/io.github.canadiancowboy.kestrel.metainfo.xml"
+          # appstreamcli, not xmllint: well-formed XML can still be meaningless
+          # AppStream, and a rejected metainfo file means no software centre
+          # ever shows the application.
+          appstreamcli validate --no-net \
+            "$STAGE/share/metainfo/io.github.canadiancowboy.kestrel.metainfo.xml"
 
       # Linking and installing are not proof the installed app still loads its
       # QML. It is started for real, from the staging prefix, and asked to quit

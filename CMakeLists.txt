@@ -167,21 +167,20 @@ if(KESTREL_LLAMA_CPP_ENABLED)
             # backend -- and recent releases add libllama-impl.so. Naming two of
             # them by hand links on a tree that happens to match that pair and
             # fails to resolve the rest everywhere else, so link what is
-            # actually installed. GLOB is evaluated once per configure, which
-            # matches how the rest of this file resolves optional dependencies.
+            # actually installed. Both the unversioned development symlinks and
+            # the versioned objects are collected, because a prefix can have
+            # one form for llama and the other for ggml; a name that matches
+            # both patterns appears twice and is linked once.
+            # GLOB is evaluated once per configure, which matches how the rest
+            # of this file resolves optional dependencies.
             set(_kestrel_llama_libdir "${KESTREL_LLAMA_CPP_ROOT}/lib")
             file(GLOB _kestrel_llama_libs
                 "${_kestrel_llama_libdir}/libllama.so"
                 "${_kestrel_llama_libdir}/libllama-impl.so"
-                "${_kestrel_llama_libdir}/libggml*.so")
-            if(NOT _kestrel_llama_libs)
-                # No unversioned development symlinks: a shared-only build tree
-                # keeps only libllama.so.1 and friends. Take the versioned names
-                # rather than declaring the backend unavailable.
-                file(GLOB _kestrel_llama_libs
-                    "${_kestrel_llama_libdir}/libllama*.so.*"
-                    "${_kestrel_llama_libdir}/libggml*.so.*")
-            endif()
+                "${_kestrel_llama_libdir}/libggml*.so"
+                "${_kestrel_llama_libdir}/libllama*.so.*"
+                "${_kestrel_llama_libdir}/libggml*.so.*")
+            list(REMOVE_DUPLICATES _kestrel_llama_libs)
             if(NOT _kestrel_llama_libs)
                 message(WARNING
                     "Kestrel: ${KESTREL_LLAMA_CPP_ROOT} has headers but no llama.cpp "
