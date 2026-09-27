@@ -123,6 +123,17 @@ public:
             unavailableReason = error;
             return false;
         }
+        // And the sealed bytes have to actually reach the disk before the
+        // removal below means anything. Deleting a file that was never written
+        // succeeds -- "was never there" is the state the caller asked for --
+        // so a probe that only sealed and then deleted was testing DPAPI and
+        // nothing else. A directory that accepts no writes, or that is
+        // read-only, passed it, and the first save of a real profile is where
+        // that would have been found instead.
+        if (!writeFileAtomically(blobPath("com.kestrel.probe", "probe"), sealedBytes, error)) {
+            unavailableReason = "the keystore would not store a test value: " + error;
+            return false;
+        }
         // The probe has to come back out again. A failure here is not cosmetic:
         // it means the directory accepts a write and refuses a delete, which is
         // the state where "forget everything" would leave the probe behind.
