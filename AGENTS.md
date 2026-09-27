@@ -7,8 +7,11 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
 
 ## Repository map
 
-- `src/core/`: conversation and message domain state; keep this layer portable and
-  independent of Qt and inference SDKs.
+- `src/core/`: conversation and message domain state, the assistant's personality
+  (`persona.*`), the presence projection the UI animates on (`presence.*`), the
+  sandboxed idle loop (`idlepersona.*`), and the voice response timeline
+  (`voicesession.*`); keep this layer portable and independent of Qt and
+  inference SDKs.
 - `src/runtime/`: backend contracts and adapters. Keep native llama.cpp and
   TensorRT integration contained in their respective adapters.
 - `src/app/`: Qt application startup and UI-facing controller.
@@ -38,6 +41,17 @@ file; extend `cudadevice.h` and the existing implementation instead.
   discovery, engine records, and backend selection.
 - Keep model-specific code behind `ModelBackend`; the mock backend must remain
   usable without external model runtimes.
+- Keep the idle loop local. `IdlePersona` may only produce strings, numbers, and
+  enums, and may not gain a network, filesystem, or command capability. The one
+  task that touches the GPU (`ModelWarmup`) stays opt-in. Anything that needs
+  those capabilities is an agent tool with explicit permission, not idle work.
+- Time is injected into `core` by its owner, never read from a clock. That is
+  what keeps the presence easing and the idle cadence testable.
+- Compile options are shared on purpose: `KESTREL_STRICT_FLAGS` in
+  `CMakeLists.txt` is applied to the library and to the tests, because a test
+  built more leniently than the code it covers can pass against a translation
+  unit the shipping target would reject. `/utf-8` is part of that contract
+  because the persona layer emits real ellipses and middots.
 - Report failures as actionable messages that tell the user what to do next, not
   bare status codes. A missing GPU, an old driver, and a mismatched engine are
   different problems and need different advice.

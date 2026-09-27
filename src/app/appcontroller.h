@@ -4,14 +4,19 @@
 #include <QObject>
 #include <QString>
 #include <QThread>
+#include <QTimer>
 #include <QVariantList>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "app/conversationentry.h"
 #include "app/conversationmodel.h"
 #include "app/messagemodel.h"
+#include "core/idlepersona.h"
+#include "core/persona.h"
+#include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/cudadevice.h"
 #include "runtime/modelbackend.h"
@@ -68,6 +73,36 @@ class AppController final : public QObject {
     Q_PROPERTY(bool canPause READ canPause NOTIFY voiceChanged)
     Q_PROPERTY(bool canResume READ canResume NOTIFY voiceChanged)
     Q_PROPERTY(bool canBargeIn READ canBargeIn NOTIFY voiceChanged)
+
+    // Assistant presence, projected from the core presence engine. The UI
+    // animates on these instead of on raw events, so a pulse means the same
+    // thing whether it was caused by a keystroke, a barge-in, or the idle loop.
+    Q_PROPERTY(QString presenceState READ presenceState NOTIFY presenceChanged)
+    Q_PROPERTY(double presenceIntensity READ presenceIntensity NOTIFY presenceChanged)
+    Q_PROPERTY(bool presenceSpeaking READ presenceSpeaking NOTIFY presenceChanged)
+    Q_PROPERTY(QString personaMood READ personaMood NOTIFY presenceChanged)
+    // The single status line shown under the composer: an activity whisper, or
+    // an anticipatory line while one is still fresh.
+    Q_PROPERTY(QString statusWhisper READ statusWhisper NOTIFY presenceChanged)
+    // The cue said the moment a request is accepted. Empty once the answer is
+    // already underway, so a consumer can speak it once and move on.
+    Q_PROPERTY(QString acknowledgement READ acknowledgement NOTIFY presenceChanged)
+    // Kestrel's own thought between turns. Always populated, displayed only when
+    // the user asks to see it: an internal note that leaks by default is not an
+    // internal note.
+    Q_PROPERTY(QString ambientThought READ ambientThought NOTIFY presenceChanged)
+    Q_PROPERTY(QString idleTaskLabel READ idleTaskLabel NOTIFY presenceChanged)
+    Q_PROPERTY(QString sessionTopic READ sessionTopic NOTIFY presenceChanged)
+
+    // The autonomous loop between turns, plus the two switches that keep it
+    // inside its box: the loop itself, the GPU prewarm that is off until asked
+    // for, and the reveal of internal thoughts.
+    Q_PROPERTY(bool idleLoopEnabled READ idleLoopEnabled WRITE setIdleLoopEnabled NOTIFY presenceChanged)
+    Q_PROPERTY(bool idlePrewarmEnabled READ idlePrewarmEnabled WRITE setIdlePrewarmEnabled NOTIFY presenceChanged)
+    Q_PROPERTY(bool showIdleThoughts READ showIdleThoughts WRITE setShowIdleThoughts NOTIFY presenceChanged)
+    // True while the composer holds unsent text. The idle loop goes quiet
+    // whenever this is set, so a half-typed question is never interrupted.
+    Q_PROPERTY(bool inputPending READ inputPending WRITE setInputPending NOTIFY presenceChanged)
 
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
 
@@ -141,6 +176,25 @@ public:
     [[nodiscard]] bool canResume() const noexcept;
     [[nodiscard]] bool canBargeIn() const noexcept;
 
+    [[nodiscard]] QString presenceState() const;
+    [[nodiscard]] double presenceIntensity() const noexcept;
+    [[nodiscard]] bool presenceSpeaking() const noexcept;
+    [[nodiscard]] QString personaMood() const;
+    [[nodiscard]] QString statusWhisper() const;
+    [[nodiscard]] QString acknowledgement() const noexcept;
+    [[nodiscard]] QString ambientThought() const;
+    [[nodiscard]] QString idleTaskLabel() const;
+    [[nodiscard]] QString sessionTopic() const;
+    [[nodiscard]] bool idleLoopEnabled() const noexcept;
+    [[nodiscard]] bool idlePrewarmEnabled() const noexcept;
+    [[nodiscard]] bool showIdleThoughts() const noexcept;
+    [[nodiscard]] bool inputPending() const noexcept;
+
+    void setIdleLoopEnabled(bool enabled);
+    void setIdlePrewarmEnabled(bool enabled);
+    void setShowIdleThoughts(bool show);
+    void setInputPending(bool pending);
+
     [[nodiscard]] bool gpuAvailable() const;
     [[nodiscard]] QString gpuName() const;
     [[nodiscard]] QString gpuSummary() const;
@@ -197,11 +251,18 @@ signals:
     void modelLoadFinished();
     void metricsChanged();
     void voiceChanged();
+    /// Notifies observers that presence, mood, or the status line changed.
+    void presenceChanged();
 
 private:
     // Worker callbacks, delivered on the UI thread by queued connections.
     void onGenerationToken(quint64 requestId, const QString& token);
     void onGenerationFinished(quint64 requestId, bool success, const QString& error);
+
+    // The idle thought cycle, driven by m_idleTimer. Silent whenever the user
+    // is present: a turn is running, the voice is live, or something is typed
+    // and unsent.
+    void onIdleTick();
 
     [[nodiscard]] ConversationEntry* findEntry(int id) noexcept;
     [[nodiscard]] ConversationEntry* activeEntry() noexcept;
@@ -216,7 +277,7 @@ private:
     /// Assembles the text actually sent to the model: the recent conversation
     /// followed by an assistant cue. The shared system prompt is excluded on
     /// purpose, because the backend keeps it as a cached prefix.
-    [[nodiscard]] QString buildPrompt(const QString& userText) const;
+    [[nodiscard]] QString buildPrompt() const;
 
     /// Spins the UI event loop until the in-flight generation reports back, or
     /// the timeout expires. Needed before swapping or destroying a backend,
@@ -236,6 +297,24 @@ private:
     void resetMetrics();
     void publishMetrics();
     void rebuildDiagnostics();
+
+    /// Monotonic milliseconds since the controller was created. Passed to the
+    /// presence engine and the idle loop rather than letting either read a
+    /// clock, so their behaviour is reproducible in tests.
+    [[nodiscard]] std::uint64_t nowMs() const noexcept;
+
+    /// Records what the assistant is doing and republishes presence.
+    void noteAssistant(core::AssistantAction action);
+
+    /// Offers an anticipatory line for this long, then lets the activity
+    /// whisper take the status line back.
+    void setWhisperOverride(const QString& text, int holdMs);
+
+    /// Asks the persona whether this moment deserves a line, and shows it if so.
+    void anticipate(core::PersonaTrigger trigger);
+
+    /// Any user or assistant action. Keeps the idle loop out of the way.
+    void noteActivity();
 
     std::unique_ptr<runtime::ModelBackend> m_backend;
 
@@ -276,6 +355,27 @@ private:
     // Voice state machine. Owns the response timeline and is the authority on
     // what the UI is allowed to offer next.
     core::VoiceSession m_voice;
+
+    // The personality, the presence projection of it, and the loop that keeps
+    // the assistant company between turns. All three are portable core; this
+    // layer only polls them and translates the results into Qt properties.
+    core::Persona m_persona;
+    core::IdlePersona m_idle;
+    core::Presence m_presence;
+    QElapsedTimer m_clock;
+    QTimer m_idleTimer;
+    // In-flight GPU prewarm from the idle loop, or 0 when none is running. The
+    // loop is silent while this is set, so a second warmup cannot stack behind
+    // the first.
+    quint64 m_warmupRequestId = 0;
+
+    QString m_statusWhisperOverride;
+    qint64 m_whisperOverrideUntilMs = 0;
+    QString m_acknowledgement;
+    QString m_ambientThought;
+    QString m_idleTaskLabel;
+    bool m_inputPending = false;
+    bool m_showIdleThoughts = false;
     core::ResponseId m_activeResponse = core::kInvalidResponseId;
     core::GenerationId m_activeGeneration = core::kInvalidGenerationId;
     quint64 m_nextRequestId = 1;

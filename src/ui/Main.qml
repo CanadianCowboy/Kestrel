@@ -27,6 +27,48 @@ ApplicationWindow {
         readonly property color canvas: window.canvas
     }
 
+    // A switch for the presence panel. Declared here rather than repeated three
+    // times in the diagnostics column, because the file already styles every
+    // control by hand and a stock CheckBox would not match it.
+    component IdleToggle: RowLayout {
+        id: toggle
+        required property string label
+        property string hint: ""
+        property bool checked: false
+        signal toggled()
+        Layout.fillWidth: true
+        spacing: 10
+        Rectangle {
+            width: 14
+            height: 14
+            radius: 4
+            color: toggle.checked ? window.accent : "#1a1d23"
+            border.color: toggle.checked ? window.accent : window.line
+            Behavior on color { ColorAnimation { duration: 140 } }
+        }
+        Text {
+            text: toggle.label
+            color: window.ink
+            font.pixelSize: 12
+            Layout.fillWidth: true
+        }
+        MouseArea {
+            Layout.preferredWidth: 14
+            Layout.preferredHeight: 14
+            cursorShape: Qt.PointingHandCursor
+            onClicked: toggle.toggled()
+        }
+        ToolTip.visible: hover.containsMouse && toggle.hint.length > 0
+        ToolTip.text: toggle.hint
+        ToolTip.delay: 400
+        MouseArea {
+            id: hover
+            anchors.fill: parent
+            hoverEnabled: true
+            acceptedButtons: Qt.NoButton
+        }
+    }
+
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
     Shortcut { sequence: "Ctrl+K"; onActivated: composer.forceActiveFocus() }
     Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
@@ -209,6 +251,53 @@ ApplicationWindow {
                         Text { text: "Private workspace  ·  local only"; color: window.muted; font.pixelSize: 11 }
                     }
                     Item { Layout.fillWidth: true }
+                    // The presence indicator. A soft pulse and a mood, with no
+                    // controls attached: it reports that Kestrel is there
+                    // without becoming a dashboard.
+                    Rectangle {
+                        id: presencePill
+                        implicitWidth: presenceRow.implicitWidth + 28
+                        implicitHeight: 34
+                        radius: 17
+                        color: "#161e1c"
+                        border.color: "#2b3a35"
+                        opacity: 0.62 + 0.38 * appController.presenceIntensity
+                        Behavior on opacity { NumberAnimation { duration: 240 } }
+                        Row {
+                            id: presenceRow
+                            anchors.centerIn: parent
+                            spacing: 9
+                            Rectangle {
+                                width: 8; height: 8; radius: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: window.accent
+                                SequentialAnimation on scale {
+                                    loops: Animation.Infinite
+                                    running: appController.presenceSpeaking
+                                    NumberAnimation { from: 1.0; to: 1.8; duration: 850; easing.type: Easing.InOutSine }
+                                    NumberAnimation { from: 1.8; to: 1.0; duration: 850; easing.type: Easing.InOutSine }
+                                }
+                            }
+                            Text {
+                                text: appController.presenceState
+                                color: window.accent
+                                font.pixelSize: 10
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 1.2
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                        ToolTip.visible: presenceHover.containsMouse
+                        ToolTip.text: "Kestrel is " + appController.presenceState
+                                      + " · " + appController.personaMood
+                        ToolTip.delay: 400
+                        MouseArea {
+                            id: presenceHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
+                        }
+                    }
                     Rectangle {
                         id: gpuBadge
                         implicitWidth: 126
@@ -318,78 +407,169 @@ ApplicationWindow {
                             onCountChanged: Qt.callLater(function() { positionViewAtEnd() })
                         }
 
-                        Rectangle {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 68
-                            radius: 18
-                            color: "#191c22"
-                            border.color: composer.activeFocus ? "#55776a" : window.line
-                            Behavior on border.color { ColorAnimation { duration: 160 } }
-
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: 18
-                                anchors.rightMargin: 10
-                                spacing: 10
-                                TextArea {
-                                    id: composer
-                                    Layout.fillWidth: true
-                                    Layout.fillHeight: true
-                                    placeholderText: "Message Kestrel..."
-                                    placeholderTextColor: "#626a77"
-                                    color: window.ink
-                                    font.pixelSize: 14
-                                    wrapMode: TextArea.Wrap
-                                    background: Item {}
-                                    verticalAlignment: TextEdit.AlignVCenter
-                                    Keys.onReturnPressed: function(event) {
-                                        if (!(event.modifiers & Qt.ShiftModifier)) {
-                                            appController.sendMessage(text)
-                                            text = ""
-                                            event.accepted = true
-                                        }
-                                    }
-                                }
-                                Button {
-                                    id: pauseResumeButton
-                                    // Only offered when the voice state machine
-                                    // says the transition is actually legal, so
-                                    // the button can never be a no-op that
-                                    // silently does nothing.
-                                    visible: appController.canPause || appController.canResume
-                                    implicitWidth: 44
-                                    implicitHeight: 44
-                                    text: appController.canResume ? "▶" : "❚❚"
-                                    onClicked: {
-                                        if (appController.canResume) appController.resumeConversation()
-                                        else appController.pauseConversation()
-                                    }
-                                    contentItem: Text {
-                                        text: pauseResumeButton.text
-                                        color: window.ink
-                                        font.pixelSize: 13
-                                        horizontalAlignment: Text.AlignHCenter
-                                        verticalAlignment: Text.AlignVCenter
-                                    }
-                                    background: Rectangle {
-                                        radius: 13
-                                        color: "#232830"
-                                        border.color: window.line
-                                    }
-                                }
-                                Button {
-                                    implicitWidth: 44
-                                    implicitHeight: 44
-                                    text: appController.generating ? "■" : "↑"
-                                    onClicked: {
-                                        if (appController.generating) appController.stopGeneration()
-                                        else { appController.sendMessage(composer.text); composer.text = "" }
-                                    }
-                                    contentItem: Text { text: parent.text; color: window.accentInk; font.pixelSize: 20; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                    background: Rectangle { radius: 13; color: window.accent }
+                        // One line, saying what Kestrel is doing. Deliberately
+                        // not a panel and not a banner: this is the only status
+                        // surface in the window, so it can stay quiet.
+                        RowLayout {
+                            Layout.alignment: Qt.AlignHCenter
+                            Layout.bottomMargin: 2
+                            spacing: 9
+                            Rectangle {
+                                width: 6; height: 6; radius: 3
+                                color: window.accent
+                                // Tied to the presence engine rather than to any
+                                // one event, so the dot breathes with Kestrel's
+                                // state instead of blinking on token arrival.
+                                opacity: 0.3 + 0.55 * appController.presenceIntensity
+                                SequentialAnimation on scale {
+                                    loops: Animation.Infinite
+                                    running: appController.presenceSpeaking
+                                    NumberAnimation { from: 1.0; to: 1.7; duration: 900; easing.type: Easing.InOutSine }
+                                    NumberAnimation { from: 1.7; to: 1.0; duration: 900; easing.type: Easing.InOutSine }
                                 }
                             }
+                            Text {
+                                text: appController.statusWhisper
+                                color: window.muted
+                                font.pixelSize: 11
+                            }
+                            // The idle loop's own thought. Hidden unless asked
+                            // for: an internal note that shows by default is
+                            // not an internal note.
+                            Text {
+                                visible: appController.showIdleThoughts && appController.ambientThought.length > 0
+                                text: "· " + appController.ambientThought
+                                color: "#4d5a68"
+                                font.pixelSize: 11
+                                font.italic: true
+                            }
                         }
+
+                        Item {
+                            id: composerDock
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 84
+
+                            // The breathing glow. Slow, wide, and close to
+                            // invisible, so the field reads as alive rather than
+                            // as decorated.
+                            Rectangle {
+                                anchors.fill: composerShell
+                                anchors.margins: -7
+                                radius: 25
+                                color: "transparent"
+                                border.width: 1
+                                border.color: window.accent
+                                opacity: 0.12
+                                NumberAnimation on opacity {
+                                    from: 0.08; to: 0.34
+                                    duration: 3600
+                                    loops: Animation.Infinite
+                                    running: composerDock.visible
+                                    easing.type: Easing.InOutSine
+                                }
+                            }
+
+                            // The audio-reactive ring. Only alive while Kestrel
+                            // is speaking, and bright in proportion to the
+                            // presence intensity, so it tracks meaning rather
+                            // than raw audio amplitude.
+                            Rectangle {
+                                anchors.fill: composerShell
+                                anchors.margins: -7
+                                radius: 25
+                                color: "transparent"
+                                border.width: 1
+                                border.color: window.accent
+                                opacity: appController.presenceSpeaking
+                                         ? 0.14 + 0.42 * appController.presenceIntensity : 0
+                                visible: opacity > 0.01
+                                SequentialAnimation on scale {
+                                    running: appController.presenceSpeaking
+                                    loops: Animation.Infinite
+                                    NumberAnimation { from: 1.0; to: 1.014; duration: 460; easing.type: Easing.InOutSine }
+                                    NumberAnimation { from: 1.014; to: 1.0; duration: 460; easing.type: Easing.InOutSine }
+                                }
+                            }
+
+                                Rectangle {
+                                id: composerShell
+                                anchors.fill: parent
+                                radius: 18
+                                color: "#191c22"
+                                border.color: composer.activeFocus ? "#55776a" : window.line
+                                Behavior on border.color { ColorAnimation { duration: 160 } }
+
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 18
+                                    anchors.rightMargin: 10
+                                    spacing: 10
+                                    TextArea {
+                                        id: composer
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        // Anything unsent is a person being present,
+                                        // so the idle loop goes quiet before it can
+                                        // decide anything.
+                                        onTextChanged: appController.inputPending = length > 0
+                                        onActiveFocusChanged: appController.inputPending = activeFocus || length > 0
+                                        placeholderText: "Message Kestrel..."
+                                        placeholderTextColor: "#626a77"
+                                        color: window.ink
+                                        font.pixelSize: 14
+                                        wrapMode: TextArea.Wrap
+                                        background: Item {}
+                                        verticalAlignment: TextEdit.AlignVCenter
+                                        Keys.onReturnPressed: function(event) {
+                                            if (!(event.modifiers & Qt.ShiftModifier)) {
+                                                appController.sendMessage(text)
+                                                text = ""
+                                                event.accepted = true
+                                            }
+                                        }
+                                    }
+                                    Button {
+                                        id: pauseResumeButton
+                                        // Only offered when the voice state machine
+                                        // says the transition is actually legal, so
+                                        // the button can never be a no-op that
+                                        // silently does nothing.
+                                        visible: appController.canPause || appController.canResume
+                                        implicitWidth: 44
+                                        implicitHeight: 44
+                                        text: appController.canResume ? "▶" : "❚❚"
+                                        onClicked: {
+                                            if (appController.canResume) appController.resumeConversation()
+                                            else appController.pauseConversation()
+                                        }
+                                        contentItem: Text {
+                                            text: pauseResumeButton.text
+                                            color: window.ink
+                                            font.pixelSize: 13
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+                                        background: Rectangle {
+                                            radius: 13
+                                            color: "#232830"
+                                            border.color: window.line
+                                        }
+                                    }
+                                    Button {
+                                        implicitWidth: 44
+                                        implicitHeight: 44
+                                        text: appController.generating ? "■" : "↑"
+                                        onClicked: {
+                                            if (appController.generating) appController.stopGeneration()
+                                            else { appController.sendMessage(composer.text); composer.text = "" }
+                                        }
+                                        contentItem: Text { text: parent.text; color: window.accentInk; font.pixelSize: 20; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                        background: Rectangle { radius: 13; color: window.accent }
+                                    }
+                                }
+                                }
+                            }
 
                         Text { text: "Kestrel can make mistakes. Nothing leaves this device."; color: "#555d69"; font.pixelSize: 10; Layout.alignment: Qt.AlignHCenter }
                     }
@@ -470,6 +650,78 @@ ApplicationWindow {
                             color: window.muted; font.pixelSize: 11
                             wrapMode: Text.Wrap
                             Layout.fillWidth: true
+                        }
+                    }
+                }
+
+                Text { text: "ASSISTANT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: presenceColumn.implicitHeight + 24
+                    radius: 12
+                    color: "#1a1d23"
+                    border.color: window.line
+                    ColumnLayout {
+                        id: presenceColumn
+                        anchors.fill: parent
+                        anchors.margins: 12
+                        spacing: 7
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "PRESENCE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text { text: appController.presenceState; color: window.ink; font.pixelSize: 12 }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "MOOD"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text { text: appController.personaMood; color: window.ink; font.pixelSize: 12 }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "TOPIC"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.sessionTopic.length > 0 ? appController.sessionTopic : "—"
+                                color: window.muted; font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideLeft
+                                Layout.maximumWidth: 170
+                            }
+                        }
+
+                        // The three switches that keep the idle loop inside its
+                        // box: whether it runs at all, whether it may touch the
+                        // GPU, and whether its private thoughts are shown.
+                        IdleToggle {
+                            label: "Idle loop"
+                            hint: "quiet internal work between turns"
+                            checked: appController.idleLoopEnabled
+                            onToggled: appController.idleLoopEnabled = !appController.idleLoopEnabled
+                        }
+                        IdleToggle {
+                            label: "GPU prewarm"
+                            hint: "opt-in: a discarded generation while idle"
+                            checked: appController.idlePrewarmEnabled
+                            onToggled: appController.idlePrewarmEnabled = !appController.idlePrewarmEnabled
+                        }
+                        IdleToggle {
+                            label: "Show thoughts"
+                            hint: "reveal what the idle loop is thinking"
+                            checked: appController.showIdleThoughts
+                            onToggled: appController.showIdleThoughts = !appController.showIdleThoughts
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            visible: appController.idleTaskLabel.length > 0
+                            text: appController.idleTaskLabel
+                            color: "#4d5a68"
+                            font.pixelSize: 11
+                            font.italic: true
+                            wrapMode: Text.Wrap
                         }
                     }
                 }

@@ -48,6 +48,9 @@ Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA
 │   ├── core/
 │   │   ├── conversation.h
 │   │   ├── conversation.cpp    # Conversation and message domain model
+│   │   ├── persona.*           # Tone profile, presence line, anticipatory lines
+│   │   ├── presence.*          # What Kestrel and the user last did, for the UI
+│   │   ├── idlepersona.*       # The sandboxed loop that runs between turns
 │   │   ├── voicesession.h
 │   │   └── voicesession.cpp    # Voice response timeline state machine
 │   ├── runtime/
@@ -64,6 +67,7 @@ Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA
 │       └── Main.qml            # Initial soft-glass desktop workspace
 └── tests/
     ├── core_tests.cpp          # Core behavior tests
+    ├── app_tests.cpp           # Qt threading, send path, and presence tests
     └── runtime_tests.cpp       # Device discovery, engine records, backend selection
 ```
 
@@ -544,6 +548,15 @@ queued call until generation had already finished, which is exactly too late.
 `ModelBackend` documents this contract: a backend must poll its cancellation
 flag between tokens, and must make `cancel()` safe to call from another thread.
 
+Voice pacing is decided in `VoiceSession` rather than in the interface, because
+the same decisions apply whether audio is synthesized locally or handed to a
+platform voice later. `planSpeech` splits generated text into clause-sized
+segments with the micro-pause that belongs between them, and `nextSpeechSegment`
+returns the next unspoken clause with absolute offsets into the response — which
+is what lets speech begin before generation finishes. A `VoicePersona` (voice id,
+rate, pitch, warmth, and three pause lengths) makes the pacing a value rather than
+a hardcoded constant.
+
 Because there is no audio engine yet, `VoiceSession` drives the visible
 timeline and playback is treated as delivered as soon as generation finishes.
 That is the text-only fallback the state machine defines for exactly this
@@ -553,6 +566,53 @@ message mid-response is a barge-in, which abandons the interrupted response
 and hands the timeline to the new prompt. The pause/resume control is only
 shown when the state machine says the transition is legal, so it can never be a
 button that silently does nothing.
+
+## Assistant presence and idle autonomy
+
+Kestrel is a presence, not a request box. Three portable pieces in `src/core/`
+carry that, and none of them is allowed to reach outside the process.
+
+**`Persona`** holds the tone profile and five dials (`focus`, `curiosity`,
+`initiative`, `calmness`, `presenceIntensity`). It produces the assistant-presence
+line that goes into the shared system prompt, the short acknowledgement said the
+moment a request is accepted, the one-line status whisper, and the anticipatory
+lines ("Would you like me to continue?", "Task complete."). The presence line is
+built from the fixed tone profile rather than the drifting dials, so it is
+byte-identical on every turn and the backend's cached prefix survives; the dials
+move, the rules do not.
+
+**`Presence`** records what the user did, what the assistant did, the voice and
+generation states, and the mood as plain booleans. The UI animates on that
+snapshot instead of on raw events, so a pulse means the same thing whether it
+came from a keystroke, a barge-in, or the idle loop. Time is injected by the
+owner rather than read from a clock, which keeps the easing deterministic.
+
+**`IdlePersona`** is the loop that runs when nobody is talking. It stays completely
+silent while a turn is generating, the voice is live, or something is typed and
+unsent; it drifts the dials over time and weights its own work by them, so
+personality is arithmetic rather than prompt text. Because the dials also decay
+every cycle, the loop is a cycle and not a ramp: an assistant that only ever
+gained curiosity and initiative would eventually become someone nobody wants to
+talk to.
+
+The safety boundary is stated as data in `IdlePolicy`, and it is deliberately
+narrower than it looks:
+
+- The task set is closed, and every entry is a string, a number, or an enum.
+  There is no "run a command" or "call an API" member, because a loop that can be
+  handed arbitrary work stops being a screensaver and starts being an unattended
+  agent.
+- There is no network or filesystem permission to grant, because the loop has no
+  way to reach either.
+- `ModelWarmup` is the only task that leaves pure computation, and it is off
+  until the user turns it on. Its tokens are discarded; the point is warm caches.
+- Idle thoughts are internal. They are populated always and displayed only when
+  the user asks to see them.
+
+Contributors adding to this layer must keep it that way. Anything that needs the
+network, the filesystem, or a destructive action is an agent tool, and it belongs
+behind `ModelBackend`-style permission, in the timeline, with confirmation — not
+in the idle loop.
 
 ## Safety and privacy principles
 

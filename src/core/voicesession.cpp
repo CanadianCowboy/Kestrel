@@ -19,6 +19,45 @@ bool isSentenceTerminator(char c) noexcept {
     return c == '.' || c == '!' || c == '?' || c == '\n';
 }
 
+bool isClauseSoftBreak(char c) noexcept {
+    return c == ',' || c == ';' || c == ':' || c == '\n';
+}
+
+// A clause shorter than this is not worth a pause of its own: "Well, no" split
+// in two sounds like a stutter rather than a breath.
+constexpr std::size_t kMinClauseChars = 16;
+
+// Closing characters that trail a terminator without ending the clause, e.g.
+// the quote in: He said "go." Then he left.
+bool isTrailingPunctuation(char c) noexcept {
+    return c == '"' || c == '\'' || c == ')' || c == ']' || c == '}' || c == '\u201d';
+}
+
+std::size_t skipSpace(std::string_view text, std::size_t i) noexcept {
+    while (i < text.size() && isWhitespace(text[i])) {
+        ++i;
+    }
+    return i;
+}
+
+// End of the clause beginning at `start`, or text.size().
+std::size_t clauseEndFrom(std::string_view text, std::size_t start) noexcept {
+    for (std::size_t i = start; i < text.size(); ++i) {
+        const char c = text[i];
+        if (isSentenceTerminator(c)) {
+            std::size_t end = i + 1;
+            while (end < text.size() && isTrailingPunctuation(text[end])) {
+                ++end;
+            }
+            return end;
+        }
+        if (isClauseSoftBreak(c) && i - start >= kMinClauseChars) {
+            return i + 1;
+        }
+    }
+    return text.size();
+}
+
 } // namespace
 
 const char* toString(ResponseState state) noexcept {
@@ -60,6 +99,75 @@ std::size_t sentenceStartBefore(std::string_view text, std::size_t offset) noexc
         start = next;
     }
     return start;
+}
+
+const VoicePersona& defaultVoicePersona() noexcept {
+    // A function-local static rather than an inline variable, so the default is
+    // constructed once and every translation unit agrees on it.
+    static const VoicePersona kDefault{};
+    return kDefault;
+}
+
+std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcept {
+    const std::size_t limit = std::min(offset, text.size());
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (isSentenceTerminator(text[i]) || isClauseSoftBreak(text[i])) {
+            const std::size_t next = skipSpace(text, i + 1);
+            // A soft break only starts a clause if what precedes it was long
+            // enough to be a clause, matching clauseEndFrom.
+            if (isSentenceTerminator(text[i]) || i - start >= kMinClauseChars) {
+                start = next;
+            }
+        }
+    }
+    return start;
+}
+
+int pauseAfterClause(std::string_view text, std::size_t clauseEnd,
+                     const VoicePersona& persona) noexcept {
+    if (clauseEnd == 0 || clauseEnd > text.size()) {
+        return persona.clausePauseMs;
+    }
+    // Look at the last meaningful character of the clause: a full stop earns a
+    // longer breath than a comma.
+    std::size_t last = clauseEnd;
+    while (last > 0 && isWhitespace(text[last - 1])) {
+        --last;
+    }
+    if (last == 0) {
+        return persona.clausePauseMs;
+    }
+    const char c = text[last - 1];
+    if (isSentenceTerminator(c) || isTrailingPunctuation(c)) {
+        return persona.sentencePauseMs;
+    }
+    return persona.clausePauseMs;
+}
+
+std::vector<SpeechSegment> planSpeech(std::string_view text, const VoicePersona& persona,
+                                      int openingPauseMs) {
+    std::vector<SpeechSegment> segments;
+    std::size_t i = skipSpace(text, 0);
+    int previousPause = openingPauseMs;
+    while (i < text.size()) {
+        const std::size_t end = clauseEndFrom(text, i);
+        SpeechSegment segment;
+        segment.text = std::string(text.substr(i, end - i));
+        segment.startOffset = i;
+        segment.endOffset = end;
+        // The first segment carries the caller's opening pause; every later one
+        // carries the pause implied by the clause before it.
+        segment.leadingPauseMs = previousPause;
+        segment.isFirst = segments.empty();
+        // The next segment waits for whatever the clause just ended with. The
+        // final clause sets a pause nobody will use, which is harmless and
+        // keeps the loop free of a special case.
+        previousPause = pauseAfterClause(text, end, persona);
+        segments.push_back(std::move(segment));
+        i = skipSpace(text, end);
+    }
+    return segments;
 }
 
 std::string_view VoiceResponse::spokenText() const noexcept {
@@ -269,6 +377,49 @@ bool VoiceSession::fail(ResponseId id, std::string error) {
     response->m_error = std::move(error);
     pushEvent(VoiceEventKind::ResponseFailed, id, response->m_error);
     return true;
+}
+
+void VoiceSession::setVoicePersona(VoicePersona persona) {
+    m_voicePersona = std::move(persona);
+}
+
+const VoicePersona& VoiceSession::voicePersona() const noexcept {
+    return m_voicePersona;
+}
+
+std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
+                                                             int openingPauseMs) const {
+    const VoiceResponse* response = find(id);
+    if (response == nullptr) {
+        return std::nullopt;
+    }
+    const std::string_view remainder = response->unspokenText();
+    if (remainder.empty()) {
+        return std::nullopt;
+    }
+
+    const std::size_t base = response->spokenOffset();
+    // A zero opening pause means "continue what was already being said", not
+    // "start abruptly". Each call replans from the remainder, so without this
+    // every clause after the first would be spoken with no gap at all.
+    int leadIn = openingPauseMs;
+    if (leadIn == 0) {
+        leadIn = base == 0
+                     ? m_voicePersona.leadInMs
+                     : pauseAfterClause(response->generatedText(), base, m_voicePersona);
+    }
+
+    // Plan against the remainder so offsets are relative to it, then shift them
+    // back onto the response timeline: the caller advances the spoken cursor
+    // with endOffset and the accounting stays exact.
+    const std::vector<SpeechSegment> planned = planSpeech(remainder, m_voicePersona, leadIn);
+    if (planned.empty()) {
+        return std::nullopt;
+    }
+    SpeechSegment segment = planned.front();
+    segment.startOffset += base;
+    segment.endOffset += base;
+    return segment;
 }
 
 const VoiceResponse* VoiceSession::find(ResponseId id) const noexcept {

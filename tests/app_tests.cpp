@@ -441,6 +441,100 @@ void testModelLoadReportsAsynchronously() {
           "failed load preserves the current backend");
 }
 
+// The assistant's own layer, seen from the controller: the persona is in the
+// shared prompt, presence is projected for the interface, and the idle loop
+// ships with everything local-only enabled and the GPU prewarm off.
+void testPresenceAndIdleLoopProject() {
+    std::cout << "presence and the idle loop project through the controller\n";
+
+    kestrel::app::AppController controller;
+    auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    controller.setBackendForTesting(std::move(backend));
+
+    check(controller.systemPrompt().contains(QStringLiteral("You are Kestrel")),
+          "the persona's presence line is part of the shared prompt");
+    check(controller.presenceState() == QStringLiteral("standing by"),
+          "an idle controller reports that it is standing by");
+    check(controller.statusWhisper() == QString::fromUtf8("Standing by\u2026"),
+          "the status line says the same thing in one line");
+    check(controller.idleLoopEnabled(), "the idle loop is on by default");
+    check(!controller.idlePrewarmEnabled(),
+          "the one idle task that reaches past the process is off until asked for");
+    check(!controller.showIdleThoughts(), "private thoughts are not revealed by default");
+    check(controller.ambientThought().isEmpty(), "nothing has been thought yet");
+
+    int presenceSignals = 0;
+    QObject::connect(&controller, &kestrel::app::AppController::presenceChanged,
+                     &controller, [&presenceSignals] { ++presenceSignals; });
+
+    // Switched off for the rest of the test: the tick timer runs on its own
+    // schedule, and a test that raced it would fail on a slow machine rather
+    // than on a real defect.
+    controller.setIdleLoopEnabled(false);
+    check(!controller.idleLoopEnabled(), "the loop can be switched off");
+    check(controller.ambientThought().isEmpty(), "switching it off clears its output");
+
+    controller.setIdlePrewarmEnabled(true);
+    check(controller.idlePrewarmEnabled(), "prewarming is opt-in and can be turned on");
+
+    controller.setInputPending(true);
+    check(controller.inputPending(), "unsent text reaches the idle gate");
+    controller.setInputPending(false);
+
+    controller.sendMessage(QStringLiteral("What is the plan for tensorrt?"));
+    check(controller.generating(), "the turn starts");
+    check(!controller.acknowledgement().isEmpty(),
+          "a cue is offered the moment a request is accepted");
+    check(controller.presenceState() == QStringLiteral("thinking"),
+          "presence reports the turn rather than the keystroke");
+    check(controller.presenceIntensity() >= 0.0 && controller.presenceIntensity() <= 1.0,
+          "the animated intensity stays in range");
+    check(controller.sessionTopic().contains(QStringLiteral("tensorrt")),
+          "the session keeps what the conversation is about");
+
+    QEventLoop loop;
+    QObject::connect(&controller, &kestrel::app::AppController::metricsChanged, &loop, [&] {
+        if (!controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    check(!controller.generating(), "the turn finished");
+    check(controller.acknowledgement().isEmpty(), "the cue is cleared once the answer is underway");
+    check(controller.presenceState() == QStringLiteral("standing by"),
+          "presence settles back to standing by");
+    check(controller.statusWhisper() == QString::fromUtf8("Standing by\u2026"),
+          "a short answer does not prompt for the next step by default");
+    check(presenceSignals > 0, "observers are told when presence changes");
+}
+
+void testLongAnswerIsOfferedToContinue() {
+    std::cout << "a long answer is offered to continue\n";
+
+    kestrel::app::AppController controller;
+    // Slow and long enough that the reply is unambiguously finished rather than
+    // truncated, which is the condition for the offer to be made at all.
+    auto backend = std::make_unique<SlowBackend>(200, 0);
+    controller.setBackendForTesting(std::move(backend));
+    controller.setIdleLoopEnabled(false);
+
+    controller.sendMessage(QStringLiteral("Explain tensorrt"));
+    QEventLoop loop;
+    QObject::connect(&controller, &kestrel::app::AppController::metricsChanged, &loop, [&] {
+        if (!controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    check(!controller.generating(), "the long turn finished");
+    check(controller.statusWhisper().startsWith(QStringLiteral("Would you like me to continue")),
+          "a long answer is offered to continue rather than left hanging");
+}
+
 /// Runs the Qt worker and file-URL tests; returns nonzero if any check fails.
 int main(int argc, char** argv) {
     // Unbuffered, so a crash still shows how far the run got. A lost buffer
@@ -455,6 +549,8 @@ int main(int argc, char** argv) {
     testSendMessageProducesAReply();
     testResumeUsesPartialAssistantPrompt();
     testModelLoadReportsAsynchronously();
+    testPresenceAndIdleLoopProject();
+    testLongAnswerIsOfferedToContinue();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;
