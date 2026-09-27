@@ -52,9 +52,9 @@ public:
     [[nodiscard]] const std::vector<Value>* asArray() const;
     [[nodiscard]] const std::vector<Member>* asObject() const;
 
-    // The first member with this key, or nullptr. First rather than last
-    // because a document carrying the same key twice is malformed input and the
-    // honest answer to "which one" is the one a reader would have stopped at.
+    // The member with this key, or nullptr. A parsed document never has two of
+    // the same name: parse() rejects a duplicate rather than picking one, so
+    // there is no "first" or "last" to choose between here.
     [[nodiscard]] const Value* find(std::string_view key) const;
     [[nodiscard]] bool has(std::string_view key) const { return find(key) != nullptr; }
 
@@ -89,7 +89,8 @@ public:
     [[nodiscard]] std::string serializeIndented(unsigned indent = 0) const;
 
     // Parses one complete JSON document. Trailing content other than
-    // whitespace is an error, not something to skip past.
+    // whitespace is an error, not something to skip past, and so is a member
+    // name that appears twice in one object.
     //
     // On failure returns nullopt and sets `error` to a message that names the
     // byte offset, because "invalid JSON" on its own has never once helped

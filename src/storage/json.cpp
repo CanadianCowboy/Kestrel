@@ -105,6 +105,18 @@ private:
             if (!key.has_value()) {
                 return std::nullopt;
             }
+            // A name that appears twice is rejected rather than resolved. This
+            // reader is for documents a person can open and edit, and
+            // {"a":1,"a":2} is a file whose text says one thing and whose
+            // meaning is another -- whichever way the tie is broken, it is not
+            // the way a reader of the file would guess. Silently keeping one of
+            // them is also how a document stops round-tripping: the duplicate
+            // collapses, and the bytes the checksum was taken over are not the
+            // bytes that come back out.
+            if (object.has(*key)) {
+                fail("the member name \"" + *key + "\" appears more than once");
+                return std::nullopt;
+            }
             skipWhitespace();
             if (atEnd() || peek() != ':') {
                 fail("expected a colon after the member name");
@@ -326,16 +338,28 @@ private:
             }
         }
         const std::string text(m_text.substr(start, m_at - start));
-        std::int64_t value = 0;
+        const bool negative = text.front() == '-';
+        // Accumulated as an unsigned magnitude, because the magnitude of
+        // INT64_MIN is one larger than INT64_MAX and building it in a signed
+        // type would reject the one value the serialiser is able to write.
+        std::uint64_t magnitude = 0;
         for (const char character : text) {
             const int digit = character == '-' ? 0 : character - '0';
-            if (value > (INT64_MAX - digit) / 10) {
+            const std::uint64_t limit =
+                negative ? static_cast<std::uint64_t>(INT64_MAX) + 1u
+                         : static_cast<std::uint64_t>(INT64_MAX);
+            if (magnitude > (limit - static_cast<std::uint64_t>(digit)) / 10u) {
                 fail("the number is too large");
                 return std::nullopt;
             }
-            value = value * 10 + digit;
+            magnitude = magnitude * 10u + static_cast<std::uint64_t>(digit);
         }
-        return Value::makeInteger(text.front() == '-' ? -value : value);
+        if (negative) {
+            return Value::makeInteger(magnitude == static_cast<std::uint64_t>(INT64_MAX) + 1u
+                                          ? INT64_MIN
+                                          : -static_cast<std::int64_t>(magnitude));
+        }
+        return Value::makeInteger(static_cast<std::int64_t>(magnitude));
     }
 
     std::string_view m_text;

@@ -120,6 +120,29 @@ void testEscapes() {
     }
 }
 
+void testTheSmallestAndLargestIntegers() {
+    // The serialiser can write INT64_MIN, so the reader has to be able to read
+    // it back. Building the magnitude in a signed type is the obvious way to
+    // get this wrong, and the obvious way looks correct until this exact value
+    // arrives.
+    const std::string document =
+        R"({"smallest":-9223372036854775808,"largest":9223372036854775807})";
+    const Value parsed = parseOrFail(document);
+    check(parsed.find("smallest") != nullptr &&
+              parsed.find("smallest")->asInteger().value_or(0) == INT64_MIN,
+          "the smallest 64-bit integer round-trips");
+    check(parsed.find("largest") != nullptr &&
+              parsed.find("largest")->asInteger().value_or(0) == INT64_MAX,
+          "and the largest");
+    check(parsed.serialize() == document, "and the document comes back byte for byte");
+
+    std::string error;
+    check(!Value::parse(R"({"too_big":9223372036854775808})", error).has_value(),
+          "one past the largest is rejected");
+    check(!Value::parse(R"({"too_small":-9223372036854775809})", error).has_value(),
+          "and one past the smallest");
+}
+
 void testMalformedDocumentsAreRejected() {
     struct Case {
         const char* document;
@@ -136,6 +159,8 @@ void testMalformedDocumentsAreRejected() {
         {"{\"a\" 1}", "a missing colon"},
         {"{a: 1}", "an unquoted member name"},
         {"[1, 2] trailing", "content after the document"},
+        {R"({"a":1,"a":2})", "a member name that appears twice"},
+        {R"({"a":1,"b":2,"a":3})", "a repeated name further in"},
         {R"("bad \q escape")", "an unknown escape"},
         {"\"a\nb\"", "a raw newline inside a string"},
         {"{\"a\":01}", "a leading zero"},
@@ -235,6 +260,7 @@ int main() {
     testScalarsRoundTrip();
     testSerializationIsCanonical();
     testEscapes();
+    testTheSmallestAndLargestIntegers();
     testMalformedDocumentsAreRejected();
     testNestingIsBounded();
     testErrorNamesWhereItWentWrong();

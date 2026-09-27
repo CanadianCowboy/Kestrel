@@ -219,6 +219,56 @@ void testMalformedAndMistypedDocumentsAreRefused() {
     }
 }
 
+void testAFailurePartWayThroughLeavesNothing() {
+    // The contract is that a failed load leaves an empty profile, and the easy
+    // way to keep it is to clear the output on the way in. That is not enough:
+    // a document whose first conversation is fine and whose second is not would
+    // otherwise leave the first one behind. Both halves are built here by hand,
+    // with correct checksums, so the failure is the document's shape and not
+    // the integrity check.
+    struct Case {
+        const char* conversations;
+        const char* because;
+    };
+    const std::vector<Case> cases = {
+        {R"([{"id":1,"messages":[]},{"id":"two"}])", "a bad id in the second conversation"},
+        {R"([{"id":1,"messages":[]},{"id":2,"messages":"nope"}])", "bad messages in the second"},
+        {R"([{"id":1,"messages":[]},"not a record"])", "a second entry that is not a record"},
+        {R"([{"id":1,"messages":[{"role":7}]}])", "a message with a mistyped field"},
+    };
+    for (const Case& one : cases) {
+        const std::string body = std::string(R"({"version":1,"conversations":)") + one.conversations + "}";
+        const std::string document = "{\n  \"version\": 1,\n  \"conversations\": " +
+                                     std::string(one.conversations) + ",\n" +
+                                     "  \"checksum\": \"" + Profile::checksumOf(body) + "\"\n}";
+
+        Profile loaded;
+        loaded.conversations.push_back(conversationWith(99, "left over from before"));
+        loaded.modelPath = "left over too";
+        std::string error;
+        check(!Profile::fromJson(document, loaded, error), std::string("refused: ") + one.because);
+        check(loaded.empty(),
+              std::string("and nothing at all is left behind: ") + one.because +
+                  " (had " + std::to_string(loaded.conversations.size()) + " conversations)");
+    }
+}
+
+void testAnOutOfRangeIdIsRefused() {
+    // The id is stored in an int. A 64-bit value that does not fit would be
+    // truncated silently, and the next save would write the truncated id back,
+    // so a round trip would quietly change the data.
+    const std::string body =
+        R"({"version":1,"conversations":[{"id":99999999999999,"messages":[]}]})";
+    const std::string document = std::string("{\n  \"version\": 1,\n  \"conversations\": ") +
+                                 R"([{"id":99999999999999,"messages":[]}],)" +
+                                 "\n  \"checksum\": \"" + Profile::checksumOf(body) + "\"\n}";
+
+    Profile loaded;
+    std::string error;
+    check(!Profile::fromJson(document, loaded, error), "an id that does not fit is refused");
+    check(loaded.empty(), "and leaves an empty profile");
+}
+
 void testForgetEverything() {
     InMemorySecretStore store;
     std::string error;
@@ -255,18 +305,23 @@ void testTitlesComeFromTheFirstThingSaid() {
     }
 
     // A title is a preview, and a preview that cuts a character in half is a
-    // document that no longer parses.
+    // document that no longer parses. The emoji has to land exactly on the cut
+    // for this to mean anything: put it anywhere else and the boundary logic is
+    // never reached, and the test passes for a reason that has nothing to do
+    // with what it is checking. Fifty-eight ASCII bytes puts the three-byte
+    // emoji at 58, 59 and 60, and the cut is at 60.
     Profile longOne;
-    longOne.upsertConversation(conversationWith(3, std::string(200, 'x') + "\xf0\x9f\x9a\x80 tail"));
+    longOne.upsertConversation(conversationWith(3, std::string(58, 'x') + "\xf0\x9f\x9a\x80 tail"));
     if (!longOne.conversations.empty()) {
         const std::string& title = longOne.conversations[0].title;
-        check(title.size() <= 64,
-              "a long title is cut to a preview, got " + std::to_string(title.size()) + " chars");
+        check(title.size() == 58,
+              "a title cut at a character boundary keeps every whole character, got " +
+                  std::to_string(title.size()) + " bytes");
         // Whatever the cut, it has to still be valid text.
         Profile reparsed;
         std::string reparseError;
         check(Profile::fromJson(longOne.toJson(), reparsed, reparseError),
-              "a truncated title is still valid text: " + reparseError);
+              "a title cut at a character boundary is still valid text: " + reparseError);
     }
 
     Profile withoutMessages;
@@ -359,6 +414,8 @@ int main() {
     testVersionFromTheFutureIsRefused();
     testAnOlderDocumentStillLoads();
     testMalformedAndMistypedDocumentsAreRefused();
+    testAFailurePartWayThroughLeavesNothing();
+    testAnOutOfRangeIdIsRefused();
     testForgetEverything();
     testTitlesComeFromTheFirstThingSaid();
     testUpsertReplacesRatherThanAppends();

@@ -3,6 +3,7 @@
 #include "storage/json.h"
 #include "storage/sha256.h"
 
+#include <limits>
 #include <utility>
 
 namespace kestrel::storage {
@@ -209,6 +210,14 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         error = "the profile's conversations are not a list";
         return false;
     }
+    // Built here and moved across only at the end. Appending straight into
+    // `out` would leave the conversations that parsed before the one that did
+    // not sitting in a profile the caller was told is empty -- which is the
+    // whole failure this function promises not to do, arrived at from the
+    // other direction.
+    Profile assembled;
+    assembled.modelPath = std::move(out.modelPath);
+    assembled.systemPrompt = std::move(out.systemPrompt);
     for (const json::Value& entry : *list) {
         if (!entry.isObject()) {
             error = "a conversation in the profile is not a record";
@@ -220,6 +229,15 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
             const auto number = id->asInteger();
             if (!number.has_value()) {
                 error = "a conversation in the profile has an id that is not a number";
+                return false;
+            }
+            // The id is stored in an int, so a 64-bit value that does not fit is
+            // a document to refuse rather than a number to truncate: a silent
+            // truncation would give the conversation a different id from the one
+            // in the file, and the next save would write that different id back.
+            if (*number < std::numeric_limits<int>::min() ||
+                *number > std::numeric_limits<int>::max()) {
+                error = "a conversation in the profile has an id that does not fit";
                 return false;
             }
             conversation.id = static_cast<int>(*number);
@@ -248,14 +266,20 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
                 conversation.messages.push_back(std::move(message));
             }
         }
-        out.conversations.push_back(std::move(conversation));
+        assembled.conversations.push_back(std::move(conversation));
     }
+    out = std::move(assembled);
     return true;
 }
 
 bool Profile::load(SecretStore& store, std::string_view account, std::string_view service,
                    Profile& out, std::string& error) {
     out = Profile{};
+    // Cleared here rather than left to the store, because whether a miss counts
+    // as success is decided below by asking whether this is empty -- and a
+    // caller that reuses one error string across calls must not be able to turn
+    // a first run into a failure by having something in it.
+    error.clear();
     const auto sealed = store.sealed(account, service, error);
     if (!sealed.has_value()) {
         // The SecretStore contract is that a missing account leaves `error`
