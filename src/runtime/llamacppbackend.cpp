@@ -189,7 +189,7 @@ void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
     if (loaded) {
-        const std::filesystem::path path(m_impl->modelPath);
+        const auto path = std::filesystem::u8path(m_impl->modelPath);
         // core::pathText rather than filename().string(): a model file under a
         // user name the ANSI code page cannot spell throws from string() on
         // Windows, and this is the line that decides what the UI calls the model.

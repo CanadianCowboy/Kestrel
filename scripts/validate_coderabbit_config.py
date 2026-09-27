@@ -64,10 +64,22 @@ if yaml is not None:
         to catch, arriving through the one loader it was relying on.
         """
 
-        def construct_mapping(self, node, deep=False):
+        def __init__(self, stream):
+            super().__init__(stream)
+            self._checked_mappings = set()
+
+        def flatten_mapping(self, node):
+            if node in self._checked_mappings:
+                return
+            # Keep only explicit keys: flattening prepends inherited entries
+            # and recursively processes merge sources through this method.
+            explicit_keys = [key for key, _ in node.value
+                             if key.tag != "tag:yaml.org,2002:merge"]
+            super().flatten_mapping(node)
+            self._checked_mappings.add(node)
             seen = set()
-            for key_node, _value_node in node.value:
-                key = self.construct_object(key_node, deep=deep)
+            for key_node in explicit_keys:
+                key = self.construct_object(key_node)
                 try:
                     duplicate = key in seen
                 except TypeError:
@@ -80,7 +92,6 @@ if yaml is not None:
                         "found the key %r a second time" % (key,),
                         key_node.start_mark)
                 seen.add(key)
-            return super().construct_mapping(node, deep=deep)
 
 
 def read_json(path):
