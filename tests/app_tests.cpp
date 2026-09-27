@@ -701,6 +701,69 @@ void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
     check(!controller.speaking(), "the turn ends when the last clause is spoken");
 }
 
+// The whole point of the registry: a tool that has not been granted anything
+// does nothing, and says why. This is the path a user walks through in the
+// panel, so it is tested from the panel's own entry points rather than from the
+// core registry the app happens to own.
+void testIdleToolNeedsPermissionBeforeItRuns() {
+    std::cout << "an idle tool runs only once it is permitted\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    const auto tools = controller.idleTools();
+    check(!tools.isEmpty(), "the panel has something to show");
+
+    QVariantMap indexer;
+    const auto find = [&controller](const char* name) {
+        for (const QVariant& entry : controller.idleTools()) {
+            const QVariantMap tool = entry.toMap();
+            if (tool.value(QStringLiteral("name")).toString() == QLatin1String(name)) {
+                return tool;
+            }
+        }
+        return QVariantMap();
+    };
+    for (const QVariant& entry : tools) {
+        const QVariantMap tool = entry.toMap();
+        if (tool.value(QStringLiteral("name")).toString()
+            == QStringLiteral("index recent threads")) {
+            indexer = tool;
+        }
+    }
+    check(!indexer.isEmpty(), "the indexing tool is declared to the interface");
+    check(!indexer.value(QStringLiteral("enabled")).toBool(),
+          "a new tool is not switched on");
+    check(!indexer.value(QStringLiteral("permitted")).toBool(),
+          "a new tool is not permitted");
+    const QStringList required = indexer.value(QStringLiteral("required")).toStringList();
+    check(required.contains(QStringLiteral("read conversations")),
+          "the tool declares the capability it needs");
+    check(!indexer.value(QStringLiteral("missing")).toStringList().isEmpty(),
+          "what it is still missing is reported rather than left blank");
+
+    // Switched on but not granted: still refused, and the refusal is visible
+    // rather than silent.
+    controller.setIdleToolEnabled(QStringLiteral("index recent threads"), true);
+    check(!find("index recent threads").value(QStringLiteral("permitted")).toBool(),
+          "switching a tool on is not the same as allowing it");
+
+    controller.setToolPermission(QStringLiteral("read conversations"), true);
+    const bool permitted =
+        find("index recent threads").value(QStringLiteral("permitted")).toBool();
+    check(permitted, "granting the declared capability permits the tool");
+
+    // A capability the tool did not declare changes nothing, which is what
+    // stops a grant from becoming a blank cheque.
+    controller.setToolPermission(QStringLiteral("network"), true);
+    check(permitted, "an unrelated grant does not alter what the tool may do");
+
+    // Unknown names are ignored rather than inventing a tool or a capability.
+    controller.setIdleToolEnabled(QStringLiteral("no such tool"), true);
+    controller.setToolPermission(QStringLiteral("no such capability"), true);
+    check(controller.idleTools().size() == tools.size(),
+          "a name the registry has never heard of changes nothing");
+}
+
 void testSpokenResponseFollowsClauseOrder() {
     std::cout << "a spoken response is delivered clause by clause\n";
 
@@ -903,6 +966,7 @@ int main(int argc, char** argv) {
     testModelLoadReportsAsynchronously();
     testPresenceAndIdleLoopProject();
     testLongAnswerIsOfferedToContinue();
+    testIdleToolNeedsPermissionBeforeItRuns();
     testSpokenTurnIsNotDeliveredBeforeTheLastClause();
     testSpokenResponseFollowsClauseOrder();
     testBargeInStopsAudioAtAClauseBoundary();

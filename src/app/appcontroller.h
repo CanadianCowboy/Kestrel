@@ -400,6 +400,9 @@ private:
     // it did in the transcript. Private because the permission check lives
     // inside; a caller cannot ask for the run to be forced.
     void runIdleToolIfPermitted();
+    // Submits a background summary of the session. Only reached when the tool is
+    // permitted, a model is loaded, and the worker is free.
+    void startSessionSummary();
 
     /// Offers an anticipatory line for this long, then lets the activity
     /// whisper take the status line back.
@@ -460,6 +463,13 @@ private:
     // value: it is small, and sharing one would let a tool grant itself a
     // capability.
     core::IdleToolRegistry m_idleTools;
+    // Non-zero while a permissioned tool is using the worker. Tracked apart from
+    // the prewarm id so a backend swap can tell "busy answering someone" from
+    // "busy thinking on its own".
+    quint64 m_toolRequestId = 0;
+    // Why the last idle tool did not run, shown in place of the task detail. A
+    // tool that is refused without saying so is a tool the user cannot debug.
+    QString m_idleToolNotice;
     core::Presence m_presence;
     // Optional. Null only if the allocation fails; a build with no speech engine
     // still constructs one, and it simply reports itself unavailable.

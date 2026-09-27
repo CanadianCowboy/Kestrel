@@ -98,7 +98,13 @@ struct ToolRunResult {
 // granting one that is not used is trust the user gave away for nothing.
 inline constexpr std::string_view kIndexThreadsTool = "index recent threads";
 
+// A tool that asks the model to summarise the session. It declares RunGeneration
+// because it genuinely spends tokens, and that is the whole point of declaring
+// it: the user is agreeing to a cost, not just to a read.
+inline constexpr std::string_view kSummariseSessionTool = "summarise the session";
+
 [[nodiscard]] IdleToolDeclaration indexThreadsDeclaration();
+[[nodiscard]] IdleToolDeclaration summariseSessionDeclaration();
 
 // Runs the named tool. Refuses, rather than runs, unless the registry permits
 // it -- the check lives here and not at the call site so that no caller can

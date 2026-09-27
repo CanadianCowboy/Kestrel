@@ -92,6 +92,12 @@ public:
     // backend is dropped first.
     void setBackendForTesting(std::unique_ptr<SpeechBackend> backend);
 
+    // Takes ownership of a backend and uses it in place of the platform one.
+    // This is the production counterpart of the seam above: a machine with a
+    // better local voice installed hands one over, rather than being limited to
+    // whatever voices the operating system happened to register.
+    void adoptBackend(std::unique_ptr<SpeechBackend> backend);
+
     // True when a real voice is installed and reachable. False means the
     // response is delivered as text, which is a supported outcome rather than
     // an error.
