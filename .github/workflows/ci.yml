@@ -128,7 +128,12 @@ jobs:
           # x86_64 slice of Qt's macOS libraries references AGL -- the legacy
           # 32-bit OpenGL framework, which does not exist on arm64. The link
           # then fails with "ld: framework 'AGL' not found".
-          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          #
+          # The input is `arch`. It was spelled `architecture`, which the action
+          # rejects outright -- "Unexpected input(s) 'architecture'" -- so this
+          # step had never once installed anything on any platform, and the AGL
+          # link failure it was written to prevent was never actually reached.
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           # No `modules` list on purpose. Quick Controls 2 is part of the base
           # Qt 6 installation rather than a separately installable module, and
           # asking aqtinstall for it fails the step on every platform with

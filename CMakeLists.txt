@@ -139,10 +139,19 @@ else()
 endif()
 
 if(APPLE)
-    # SecItemAdd and friends live here, and only the macOS secret store needs
-    # them. Named at configure time rather than with a pragma in the source so
-    # that the dependency is visible where the build is described.
-    target_link_libraries(kestrel_core PRIVATE "-framework Security")
+    # SecItemAdd and friends live in Security, and the CF* string, data and
+    # dictionary calls the same file is written against live in CoreFoundation.
+    # Only the macOS secret store needs either. Named at configure time rather
+    # than with a pragma in the source so that the dependency is visible where
+    # the build is described.
+    #
+    # CoreFoundation is not pulled in by Security at link time: the frameworks
+    # are peers, and the Keychain Services headers only declare the CF types
+    # they take. Linking Security alone leaves every CFData, CFString and
+    # CFDictionary symbol undefined.
+    target_link_libraries(kestrel_core PRIVATE
+        "-framework Security"
+        "-framework CoreFoundation")
 endif()
 
 if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND)
