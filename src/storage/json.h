@@ -73,6 +73,13 @@ public:
     void push(Value value);
     void set(std::string key, Value value);
 
+    // Removes a member by key, keeping the order of the rest. Returns whether
+    // there was one. Exists because a document that carries its own checksum
+    // has to be able to take the checksum back off before re-serialising the
+    // body, and rebuilding the object by hand to do that is a way to get the
+    // order subtly wrong.
+    bool erase(std::string_view key);
+
     // The compact canonical form: no spaces, members in insertion order, the
     // minimal escaping. This is the form the integrity check is taken over.
     [[nodiscard]] std::string serialize() const;

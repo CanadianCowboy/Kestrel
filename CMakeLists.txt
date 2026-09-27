@@ -124,6 +124,8 @@ add_library(kestrel_core
     src/storage/json.h
     src/storage/paths.cpp
     src/storage/paths.h
+    src/storage/profile.cpp
+    src/storage/profile.h
     src/storage/secretstore.h
     src/storage/secretstore_memory.cpp
     src/storage/sha256.cpp
@@ -370,6 +372,10 @@ if(KESTREL_BUILD_TESTS)
     target_link_libraries(kestrel_json_tests PRIVATE kestrel_core)
     add_test(NAME kestrel_json_tests COMMAND kestrel_json_tests)
 
+    add_executable(kestrel_profile_tests tests/profile_tests.cpp)
+    target_link_libraries(kestrel_profile_tests PRIVATE kestrel_core)
+    add_test(NAME kestrel_profile_tests COMMAND kestrel_profile_tests)
+
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
     # implicitly on Windows.
@@ -384,7 +390,8 @@ if(KESTREL_BUILD_TESTS)
                 kestrel_core_tests
                 kestrel_runtime_tests
                 kestrel_storage_tests
-                kestrel_json_tests)
+                kestrel_json_tests
+                kestrel_profile_tests)
             set_tests_properties(${_kestrel_cuda_test} PROPERTIES
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
         endforeach()

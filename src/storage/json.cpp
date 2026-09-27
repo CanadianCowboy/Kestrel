@@ -543,6 +543,22 @@ void Value::set(std::string key, Value value) {
     m_object.push_back(Member{std::move(key), std::move(value)});
 }
 
+bool Value::erase(std::string_view key) {
+    if (m_type != Type::Object) {
+        return false;
+    }
+    for (auto it = m_object.begin(); it != m_object.end(); ++it) {
+        if (it->key == key) {
+            // erase-then-rotate rather than a loop of swaps: a member vector
+            // holds a Value each, and moving them around by index is a way to
+            // lose one.
+            m_object.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string Value::serialize() const {
     std::string out;
     writeValue(*this, out, 0, 0);
