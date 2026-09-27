@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "app/conversationentry.h"
+#include "app/localvoiceengines.h"
 #include "app/conversationmodel.h"
 #include "app/messagemodel.h"
 #include "core/idlepersona.h"
@@ -112,6 +113,8 @@ class AppController final : public QObject {
     // control that does nothing.
     Q_PROPERTY(QStringList speechVoices READ speechVoices NOTIFY ttsChanged)
     Q_PROPERTY(QString currentVoice READ currentVoice NOTIFY ttsChanged)
+    // The local engines found on this machine, for switching between them.
+    Q_PROPERTY(QVariantList speechEngines READ speechEngines NOTIFY ttsChanged)
     Q_PROPERTY(QString sessionTopic READ sessionTopic NOTIFY presenceChanged)
 
     // The autonomous loop between turns, plus the two switches that keep it
@@ -233,6 +236,7 @@ public:
     [[nodiscard]] QString idleTaskLabel() const;
     [[nodiscard]] QStringList speechVoices() const;
     [[nodiscard]] QString currentVoice() const;
+    [[nodiscard]] QVariantList speechEngines() const;
     // One map per declared tool: name, summary, whether it is switched on, the
     // capabilities it declared, and which of those are still outstanding.
     [[nodiscard]] QVariantList idleTools() const;
@@ -282,6 +286,10 @@ public:
     // Changes the speaking voice. Refuses a name the backend does not have, so a
     // stale setting cannot leave the app quietly speaking with something else.
     Q_INVOKABLE bool setSpeechVoice(const QString& voice);
+    // Switches between the local engines. Rebuilds the backend, which is the
+    // only way to change which model is in charge of the voice.
+    Q_INVOKABLE bool setSpeechEngine(const QString& engineId);
+    [[nodiscard]] QString speechEngine() const { return m_speechEngine; }
     // Speech input. A completed phrase is submitted exactly as if it had been
     // typed, which is what makes a spoken request interrupt a reply the same way
     // a typed one does. Returns false and says why when the recognizer refuses,
@@ -475,6 +483,9 @@ private:
     // value: it is small, and sharing one would let a tool grant itself a
     // capability.
     core::IdleToolRegistry m_idleTools;
+    // The local engines discovered at start-up, and which one is speaking.
+    std::unique_ptr<LocalVoiceEngines> m_localVoices;
+    QString m_speechEngine;
     // Non-zero while a permissioned tool is using the worker. Tracked apart from
     // the prewarm id so a backend swap can tell "busy answering someone" from
     // "busy thinking on its own".

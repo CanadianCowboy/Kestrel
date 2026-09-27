@@ -277,6 +277,40 @@ cmake --build build
 
 Voice is a first-class part of Kestrel's conversation experience, not a separate assistant mode. The goal is a native, local voice loop with effectively immediate interaction: speech should begin quickly, the user should be able to interrupt naturally, and Kestrel should never force the user to wait for an answer to finish before accepting new information.
 
+### Setting up a local voice
+
+Kestrel speaks through Qt's text-to-speech when it is available, but the voices a stock Windows install offers were recorded before neural speech existed, and no better one can be added as a *system* voice because none of the good engines are SAPI. So Kestrel can run its own local model instead, and prefers it when it finds one.
+
+The model is not vendored: it is a per-machine download, a few hundred megabytes, and something a contributor chooses for their own hardware. When it is absent, Kestrel falls back to the platform voice and says so rather than pretending to have none.
+
+From the repository root:
+
+```bash
+# 1. An interpreter with the model bindings. A venv keeps it off the system.
+py -m venv .kestrel-voice
+./.kestrel-voice/Scripts/python.exe -m pip install kokoro-onnx soundfile numpy
+
+# 2. The model (325 MB) and its voice table (28 MB).
+mkdir -p .kestrel-voice/models
+curl -L -o .kestrel-voice/models/kokoro-v1.0.onnx \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o .kestrel-voice/models/voices-v1.0.bin \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
+
+That is the whole setup. Kestrel finds the interpreter and the model beside the built binary, and reports what it got:
+
+```bash
+build/kestrel.exe --print-runtime
+#   voice        : available (bm_george (Kokoro, local))
+```
+
+The model loads in about a second and synthesises a clause faster than it can be spoken, so a clause-by-clause reply does not sound like it is waiting on something. `VOICE PROFILE` in the assistant panel switches voice without a restart; an unknown name is refused rather than accepted and failed at the next reply.
+
+`.kestrel-voice/` is git-ignored. Override the location with `KESTREL_VOICE_PYTHON`, the model directory with `KESTREL_VOICE_MODEL_DIR`, and the default voice with `KESTREL_VOICE`.
+
+Kokoro is 82 million parameters and Apache-2.0, which is why it is the default: it is the best quality-to-footprint ratio available for a CPU-only local voice, and it is fast enough that per-clause synthesis disappears under the speech itself. Piper is the other local engine and was measured here at roughly a third of a second per clause; it is not wired in, but `LocalVoiceEngines` and the shared `LocalModelSpeechBackend` are the seam it would plug into.
+
 ### Voice goals
 
 - **Local-first audio path:** microphone capture, voice activity detection, speech recognition, response generation, and speech synthesis should run locally whenever the required models and hardware support it.

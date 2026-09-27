@@ -4,7 +4,6 @@
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
 #if KESTREL_HAS_QT_MULTIMEDIA
-#include "app/kokorospeechbackend.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
@@ -151,23 +150,21 @@ AppController::AppController(QObject* parent)
     m_speech = std::make_unique<SpeechSynthesizer>(this);
 
 #if KESTREL_HAS_QT_MULTIMEDIA
-    // A local neural voice, if one has been installed. It is preferred over the
-    // platform voice because the platform voice on a stock Windows install is a
-    // recording from the early 2000s, and a better one is a single download
-    // away. Found by looking rather than by asking the user, and absent without
-    // complaint: the platform voice underneath is a perfectly good fallback.
-    {
-        const QString root = QCoreApplication::applicationDirPath()
-            + QStringLiteral("/../");
-        const QString python = qEnvironmentVariable(
-            "KESTREL_VOICE_PYTHON",
-            QDir(root).filePath(QStringLiteral(".kestrel-voice/Scripts/python.exe")));
-        const QString script = QDir(root).filePath(
-            QStringLiteral("tools/kokoro_voice_server.py"));
-        if (QFileInfo::exists(python) && QFileInfo::exists(script)) {
-            m_speech->adoptBackend(
-                std::make_unique<KokoroSpeechBackend>(python, script));
-        }
+    // A local voice, if one has been installed. Both engines are preferred over
+    // the platform voice, because the platform voice on a stock Windows install
+    // is a recording from the early 2000s and a better one is a single download
+    // away. Found by looking rather than by asking, and absent without complaint:
+    // the platform voice underneath is a perfectly good fallback.
+    m_localVoices = std::make_unique<LocalVoiceEngines>(LocalVoiceEngines::discover());
+    // An explicit choice wins, and an impossible one is ignored rather than
+    // fatal: asking for an engine that is not installed should leave the app
+    // with the voice it can actually speak, not with no voice at all.
+    const QString requested = qEnvironmentVariable("KESTREL_VOICE_ENGINE");
+    m_speechEngine = (!requested.isEmpty() && m_localVoices->create(requested) != nullptr)
+                         ? requested
+                         : m_localVoices->defaultEngineId();
+    if (!m_speechEngine.isEmpty()) {
+        m_speech->adoptBackend(m_localVoices->create(m_speechEngine));
     }
 #endif
     connect(m_speech.get(), &SpeechSynthesizer::segmentFinished,
@@ -511,6 +508,29 @@ QStringList AppController::speechVoices() const {
 
 QString AppController::currentVoice() const {
     return m_speech != nullptr ? m_speech->currentVoice() : QString();
+}
+
+QVariantList AppController::speechEngines() const {
+    return m_localVoices != nullptr ? m_localVoices->describe() : QVariantList();
+}
+
+bool AppController::setSpeechEngine(const QString& engineId) {
+    if (m_localVoices == nullptr || engineId == m_speechEngine) {
+        return false;
+    }
+    std::unique_ptr<SpeechBackend> backend = m_localVoices->create(engineId);
+    if (backend == nullptr || !backend->usable()) {
+        // Refused rather than swapped in and failed later: an engine that cannot
+        // start would leave the app with no voice at all, which is worse than
+        // staying on the one that works.
+        return false;
+    }
+    m_speechEngine = engineId;
+    // The voice list belongs to the engine, so it is asked again rather than
+    // remembered; the previous engine's voices are not this engine's voices.
+    m_speech->adoptBackend(std::move(backend));
+    emit ttsChanged();
+    return true;
 }
 
 bool AppController::setSpeechVoice(const QString& voice) {
