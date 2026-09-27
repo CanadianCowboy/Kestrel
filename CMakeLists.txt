@@ -363,6 +363,25 @@ if(KESTREL_BUILD_TESTS)
     # links no Qt. It does link the platform keystore, whose library is either
     # the system one or already a load-time dependency of the process. It does
     # need cudart under a CUDA build, which is handled with the other tests.
+    #
+    # Bounded, and the only test here that is. The other three are pure
+    # computation and finish in milliseconds. This one talks to the real
+    # platform keystore -- DPAPI, secret-tool, the macOS login keychain -- and
+    # each of those can block rather than answer: a locked keyring in a
+    # session with nobody present to approve it waits, and it does not come
+    # back with an error to report.
+    #
+    # That is what a macOS core run did on 2026-09-27: every other job on the
+    # same commit finished in about three minutes and this one was still going
+    # at thirteen, with nothing in the job output to say which test it was
+    # inside. A hang is worse than a failure for exactly that reason -- it
+    # costs the full job timeout and still reports nothing actionable.
+    #
+    # CTest names the test it was running when the timeout fires, so the bound
+    # turns an unactionable stall into a named failure. Five minutes is far
+    # more than a healthy keystore round trip needs and far less than the
+    # six hours it was costing.
+    set_tests_properties(kestrel_storage_tests PROPERTIES TIMEOUT 300)
 
     # The document format the profile is written in. Separate from the storage
     # tests because it has no keystore in it at all: a JSON parser that only

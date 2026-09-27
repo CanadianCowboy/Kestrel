@@ -212,10 +212,18 @@ public:
             unavailableReason = "the keychain did not accept a test value: " + error;
             return false;
         }
-        // The probe is thrown away either way; a keychain that will not release
-        // it was already reported above.
-        std::string ignored;
-        forgetFromKeychain("probe", "com.kestrel.probe", ignored);
+        // The probe has to come back out again, and that is a second thing that
+        // can fail on its own. A keychain that will store a value but not give
+        // it back is not a keychain this store can use, and leaving the probe
+        // behind would mean reporting itself available while sitting on a
+        // value that would not go away -- the one claim this store must not
+        // make.
+        std::string cleanupError;
+        if (!forgetFromKeychain("probe", "com.kestrel.probe", cleanupError)) {
+            unavailableReason =
+                "the keychain accepted a test value but would not remove it: " + cleanupError;
+            return false;
+        }
         return true;
     }
 
