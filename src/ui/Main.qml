@@ -55,31 +55,44 @@ ApplicationWindow {
                                             : toggle.checked ? window.accent : window.line
             Behavior on color { ColorAnimation { duration: 140 } }
         }
-        Text {
-            text: toggle.label
-            color: window.ink
-            font.pixelSize: 12
-            Layout.fillWidth: true
-        }
-        // One MouseArea covering the whole row, so the label is the target and
-        // the hover that reveals the hint is the same gesture as the click. It
-        // is sized by the layout rather than anchored: anchors on a
-        // layout-managed item are undefined behaviour, and Qt says so at
-        // runtime.
-        MouseArea {
-            id: hover
+        // One MouseArea over the whole row, so the label is the target and the
+        // hover that reveals the hint is the same gesture as the click.
+        //
+        // It lives in a plain Item rather than being a RowLayout child. A
+        // layout gives every child its own cell, so a MouseArea declared here
+        // is a cell of its own *after* the indicator and the label -- it does
+        // not cover them, and because it and the label both ask for
+        // Layout.fillWidth they merely split the leftover width between them.
+        // Clicks on the indicator, and on the left part of the label, did
+        // nothing. The comment here used to say the opposite.
+        //
+        // Wrapping the row in an Item lets the MouseArea anchor to the row
+        // instead, which is legal precisely because it is no longer a child of
+        // the layout. One cell, one item, one gesture over all of it.
+        Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-                toggle.forceActiveFocus(Qt.MouseFocusReason)
-                toggle.toggled()
+            Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: toggle.label
+                color: window.ink
+                font.pixelSize: 12
             }
+            MouseArea {
+                id: hover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                    toggle.forceActiveFocus(Qt.MouseFocusReason)
+                    toggle.toggled()
+                }
+            }
+            ToolTip.visible: hover.containsMouse && toggle.hint.length > 0
+            ToolTip.text: toggle.hint
+            ToolTip.delay: 400
         }
-        ToolTip.visible: hover.containsMouse && toggle.hint.length > 0
-        ToolTip.text: toggle.hint
-        ToolTip.delay: 400
     }
 
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }

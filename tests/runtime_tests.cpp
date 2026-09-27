@@ -850,6 +850,102 @@ void testMockRecognizerStillStreamsPartials() {
 }
 
 /// Runs portable runtime checks and optional GGUF integration checks; assertions abort on failure.
+/// Runs the real platform recognizer and reports what the engine actually did.
+///
+/// Gated on KESTREL_TEST_DICTATE, because it opens the microphone for real and
+/// a CI machine has none. With it set this is the only thing in the project
+/// that proves the speech path runs rather than merely compiles -- which is the
+/// distinction that mattered here, since the adapter built cleanly for a long
+/// time while containing no grammar and so could never recognise a word.
+///
+/// The interesting assertion is not the text. It is that a session *ends* with
+/// a reason the adapter chose, rather than silently: before the grammar existed
+/// this path had nothing to raise SPEI_RECOGNITION and nothing to wait for, and
+/// the only honest outcome is reported as such.
+void testPlatformRecognizerRunsWhenAsked() {
+    const std::string flag = environmentOrEmpty("KESTREL_TEST_DICTATE");
+    if (flag.empty()) {
+        std::printf("  skip  live dictation (set KESTREL_TEST_DICTATE to run)\n");
+        return;
+    }
+
+    auto recognizer = runtime::makePlatformSpeechRecognizer();
+    assert(recognizer != nullptr);
+    if (!recognizer->available()) {
+        std::printf("  FAIL  the platform recognizer reported itself unavailable: %s\n",
+                    recognizer->detail().c_str());
+        std::abort();
+    }
+    std::printf("  recognizer: %s\n", recognizer->detail().c_str());
+
+    std::mutex mutex;
+    std::vector<std::string> results;
+    std::string ending;
+    runtime::RecognitionEnd end = runtime::RecognitionEnd::Failed;
+    bool sawEnd = false;
+
+    // The deadline is the recognizer's own, not this test's: a session that
+    // runs to its 30s phrase deadline and reports why is a pass, and one that
+    // returns in a few milliseconds with an error is a pass that found a fault.
+    const int seconds = flag == "quick" ? 8 : 35;
+
+    std::string error;
+    const bool started = recognizer->start(
+        [&](const runtime::RecognitionResult& result) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (result.isFinal) {
+                results.push_back(result.text);
+            }
+        },
+        [&](runtime::RecognitionEnd reason, std::string_view detail) {
+            std::lock_guard<std::mutex> lock(mutex);
+            end = reason;
+            ending = std::string(detail);
+            sawEnd = true;
+        },
+        error);
+
+    if (!started) {
+        std::printf("  FAIL  start() refused: %s\n", error.c_str());
+        std::abort();
+    }
+    assert(recognizer->listening());
+
+    for (int i = 0; i < seconds * 10; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (sawEnd) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    recognizer->stop();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!sawEnd) {
+        std::printf("  FAIL  the session never ended after %d seconds\n", seconds);
+        std::abort();
+    }
+    const char* reason = "unknown";
+    switch (end) {
+    case runtime::RecognitionEnd::Silence: reason = "silence (phrase completed)"; break;
+    case runtime::RecognitionEnd::NoAudio: reason = "no audio"; break;
+    case runtime::RecognitionEnd::Cancelled: reason = "cancelled"; break;
+    case runtime::RecognitionEnd::Failed: reason = "failed"; break;
+    }
+    std::printf("  session ended: %s -- %s\n", reason, ending.c_str());
+    for (const std::string& text : results) {
+        std::printf("  heard: \"%s\"\n", text.c_str());
+    }
+    std::printf("  final phrases: %zu\n", results.size());
+    // A session that ends by failing is a finding, not a pass: the grammar now
+    // exists, so the engine has something to listen with, and a failure here
+    // names the step that failed in its own detail string.
+    assert(end != runtime::RecognitionEnd::Failed);
+}
+
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
     // checks ran. A lost buffer turns a five-second diagnosis into a guess.
@@ -877,6 +973,7 @@ int main() {
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
     KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
     KESTREL_RUN(testOrtGenAiGeneratesFromRealModel);
+    KESTREL_RUN(testPlatformRecognizerRunsWhenAsked);
 #undef KESTREL_RUN
 
     std::printf("runtime tests passed\n");

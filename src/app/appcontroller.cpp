@@ -256,7 +256,21 @@ bool AppController::listening() const noexcept {
 }
 
 bool AppController::sttAvailable() const noexcept {
-    return m_recognizer != nullptr && m_recognizer->available();
+    if (m_recognizer == nullptr || !m_recognizer->available()) {
+        return false;
+    }
+    // The fallback recognizer is always available, because availability is what
+    // makes it a usable fallback -- so reporting that as "dictation is ready"
+    // offers the user a microphone button that cannot hear them. What it
+    // actually does is submit a canned phrase as if the user had said it, which
+    // is worse than being unavailable: the app appears to be listening while
+    // inventing what was said.
+    //
+    // So the property means "there is a recognizer here that can hear you",
+    // and the preview is reported as what it is in sttDetail(). This is the
+    // same overstatement as a backend reporting itself ready with nothing
+    // loaded, which is why it is checked here rather than left to the registry.
+    return dynamic_cast<const runtime::MockSpeechRecognizer*>(m_recognizer.get()) == nullptr;
 }
 
 QString AppController::sttDetail() const {

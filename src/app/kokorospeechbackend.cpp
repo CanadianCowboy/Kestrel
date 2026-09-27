@@ -23,6 +23,27 @@ KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript,
             noteEngineFailed(tr("the local voice could not be started"));
         }
     });
+    // A driver that dies *after* starting is the case that used to be
+    // invisible. QProcess::FailedToStart only covers the launch, and a process
+    // that starts and then exits -- a Python traceback, a CUDA failure, the
+    // machine suspending -- raised nothing at all. m_started stayed true, the
+    // next speak() wrote into a process that was already gone, and because the
+    // reply never came, speakingNow() never cleared and the clause pump waited
+    // for a completion that had no way of arriving. The reply was neither
+    // spoken nor delivered as text; it just stopped, mid-pump, forever.
+    //
+    // Any exit that was not asked for is therefore an engine failure, reported
+    // through the same path as a launch failure so the caller unwinds the same
+    // way.
+    connect(m_process, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
+        if (status == QProcess::NormalExit && exitCode == 0) {
+            // A clean exit after an explicit stop. The stop path has already
+            // settled the state, so there is nothing to report.
+            return;
+        }
+        noteEngineFailed(tr("the local voice stopped unexpectedly (exit %1)")
+                             .arg(exitCode));
+    });
     completeSetup();
 }
 

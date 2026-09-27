@@ -846,9 +846,13 @@ void testIdleToolNeedsPermissionBeforeItRuns() {
     check(permitted, "granting the declared capability permits the tool");
 
     // A capability the tool did not declare changes nothing, which is what
-    // stops a grant from becoming a blank cheque.
+    // stops a grant from becoming a blank cheque. Re-read the value rather
+    // than reusing `permitted`: that local was captured before this grant, so
+    // asserting on it here passed whether or not the grant had any effect, and
+    // a test that cannot fail is not a test.
     controller.setToolPermission(QStringLiteral("network"), true);
-    check(permitted, "an unrelated grant does not alter what the tool may do");
+    check(find("index recent threads").value(QStringLiteral("permitted")).toBool(),
+          "an unrelated grant does not alter what the tool may do");
 
     // Unknown names are ignored rather than inventing a tool or a capability.
     controller.setIdleToolEnabled(QStringLiteral("no such tool"), true);
@@ -1511,7 +1515,19 @@ void testSpokenPhraseTakesTheTypedPath() {
     auto backend = std::make_unique<SlowBackend>(200, 1);
     controller.setBackendForTesting(std::move(backend));
 
-    check(controller.sttAvailable(), "a recognizer is available");
+    // The controller here is holding the preview recognizer, so sttAvailable
+    // is false -- and that is the assertion. It used to be true, on the
+    // reasoning that the preview is "available", and the consequence was a
+    // microphone button that cannot hear the user while the app appears to be
+    // listening: the preview is always available precisely because it ignores
+    // the microphone. It is still reachable through startListening below,
+    // which is what this test is about; it just no longer claims to be a
+    // working input device.
+    check(!controller.sttAvailable(),
+          "the preview recognizer is not reported as a working microphone");
+    check(controller.sttDetail().contains(QLatin1String("preview"), Qt::CaseInsensitive)
+              || controller.sttDetail().contains(QLatin1String("script"), Qt::CaseInsensitive),
+          "what is actually in use is described as a preview rather than a device");
     check(controller.listening() == false, "not listening before asked");
     check(controller.startListening(), "listening starts");
     check(controller.listening(), "the controller reports listening");

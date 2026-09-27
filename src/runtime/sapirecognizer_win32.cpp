@@ -47,10 +47,15 @@
 #include <initguid.h>
 #include <mmsystem.h>
 #include <sapi.h>
+// For SpClearEvent, which is the documented counterpart to draining the event
+// queue: it releases whatever the engine attached to an event. It is an inline
+// function here rather than something to declare by hand, which is the point.
+#include <sphelper.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -61,12 +66,24 @@
 namespace kestrel::runtime {
 namespace {
 
-// SPRVI_* is the SPRVIFLAGS enum, which is a Speech SDK header the Windows SDK
-// does not ship. These are its published values, and they are load bearing: the
-// interest mask decides which events the engine raises at all, so a wrong bit
-// produces a recognizer that hears nothing and says nothing about why.
-constexpr ULONGLONG kInterestRecognition = 0x0001; // SPRVI_SR
-constexpr ULONGLONG kInterestOther = 0x0010;      // SPRVI_OTHER
+// The events this recognizer acts on.
+//
+// SPFEI() is a macro from sapi.h that turns a SPEVENTENUM into the bit the
+// interest mask wants: 1 << the enum. The mask is a set of *event indices*.
+//
+// This used to be hand-declared as SPRVI_SR and SPRVI_OTHER, which are
+// SPRVIFLAGS values -- a different enum, describing things to do with a voice,
+// not events to receive. The two namespaces overlap numerically and nothing
+// complained: SetInterest succeeded, and the engine then raised almost nothing.
+// A recognizer with the wrong interest mask is silent rather than broken, which
+// is why it survived being written and why the comment here used to explain the
+// wrong constants as if they were deliberate.
+//
+// SPFEI itself does come from sapi.h, so no spelling-out is needed.
+constexpr ULONGLONG kInterest =
+    SPFEI(SPEI_RECOGNITION)     // a phrase was recognised; carries the text
+    | SPFEI(SPEI_SOUND_START)    // the engine heard something begin
+    | SPFEI(SPEI_END_SR_STREAM); // the engine closed the phrase: normal end
 
 // The audio category SetInput is told to look in, when the token is null and
 // the engine picks its own default device. SPADTYPE_INPUT is a Speech SDK enum
@@ -129,6 +146,13 @@ std::string formatHr(HRESULT hr) {
 
 class RecognizerWorker;
 
+// True on the recognizer's own worker thread, for its whole lifetime. A
+// thread_local rather than a member: a consumer may legitimately call stop()
+// from inside a callback, and waiting there for the thread doing the waiting
+// would be a deadlock. There is exactly one worker thread, so a flag is
+// enough and nothing has to be read across threads to find out.
+thread_local bool t_inWorker = false;
+
 // What one listening session has learned so far. Kept apart from the worker so
 // that the audio objects can be released before anything else is touched: the
 // context holds the only reference to the engine, and the engine is what calls
@@ -162,11 +186,17 @@ public:
     Impl() {
         m_devices = static_cast<unsigned>(waveInGetNumDevs());
         m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        // Manual reset and initially signalled: the worker is idle right now.
+        // stop() waits on this, so it has to mean "the worker is not inside a
+        // session" rather than "something happened".
+        m_idle = CreateEventW(nullptr, TRUE, TRUE, nullptr);
         // The wake handle is part of availability, not a detail. A recognizer
-        // that cannot be stopped is worse than one that never started, so if the
-        // event could not be created this adapter reports itself unavailable
-        // rather than offering a listening state it cannot end.
-        m_available = m_devices > 0 && m_wake != nullptr;
+        // that cannot be stopped is worse than one that never started, so if
+        // either event could not be created this adapter reports itself
+        // unavailable rather than offering a listening state it cannot end --
+        // and without m_idle it cannot honour the promise that a returned stop()
+        // will be followed by no further callback.
+        m_available = m_devices > 0 && m_wake != nullptr && m_idle != nullptr;
     }
 
     ~Impl() {
@@ -179,6 +209,9 @@ public:
         }
         if (m_wake != nullptr) {
             CloseHandle(m_wake);
+        }
+        if (m_idle != nullptr) {
+            CloseHandle(m_idle);
         }
     }
 
@@ -248,12 +281,46 @@ public:
         if (m_thread.joinable() && m_wake != nullptr) {
             SetEvent(m_wake);
         }
+        // Then wait for the worker to actually leave the session, which is the
+        // part that used to be missing and is what made this method unsafe.
+        //
+        // Bumping the generation says "stop"; it does not stop anything by
+        // itself. The worker is somewhere in runSession -- inside a COM call,
+        // inside a callback, about to call a callback -- and it gets to
+        // deliverResult and deliverEnd on its way out. Those call the
+        // consumer's lambdas, and the consumer's lambdas capture whatever the
+        // consumer is. If the consumer is a QObject that is being destroyed
+        // because the app is quitting, this thread is dereferencing a
+        // QMetaObject::invokeMethod on freed memory. No exception, no crash
+        // report pointing here, and the same window is what loses a new
+        // session's callbacks when a stop is immediately followed by a start.
+        //
+        // The interface already promised the safe version: "must not deliver a
+        // final result after it returns unless the phrase was genuinely
+        // complete". This is what honouring that costs.
+        //
+        // Not when called from the worker itself. A consumer is entitled to
+        // stop from inside its own callback, and waiting for the thread that is
+        // calling it would be a deadlock -- so the flag is set for the worker's
+        // whole lifetime and checked before waiting.
+        if (t_inWorker || m_idle == nullptr) {
+            return;
+        }
+        // Bounded, because the alternative to a timeout here is a shutdown
+        // that never finishes. It cannot normally expire: the worker's only
+        // long operations are the engine's, and the generation has already been
+        // bumped so it will take the cancelled path out of each of them.
+        WaitForSingleObject(m_idle, 2000);
     }
 
     [[nodiscard]] bool listening() const { return m_listening.load(std::memory_order_acquire); }
 
 private:
     void workerMain() {
+        // Set for this thread's whole lifetime, and the only thing that lets
+        // stop() tell "called from a callback" apart from "called from
+        // elsewhere" without a mutex on the hot path.
+        t_inWorker = true;
         // SAPI's objects are apartment threaded, so the thread that creates
         // them has to own an apartment for their whole life. That is why
         // everything COM happens here rather than in start(), and why the last
@@ -277,7 +344,14 @@ private:
                 }
                 continue;
             }
+            // Cleared for the whole of the session and set again after it, so
+            // that a stop() arriving at any moment either waits and is released
+            // the instant the worker leaves, or sees it already signalled. The
+            // window where a callback can be running is exactly the window
+            // where m_idle is clear, which is the whole point of it.
+            ResetEvent(m_idle);
             runSession(m_generation.load(std::memory_order_acquire));
+            SetEvent(m_idle);
         }
         CoUninitialize();
     }
@@ -306,6 +380,7 @@ private:
 
         ISpRecognizer* recognizer = nullptr;
         ISpRecoContext* context = nullptr;
+        ISpRecoGrammar* grammar = nullptr;
         HANDLE events = nullptr;
 
         // The order of these steps is not a style choice. A shared recognizer
@@ -331,8 +406,34 @@ private:
             hr = recognizer->CreateRecoContext(&context);
         }
         if (SUCCEEDED(hr)) {
+            // This is the step that was missing, and nothing failed without it.
+            //
+            // A recognition context does not listen on its own. It recognises
+            // only what its grammars tell it to recognise, and this adapter
+            // created no grammar at all -- so the engine was handed a
+            // microphone, a context, an interest mask and a set of event
+            // handlers, and then had nothing to recognise with. It never
+            // raised SPEI_RECOGNITION, so the code that reads a phrase never
+            // ran, and the whole path sat there looking correct.
+            step_name = "creating a dictation grammar";
+            hr = context->CreateGrammar(1, &grammar);
+        }
+        if (SUCCEEDED(hr)) {
+            // SPRS_ACTIVE, on the plain C interface, rather than the
+            // ISpGrammarBuilder helper's LoadGrammar(L"", SPLOAD_AS_DICTATION).
+            // Both do the same thing; the helper is the only place
+            // SPLOAD_AS_DICTATION appears, and it lives in the Speech Platform
+            // SDK, which is a separate download from the Windows SDK this file
+            // is allowed to rely on. Spelling the enum out by hand is how the
+            // interest mask above came to be wrong: the constant is not the
+            // problem, guessing it is. SPRS_ACTIVE is in sapi.h, and it is the
+            // whole of what "recognise whatever I say" means.
+            step_name = "turning dictation on";
+            hr = grammar->SetDictationState(SPRS_ACTIVE);
+        }
+        if (SUCCEEDED(hr)) {
             step_name = "asking the engine for recognition events";
-            hr = context->SetInterest(kInterestRecognition | kInterestOther, 0);
+            hr = context->SetInterest(kInterest, 0);
         }
         if (SUCCEEDED(hr)) {
             // An event handle rather than a callback, so the worker can wait on
@@ -349,7 +450,7 @@ private:
         }
 
         if (FAILED(hr)) {
-            releaseAudio(context, recognizer);
+            releaseAudio(context, grammar, recognizer);
             m_listening.store(false, std::memory_order_release);
             deliverEnd(RecognitionEnd::Failed,
                        std::string("SAPI could not ") + step_name + ": " + formatHr(hr));
@@ -374,8 +475,18 @@ private:
                                        deadline - std::chrono::steady_clock::now())
                                        .count();
             if (remaining <= 0) {
-                state.failure = "the recognizer did not finish a phrase within "
-                                + std::to_string(kPhraseDeadline.count()) + " seconds";
+                // Only a failure if something was heard. The engine ends a
+                // phrase when the speaker stops, so running out of time with
+                // silence means there was nothing to end -- and reporting that
+                // as a failure tells the user their microphone is broken when
+                // the truth is that nobody spoke, or that the input is muted.
+                // Silence has its own outcome below, with its own wording.
+                if (state.heardSound) {
+                    state.failure = "the recognizer heard speech but did not finish "
+                                    "a phrase within "
+                                    + std::to_string(kPhraseDeadline.count())
+                                    + " seconds";
+                }
                 break;
             }
 
@@ -401,7 +512,7 @@ private:
             // loop, where it is turned into a reason.
         }
 
-        releaseAudio(context, recognizer);
+        releaseAudio(context, grammar, recognizer);
         m_listening.store(false, std::memory_order_release);
 
         if (cancelled) {
@@ -455,12 +566,26 @@ private:
                 state.heardSound = true;
                 break;
             case SPEI_RECOGNITION: {
-                const auto* payload =
-                    reinterpret_cast<const RecognitionPayload*>(event.lParam);
+                // lParam is a LONG_PTR, so the pointer has to be cast through
+                // an integer type. const_cast cannot do it: the value is not
+                // const, it is a pointer stored in a field that happens to be
+                // named like one.
+                auto* payload = reinterpret_cast<RecognitionPayload*>(
+                    static_cast<std::uintptr_t>(event.lParam));
                 if (payload == nullptr) {
                     break;
                 }
                 const std::string text = toUtf8(payload->phrase);
+                // The engine allocates pwszResult and hands over ownership by
+                // putting the pointer in the event. Nothing else releases it,
+                // and CoTaskMemFree is the only thing that can: freeing it with
+                // the C runtime would corrupt the COM task allocator's heap. A
+                // dictation session raises one of these per phrase, so this is
+                // a leak on the hot path rather than a theoretical one.
+                if (payload->phrase != nullptr) {
+                    ::CoTaskMemFree(payload->phrase);
+                    payload->phrase = nullptr;
+                }
                 if (text.empty()) {
                     break;
                 }
@@ -483,6 +608,14 @@ private:
             default:
                 break;
             }
+            // Releases whatever the engine attached to this event, and only for
+            // events it actually populated. SpClearEvent is the documented
+            // counterpart to a queue read and is safe on an event whose
+            // eEventId carries no data: it checks lObject and wParam itself.
+            // Without it every event the engine queues costs a leak, and a
+            // session's worth of them is a session's worth of engine memory
+            // that never comes back.
+            ::SpClearEvent(&events[i]);
         }
     }
 
@@ -492,9 +625,19 @@ private:
     // that leaves a dangling engine reference behind. Interest is turned off
     // before any of it, so nothing is delivered into an object that is on its
     // way out.
-    static void releaseAudio(ISpRecoContext* context, ISpRecognizer* recognizer) {
+    static void releaseAudio(ISpRecoContext* context, ISpRecoGrammar* grammar,
+                             ISpRecognizer* recognizer) {
         if (context != nullptr) {
             context->SetInterest(0, 0);
+        }
+        // The grammar before the context that created it, the context before
+        // the recognizer that owns the audio device. Releasing them the other
+        // way round leaves the context holding a grammar that is already gone.
+        if (grammar != nullptr) {
+            grammar->SetDictationState(SPRS_INACTIVE);
+            grammar->Release();
+        }
+        if (context != nullptr) {
             context->Release();
         }
         if (recognizer != nullptr) {
@@ -540,6 +683,9 @@ private:
     unsigned m_devices = 0;
     bool m_available = false;
     HANDLE m_wake = nullptr;
+    // Signalled whenever the worker is outside runSession, which is what makes
+    // a returned stop() a real boundary rather than a request.
+    HANDLE m_idle = nullptr;
     std::thread m_thread;
     // Bumped by both start() and stop(). A session runs against the value it
     // started with and ends the moment it no longer matches, which is what makes

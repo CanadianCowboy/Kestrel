@@ -41,18 +41,33 @@ namespace {
 // no parent console to attach to, and adding one would only give the report
 // somewhere to go that it was not going before.
 void attachToLaunchConsole() {
+    // Each stream is checked on its own. Treating them as one is wrong in a way
+    // that is easy to hit: a launcher that captures stderr to a log file and
+    // leaves stdout alone gives a valid stderr and an invalid stdout, and a
+    // single early return on stdout would leave the report going nowhere while
+    // a single freopen pair would tear the log redirect loose and send every
+    // later error to the console instead. Both streams are therefore reopened
+    // only when that stream is the broken one.
     const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (out != nullptr && out != INVALID_HANDLE_VALUE) {
+    const bool stdoutBroken = out == nullptr || out == INVALID_HANDLE_VALUE;
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    const bool stderrBroken = err == nullptr || err == INVALID_HANDLE_VALUE;
+
+    if (!stdoutBroken && !stderrBroken) {
         return;
     }
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
         return;
     }
-    // A failure here means the console is attached but the stream is already
-    // usable, which is the normal case for a redirected launch, so there is
-    // nothing to report and nothing to do about it.
-    static_cast<void>(freopen("CONOUT$", "w", stdout));
-    static_cast<void>(freopen("CONOUT$", "w", stderr));
+    // A failure here means the console is attached but that stream was already
+    // usable after all, which is the normal case for a redirected launch, so
+    // there is nothing to report and nothing to do about it.
+    if (stdoutBroken) {
+        static_cast<void>(freopen("CONOUT$", "w", stdout));
+    }
+    if (stderrBroken) {
+        static_cast<void>(freopen("CONOUT$", "w", stderr));
+    }
 }
 #else
 void attachToLaunchConsole() {}
