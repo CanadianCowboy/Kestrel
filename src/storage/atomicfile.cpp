@@ -89,6 +89,49 @@ bool flushToDevice(const fs::path& path, std::string& error) {
 #endif
 }
 
+// Pushes a directory's own entries out to the device.
+//
+// rename(2) does not rewrite the file; it edits the parent directory, and that
+// edit is a write of its own. Syncing the file made its contents durable but
+// left the name it was published under in the same state the old name was in,
+// so a power cut could still bring the previous contents back. Windows gets
+// this from MOVEFILE_WRITE_THROUGH, which the rename is already carrying; POSIX
+// has no equivalent, so it has to be asked for by hand.
+bool flushDirectory(const fs::path& path, std::string& error) {
+#if defined(_WIN32)
+    // Reached only by the POSIX branch, but the function is compiled
+    // unconditionally, so it needs a body here. The Windows path never calls
+    // it: MOVEFILE_WRITE_THROUGH has already done this work.
+    (void)path;
+    (void)error;
+    return true;
+#else
+    int flags = O_RDONLY;
+    // O_DIRECTORY is Linux's way of refusing to open anything that is not a
+    // directory, which turns a typo into an error instead of a sync of some
+    // other file. It does not exist on macOS or the BSDs, where opening a
+    // directory read-only and syncing it is the documented spelling.
+#if defined(O_DIRECTORY)
+    flags |= O_DIRECTORY;
+#endif
+    const int descriptor = ::open(path.c_str(), flags);
+    if (descriptor < 0) {
+        error = "could not open " + path.string() + " in order to flush it: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    const bool synced = ::fsync(descriptor) == 0;
+    const int syncError = errno;
+    ::close(descriptor);
+    if (!synced) {
+        error = "could not flush " + path.string() + " to the device: " +
+                std::string(std::strerror(syncError));
+        return false;
+    }
+    return true;
+#endif
+}
+
 } // namespace
 
 bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>& bytes,
@@ -149,6 +192,16 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
         error = "could not replace " + target.string() + ": " + describe(renameCode);
         std::error_code ignored;
         fs::remove(scratch, ignored);
+        return false;
+    }
+    // The rename is already visible at this point, so a failure here is not a
+    // failed write: the file is there, with the right bytes, and only its name
+    // is not yet durable. It is reported rather than swallowed because the
+    // whole point of this function is that a closed laptop is survivable, and
+    // "it usually is" is not a claim worth making quietly. Rolling back would be
+    // worse than the risk: the new contents are already the ones on screen.
+    if (!flushDirectory(target.has_parent_path() ? target.parent_path() : fs::path("."), error)) {
+        error += " (the new contents are in place; only the name may not survive a power cut)";
         return false;
     }
 #endif
