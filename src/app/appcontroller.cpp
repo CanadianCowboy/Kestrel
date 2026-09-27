@@ -1,6 +1,8 @@
 #include "app/appcontroller.h"
 
 #include "app/generationworker.h"
+#include "app/listensession.h"
+#include "app/speechsynthesizer.h"
 #include "runtime/backendregistry.h"
 #include "runtime/llamacppbackend.h"
 
@@ -83,6 +85,10 @@ AppController::AppController(QObject* parent)
     : QObject(parent)
     , m_backend(runtime::selectBackend(runtime::BackendKind::Mock))
     , m_idle(m_persona) {
+    // Declared, not enabled. The registry is populated so the interface can
+    // show what exists, and a tool stays inert until the user both switches it
+    // on and grants what it declared.
+    m_idleTools.declare(core::indexThreadsDeclaration());
     m_messageModel = new MessageModel(this);
     m_conversationModel = new ConversationModel(&m_entries, this);
 
@@ -125,6 +131,111 @@ AppController::AppController(QObject* parent)
 
     connect(&m_idleTimer, &QTimer::timeout, this, &AppController::onIdleTick);
     m_idleTimer.start(kIdleTickMs);
+
+    // Audio is optional and its absence changes nothing about how a turn runs.
+    // The synthesizer still exists; it reports itself unavailable and the
+    // text-only path below is what the app takes.
+    m_speech = std::make_unique<SpeechSynthesizer>(this);
+    connect(m_speech.get(), &SpeechSynthesizer::segmentFinished,
+            this, &AppController::onSpeechSegmentFinished);
+    connect(m_speech.get(), &SpeechSynthesizer::stopCompleted,
+            this, &AppController::onSpeechStopCompleted);
+    connect(m_speech.get(), &SpeechSynthesizer::failed, this, [this](const QString& reason) {
+        // A voice that dies mid-response must not take the reply with it: the
+        // text is already on screen, so the failure is reported and the
+        // remaining clauses are simply not spoken.
+        m_speechError = reason;
+        m_speaking = false;
+        m_hasPendingSegment = false;
+        emit ttsChanged();
+    });
+
+    // Speech input. The recognizer is the same preview backend the mock
+    // generation path uses, so the whole voice loop -- partial words, barge-in,
+    // submission -- runs in a build with no microphone. A platform recognizer
+    // replaces it without anything above this line changing.
+    m_recognizer = std::make_unique<runtime::MockSpeechRecognizer>();
+    m_listen = std::make_unique<ListenSession>(*m_recognizer, this);
+    connect(m_listen.get(), &ListenSession::utteranceFinal,
+            this, &AppController::onUtteranceFinal);
+    connect(m_listen.get(), &ListenSession::listeningEnded,
+            this, &AppController::onListeningEnded);
+    connect(m_listen.get(), &ListenSession::partialChanged, this, [this] {
+        emit listeningChanged();
+    });
+}
+
+bool AppController::startListening() {
+    if (m_listen == nullptr) {
+        m_listenError = tr("Speech input is not available in this build.");
+        emit listeningChanged();
+        return false;
+    }
+    QString error;
+    if (!m_listen->startListening(error)) {
+        m_listenError = error;
+        emit listeningChanged();
+        return false;
+    }
+    m_listenError.clear();
+    // Someone is talking, so the idle loop has to keep quiet even though no
+    // message has been sent yet.
+    noteActivity();
+    m_presence.noteUserAction(core::UserAction::Spoke);
+    m_presence.setNow(nowMs());
+    m_presence.applyPersona(m_persona.state());
+    noteAssistant(core::AssistantAction::Waiting);
+    emit listeningChanged();
+    return true;
+}
+
+void AppController::stopListening() {
+    if (m_listen != nullptr) {
+        m_listen->stopListening();
+    }
+    emit listeningChanged();
+}
+
+void AppController::abandonListening() {
+    if (m_listen != nullptr) {
+        m_listen->abandon();
+    }
+    emit listeningChanged();
+}
+
+bool AppController::listening() const noexcept {
+    return m_listen != nullptr && m_listen->listening();
+}
+
+bool AppController::sttAvailable() const noexcept {
+    return m_recognizer != nullptr && m_recognizer->available();
+}
+
+QString AppController::sttDetail() const {
+    return m_recognizer != nullptr ? QString::fromStdString(m_recognizer->detail()) : QString();
+}
+
+QString AppController::partialTranscript() const {
+    return m_listen != nullptr ? m_listen->partialText() : QString();
+}
+
+QString AppController::listenError() const {
+    return m_listenError;
+}
+
+void AppController::onUtteranceFinal(const QString& text, double confidence) {
+    static_cast<void>(confidence);
+    emit listeningChanged();
+    // The single path a turn starts from. A spoken request is a typed request
+    // that happened to arrive by ear, and everything downstream -- the barge-in
+    // path, the acknowledgement, the presence projection, the transcript -- is
+    // the same because of this one call.
+    sendMessage(text);
+}
+
+void AppController::onListeningEnded(const QString& reason) {
+    m_listenError = reason;
+    emit listeningChanged();
 }
 
 AppController::~AppController() {
@@ -132,7 +243,6 @@ AppController::~AppController() {
     // a tick arriving during teardown would call into a half-destroyed
     // controller.
     m_idleTimer.stop();
-
     // Order matters: cancel so a blocked generate() returns, then stop the event
     // loop, then wait. Only once the thread is idle is it safe to destroy an
     // object whose affinity was that thread.
@@ -312,8 +422,69 @@ QString AppController::ambientThought() const {
     return m_ambientThought;
 }
 
+QVariantList AppController::idleTools() const {
+    QVariantList result;
+    for (const core::IdleToolDeclaration& declaration : m_idleTools.tools()) {
+        QStringList required;
+        for (const core::ToolPermission permission : declaration.permissions) {
+            required << QString::fromLatin1(core::toString(permission));
+        }
+        QStringList outstanding;
+        for (const core::ToolPermission permission : m_idleTools.missing(declaration.name)) {
+            outstanding << QString::fromLatin1(core::toString(permission));
+        }
+        QVariantMap entry;
+        entry.insert(QStringLiteral("name"), QString::fromStdString(declaration.name));
+        entry.insert(QStringLiteral("summary"), QString::fromStdString(declaration.summary));
+        entry.insert(QStringLiteral("enabled"), m_idleTools.enabled(declaration.name));
+        entry.insert(QStringLiteral("required"), required);
+        entry.insert(QStringLiteral("missing"), outstanding);
+        // Reported so the panel can say the difference between a tool that is
+        // off and a tool that is on but cannot do anything yet.
+        entry.insert(QStringLiteral("permitted"), m_idleTools.permits(declaration.name));
+        result.append(entry);
+    }
+    return result;
+}
+
+void AppController::setIdleToolEnabled(const QString& name, bool enabled) {
+    m_idleTools.setEnabled(name.toStdString(), enabled);
+    emit idleToolsChanged();
+}
+
+void AppController::setToolPermission(const QString& permission, bool granted) {
+    // Matched by name so QML never has to know the enum, and so a name that
+    // does not exist simply grants nothing.
+    static constexpr core::ToolPermission kAll[] = {
+        core::ToolPermission::ReadConversations,
+        core::ToolPermission::RunGeneration,
+        core::ToolPermission::WriteFiles,
+        core::ToolPermission::Network,
+    };
+    const std::string wanted = permission.toStdString();
+    for (const core::ToolPermission candidate : kAll) {
+        if (wanted == core::toString(candidate)) {
+            m_idleTools.grant(candidate, granted);
+            emit idleToolsChanged();
+            return;
+        }
+    }
+}
+
 QString AppController::idleTaskLabel() const {
-    return m_idleTaskLabel;
+    if (m_idleTaskKind.isEmpty()) {
+        return {};
+    }
+    // A detail is private to the extent the thought beside it is. When thoughts
+    // are hidden, the detail goes with them, and that has to be decided here
+    // rather than when the task ran or the detail would outlive the setting.
+    if (m_idleTaskDetail.isEmpty()) {
+        return m_idleTaskKind;
+    }
+    if (!m_showIdleThoughts && !m_ambientThought.isEmpty()) {
+        return m_idleTaskKind;
+    }
+    return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleTaskDetail);
 }
 
 QString AppController::sessionTopic() const {
@@ -336,6 +507,133 @@ bool AppController::inputPending() const noexcept {
     return m_inputPending;
 }
 
+bool AppController::ttsAvailable() const noexcept {
+    return m_speech != nullptr && m_speech->available();
+}
+
+QString AppController::ttsVoice() const {
+    if (m_speech == nullptr) {
+        return tr("unavailable");
+    }
+    return m_speech->voiceDescription();
+}
+
+bool AppController::speaking() const noexcept {
+    return m_speaking;
+}
+
+QString AppController::ttsError() const {
+    if (!m_speechError.isEmpty()) {
+        return m_speechError;
+    }
+    if (m_speech != nullptr && !m_speech->available()) {
+        return m_speech->voiceDescription();
+    }
+    return {};
+}
+
+void AppController::onSpeechSegmentFinished() {
+    if (!m_speaking) {
+        return;
+    }
+    if (m_hasPendingSegment) {
+        // The clause is out of the speaker. Only now does the spoken cursor move,
+        // which is what keeps an interruption resuming from exactly where the
+        // user stopped hearing rather than from where decoding happened to be.
+        m_hasPendingSegment = false;
+        m_voice.advancePlayback(m_activeResponse, m_pendingSegmentEnd);
+        noteAssistant(core::AssistantAction::Speaking);
+    } else {
+        // That was the acknowledgement cue. The pause the persona asked for
+        // belongs in front of the answer, not after the cue.
+        m_openingPauseMs = m_persona.acknowledgementPauseMs();
+        m_acknowledgement.clear();
+    }
+    pumpNextSegment();
+}
+
+void AppController::pumpNextSegment() {
+    if (!m_speaking) {
+        return;
+    }
+    const auto segment = m_voice.nextSpeechSegment(m_activeResponse, m_openingPauseMs);
+    m_openingPauseMs = 0;
+    if (!segment.has_value()) {
+        // No complete segment is available yet, which is not the same as the
+        // response being over. The pump starts as soon as the request is
+        // accepted so the cue can be heard while the model is still working,
+        // and at that point there is usually no answer text at all. Treating
+        // that empty result as completion would deliver a response made of the
+        // first few tokens and skip everything after them.
+        if (m_generating) {
+            return;
+        }
+        finishPlayback();
+        return;
+    }
+    m_hasPendingSegment = true;
+    m_pendingSegmentEnd = segment->endOffset;
+    m_speech->speak(QString::fromStdString(segment->text), segment->leadingPauseMs);
+}
+
+void AppController::finishPlayback() {
+    m_speaking = false;
+    m_hasPendingSegment = false;
+    m_openingPauseMs = 0;
+    // The response is delivered once it has been spoken, not once it has been
+    // generated. That is the whole point of the text-only fallback having been
+    // a fallback: with audio, completion follows the audio.
+    m_voice.complete(m_activeResponse);
+    noteAssistant(core::AssistantAction::Waiting);
+    anticipateForDelivery();
+    emit voiceChanged();
+    emit ttsChanged();
+}
+
+void AppController::anticipateForDelivery() {
+    // Whether a long answer is offered to continue depends on how long it
+    // actually turned out to be, so the judgement is made at delivery rather
+    // than guessed at when the request was sent.
+    const int lastRow = m_messageModel->rowCount() - 1;
+    const QString delivered = lastRow >= 0
+        ? m_messageModel->data(m_messageModel->index(lastRow, 0),
+                               MessageModel::ContentRole).toString()
+        : QString();
+    anticipate(delivered.size() > kLongResponseChars ? core::PersonaTrigger::LongResponse
+                                                     : core::PersonaTrigger::TurnCompleted);
+}
+
+void AppController::onSpeechStopCompleted() {
+    if (!m_speaking) {
+        return;
+    }
+    m_speaking = false;
+    m_hasPendingSegment = false;
+    m_openingPauseMs = 0;
+    emit ttsChanged();
+    emit presenceChanged();
+}
+
+void AppController::startPlayback() {
+    if (!ttsAvailable()) {
+        // No voice installed: the text-only fallback owns delivery, and the
+        // response completes with generation.
+        return;
+    }
+    m_speech->applyVoice(m_voice.voicePersona());
+    m_speaking = true;
+    m_openingPauseMs = 0;
+    if (m_acknowledgement.isEmpty()) {
+        pumpNextSegment();
+        return;
+    }
+    // The cue goes first and unpaused. It is the sound of the request being
+    // accepted, and it must not be delayed by a pause meant for the answer.
+    m_hasPendingSegment = false;
+    m_speech->speak(m_acknowledgement, 0);
+    emit ttsChanged();
+}
+
 void AppController::setIdleLoopEnabled(bool enabled) {
     if (m_idle.enabled() == enabled) {
         return;
@@ -343,7 +641,8 @@ void AppController::setIdleLoopEnabled(bool enabled) {
     m_idle.setEnabled(enabled);
     if (!enabled) {
         m_ambientThought.clear();
-        m_idleTaskLabel.clear();
+        m_idleTaskKind.clear();
+        m_idleTaskDetail.clear();
     }
     emit presenceChanged();
 }
@@ -472,6 +771,15 @@ void AppController::setSystemPrompt(const QString& text) {
     m_backend->setSystemPrompt(m_systemPrompt.toStdString());
     emit systemPromptChanged();
     publishMetrics();
+}
+
+/// Adopts a speech backend so the playback pump can be driven without a voice.
+void AppController::setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> backend) {
+    if (backend == nullptr) {
+        return;
+    }
+    m_speech->setBackendForTesting(std::move(backend));
+    emit ttsChanged();
 }
 
 /// Returns whether this build provides an available llama.cpp backend.
@@ -652,6 +960,24 @@ void AppController::noteActivity() {
     m_idle.noteActivity(now);
 }
 
+void AppController::runIdleToolIfPermitted() {
+    const ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) {
+        return;
+    }
+    const core::ToolRunResult outcome = core::runIdleTool(
+        m_idleTools, core::kIndexThreadsTool, entry->conversation.messages());
+    if (!outcome.ran) {
+        // Refused. Nothing is written to the transcript: a line saying a tool
+        // could not run is noise, and the panel already says why.
+        return;
+    }
+    m_messageModel->appendMessage(core::MessageRole::Tool,
+                                  QString::fromStdString(outcome.summary),
+                                  MessageStatus::Complete);
+    emit presenceChanged();
+}
+
 void AppController::onIdleTick() {
     const std::uint64_t now = nowMs();
 
@@ -668,11 +994,8 @@ void AppController::onIdleTick() {
     const core::IdleTick tick = m_idle.tick(now);
     if (tick.produced) {
         m_ambientThought = QString::fromStdString(tick.thought);
-        const QString kind = QString::fromLatin1(core::toString(tick.task.kind));
-        m_idleTaskLabel = !tick.thought.empty() && !m_showIdleThoughts
-                             ? kind
-                             : QStringLiteral("%1 \u00b7 %2")
-                                   .arg(kind, QString::fromStdString(tick.task.detail));
+        m_idleTaskKind = QString::fromLatin1(core::toString(tick.task.kind));
+        m_idleTaskDetail = QString::fromStdString(tick.task.detail);
         m_presence.applyPersona(m_persona.state());
 
         if (!tick.whisper.empty()) {
@@ -683,6 +1006,15 @@ void AppController::onIdleTick() {
         } else if (tick.task.kind == core::IdleTaskKind::CreativeThought
                    || tick.task.kind == core::IdleTaskKind::SelfReflection) {
             noteAssistant(core::AssistantAction::Reflecting);
+        }
+
+        // The one idle task that does real work rather than thinking. It goes
+        // through the registry, so it runs only when the user has switched it
+        // on and granted what it declared, and its outcome is written into the
+        // transcript rather than into a thought the user may never see: a tool
+        // that did something and left no trace would be a tool nobody can audit.
+        if (tick.task.kind == core::IdleTaskKind::ContextReindex) {
+            runIdleToolIfPermitted();
         }
     }
 
@@ -805,24 +1137,26 @@ void AppController::onGenerationFinished(quint64 requestId,
 
     m_voice.finishGeneration(m_activeResponse, m_activeGeneration);
 
-    // There is no audio engine yet, so playback is treated as delivered as soon
-    // as generation finishes. That is the text-only fallback VoiceSession
-    // defines for exactly this situation.
+    // Delivery. With a voice installed the response is not finished until the
+    // audio is, so completion waits for the playback pump. Without one this is
+    // the text-only fallback VoiceSession defines for exactly that situation.
+    if (ttsAvailable()) {
+        m_acknowledgement.clear();
+        finalizeStream(MessageStatus::Complete, {});
+        // The pump can have gone idle earlier, waiting for answer text that had
+        // not been generated yet. Now that the response is whole, let it speak
+        // the remainder and deliver the turn properly.
+        if (m_speaking) {
+            pumpNextSegment();
+        }
+        return;
+    }
+
     m_voice.complete(m_activeResponse);
     m_acknowledgement.clear();
     finalizeStream(MessageStatus::Complete, {});
     noteAssistant(core::AssistantAction::Waiting);
-
-    // Whether a long answer is offered to continue depends on how long it
-    // actually turned out to be, so the judgement is made here rather than
-    // guessed at the start.
-    const int lastRow = m_messageModel->rowCount() - 1;
-    const QString delivered = lastRow >= 0
-        ? m_messageModel->data(m_messageModel->index(lastRow, 0),
-                               MessageModel::ContentRole).toString()
-        : QString();
-    anticipate(delivered.size() > kLongResponseChars ? core::PersonaTrigger::LongResponse
-                                                     : core::PersonaTrigger::TurnCompleted);
+    anticipateForDelivery();
     emit voiceChanged();
 }
 
@@ -844,6 +1178,7 @@ void AppController::startGeneration(const QString& userText) {
     noteAssistant(core::AssistantAction::Thinking);
     emit generatingChanged();
     emit voiceChanged();
+    startPlayback();
     refreshCanRegenerate();
     touchActiveConversation();
 
@@ -923,7 +1258,7 @@ void AppController::sendMessage(const QString& text) {
         return;
     }
 
-    if (m_generating) {
+    if (m_generating || m_speaking) {
         // A new prompt mid-response is a barge-in: preserve what was already
         // delivered, invalidate the in-flight generation so late tokens are
         // rejected as stale, and hand the timeline to the new prompt.
@@ -934,10 +1269,24 @@ void AppController::sendMessage(const QString& text) {
         // through unnoticed.
         static_cast<void>(
             m_voice.resolveInterruption(m_activeResponse, core::InterruptionIntent::Replacement));
-        m_userStopped = true;
-        m_worker->cancel();
+        m_userStopped = m_generating;
+        if (m_generating) {
+            m_worker->cancel();
+        }
+        if (m_speaking) {
+            // Clause boundary, not mid-word: the clause in flight is allowed to
+            // land, and no further segment is pulled. An explicit stop still
+            // cuts immediately, which is what stopGeneration() is for.
+            m_speech->requestStop();
+        }
         m_presence.noteUserAction(core::UserAction::Interrupted);
         emit voiceChanged();
+    }
+
+    // A request that arrived by ear is still the user being present.
+    if (m_listen != nullptr && m_listen->listening()) {
+        m_listen->stopListening();
+        emit listeningChanged();
     }
 
     const bool firstMessage = entry->conversation.size() == 0;
@@ -961,12 +1310,28 @@ void AppController::sendMessage(const QString& text) {
 }
 
 void AppController::stopGeneration() {
-    if (!m_generating) {
+    if (!m_generating && !m_speaking) {
         return;
     }
-    m_userStopped = true;
-    m_worker->cancel();
-    m_voice.cancel(m_activeResponse);
+    if (m_generating) {
+        m_userStopped = true;
+        m_worker->cancel();
+        m_voice.cancel(m_activeResponse);
+    }
+    if (m_listen != nullptr && m_listen->listening()) {
+        // Escape stops the microphone as well as the reply: both are the user
+        // saying stop, and leaving one running would be a surprise.
+        m_listen->stopListening();
+        emit listeningChanged();
+    }
+    if (m_speaking) {
+        // An explicit cancel cuts immediately. Waiting out the current clause
+        // would make the stop button feel ignored.
+        m_speech->stopNow();
+        m_speaking = false;
+        m_hasPendingSegment = false;
+        emit ttsChanged();
+    }
     m_acknowledgement.clear();
     noteActivity();
     m_presence.noteUserAction(core::UserAction::Interrupted);
@@ -984,6 +1349,11 @@ void AppController::pauseConversation() {
     m_voice.pause(m_activeResponse, QStringLiteral("user paused").toStdString());
     m_userPaused = true;
     m_worker->cancel();
+    if (m_speaking) {
+        // Pausing is not cancelling: the clause in flight is still allowed to
+        // finish, and nothing new is pulled afterwards.
+        m_speech->requestStop();
+    }
     m_acknowledgement.clear();
     noteActivity();
     m_presence.noteUserAction(core::UserAction::Paused);
@@ -1032,6 +1402,13 @@ void AppController::resumeConversation() {
     }
 
     // Everything the response needed was already generated; nothing to restart.
+    if (ttsAvailable() && !m_speaking) {
+        // The text is all there and the user paused the audio. Resuming means
+        // picking the playback back up from the spoken cursor, not completing a
+        // response the user has not heard yet.
+        startPlayback();
+        return;
+    }
     m_voice.complete(m_activeResponse);
     finalizeStream(MessageStatus::Complete, {});
 }

@@ -1,5 +1,6 @@
 #include "core/conversation.h"
 #include "core/idlepersona.h"
+#include "core/idletool.h"
 #include "core/persona.h"
 #include "core/presence.h"
 #include "core/voicesession.h"
@@ -680,6 +681,114 @@ void testIdleStopsWhenDisabled() {
     assert(idle.cycles() == 0);
 }
 
+// --- Idle tool registry ------------------------------------------------------
+
+core::IdleToolDeclaration indexingTool() {
+    core::IdleToolDeclaration declaration;
+    declaration.name = "index recent threads";
+    declaration.summary = "Summarise recent conversations into a local index.";
+    declaration.permissions = {core::ToolPermission::ReadConversations,
+                                core::ToolPermission::RunGeneration};
+    return declaration;
+}
+
+void testUndeclaredToolIsRefused() {
+    core::IdleToolRegistry registry;
+    // Nothing is known about a tool that was never declared, so every
+    // capability it might need counts as outstanding. Returning an empty list
+    // would read as permission granted.
+    assert(!registry.permits("index recent threads"));
+    assert(registry.missing("index recent threads").size() == 4);
+    assert(registry.find("index recent threads") == nullptr);
+    assert(registry.tools().empty());
+}
+
+void testDeclaredToolIsRefusedUntilEnabled() {
+    core::IdleToolRegistry registry;
+    registry.declare(indexingTool());
+    assert(registry.find("index recent threads") != nullptr);
+    // Declared and fully granted is still not enough: a tool has to be asked for.
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    registry.grant(core::ToolPermission::RunGeneration, true);
+    assert(!registry.enabled("index recent threads"));
+    assert(!registry.permits("index recent threads"));
+    // A tool that declares nothing still needs to be switched on, or an opt-in
+    // registry would run anything that happened to ask for nothing.
+    core::IdleToolDeclaration inert;
+    inert.name = "warm the cache";
+    inert.summary = "Touch a file already in memory.";
+    registry.declare(inert);
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    registry.grant(core::ToolPermission::RunGeneration, true);
+    assert(registry.missing("warm the cache").empty());
+    assert(!registry.permits("warm the cache"));
+    registry.setEnabled("warm the cache", true);
+    assert(registry.permits("warm the cache"));
+}
+
+void testMissingPermissionIsNamed() {
+    core::IdleToolRegistry registry;
+    registry.declare(indexingTool());
+    registry.setEnabled("index recent threads", true);
+    assert(!registry.permits("index recent threads"));
+
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    assert(!registry.permits("index recent threads"));
+    const std::vector<core::ToolPermission> outstanding =
+        registry.missing("index recent threads");
+    assert(outstanding.size() == 1);
+    assert(outstanding.front() == core::ToolPermission::RunGeneration);
+
+    registry.grant(core::ToolPermission::RunGeneration, true);
+    assert(registry.missing("index recent threads").empty());
+    assert(registry.permits("index recent threads"));
+
+    // Revoking a grant takes effect immediately rather than at the next request.
+    registry.grant(core::ToolPermission::RunGeneration, false);
+    assert(!registry.permits("index recent threads"));
+    assert(registry.missing("index recent threads").size() == 1);
+}
+
+void testNothingIsGrantedByDefault() {
+    core::IdleToolRegistry registry;
+    // Not even the capabilities that sound harmless. The user grants them, or
+    // nobody does.
+    for (const core::ToolPermission permission :
+         {core::ToolPermission::ReadConversations, core::ToolPermission::RunGeneration,
+          core::ToolPermission::WriteFiles, core::ToolPermission::Network}) {
+        assert(!registry.granted(permission));
+    }
+    assert(std::string(core::toString(core::ToolPermission::WriteFiles))
+           == "write files");
+    assert(std::string(core::toString(core::ToolPermission::Network)) == "network");
+}
+
+void testReplacedToolMustBeAgreedAgain() {
+    core::IdleToolRegistry registry;
+    registry.declare(indexingTool());
+    registry.setEnabled("index recent threads", true);
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    registry.grant(core::ToolPermission::RunGeneration, true);
+    assert(registry.permits("index recent threads"));
+
+    // Same name, different job: it now reaches the network as well. Whatever
+    // the user agreed to was the previous tool, so the new one starts off.
+    core::IdleToolDeclaration widened = indexingTool();
+    widened.summary = "Summarise recent conversations and publish the index.";
+    widened.permissions = {core::ToolPermission::ReadConversations,
+                            core::ToolPermission::RunGeneration,
+                            core::ToolPermission::Network};
+    registry.declare(widened);
+
+    assert(registry.tools().size() == 1);
+    assert(!registry.enabled("index recent threads"));
+    assert(!registry.permits("index recent threads"));
+    assert(registry.missing("index recent threads").size() == 1);
+    assert(registry.missing("index recent threads").front() == core::ToolPermission::Network);
+    // The grants the user gave are still grants; they are not taken away.
+    assert(registry.granted(core::ToolPermission::RunGeneration));
+}
+
 // --- Presence engine ---------------------------------------------------------
 
 void testPresenceTracksMeaning() {
@@ -903,6 +1012,11 @@ int main() {
     testIdleDriftsDialsButNeverRamps();
     testIdleGreetsOncePerAbsence();
     testIdleStopsWhenDisabled();
+    testUndeclaredToolIsRefused();
+    testDeclaredToolIsRefusedUntilEnabled();
+    testMissingPermissionIsNamed();
+    testNothingIsGrantedByDefault();
+    testReplacedToolMustBeAgreedAgain();
     testPresenceTracksMeaning();
     testSpeechPlanningClausesAndPauses();
     testClauseStartBefore();

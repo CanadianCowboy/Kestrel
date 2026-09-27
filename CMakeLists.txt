@@ -69,6 +69,38 @@ else()
     message(STATUS "Kestrel: CUDA disabled; compiling the portable device-discovery stub")
 endif()
 
+# --- Platform speech recognition ---------------------------------------------
+# The Windows Runtime speech headers are part of the Windows SDK rather than
+# something Kestrel vendors, so this checks for them and says what it found
+# instead of assuming. On anything else -- or on a Windows SDK without them --
+# the stub compiles and the app reports that it cannot listen.
+#
+# Note on what the SDK actually provides: the Windows.Media.SpeechRecognition
+# projection here exposes the ISpeechRecognizer interface but not a projected
+# runtime class, so there is no GetSpeechRecognizerAsync to call and reaching
+# the engine means creating the ABI interface through RoCreateInstance. The
+# desktop flavour of that API also has no interim-text event, so a recognizer
+# built on it can report a finished phrase but not the words so far. See
+# src/runtime/winrtspeechrecognizer.h.
+set(KESTREL_WINRT_SPEECH_SOURCE src/runtime/winrtspeechrecognizer_stub.cpp)
+set(KESTREL_WINRT_SPEECH OFF)
+if(WIN32)
+    find_path(KESTREL_CPPWINRT_INCLUDE_DIR
+        NAMES winrt/Windows.Media.SpeechRecognition.h
+        PATH_SUFFIXES cppwinrt
+    )
+    find_library(KESTREL_WINDOWSAPP_LIBRARY NAMES WindowsApp)
+    if(KESTREL_CPPWINRT_INCLUDE_DIR AND KESTREL_WINDOWSAPP_LIBRARY)
+        message(STATUS "Kestrel: Windows speech headers present; the recognizer stub is "
+                       "still used because the SDK ships no projected speech class")
+    else()
+        message(STATUS "Kestrel: Windows speech recognition headers not found; "
+                       "compiling the portable recognizer stub")
+    endif()
+else()
+    message(STATUS "Kestrel: not Windows; compiling the portable recognizer stub")
+endif()
+
 # --- TensorRT discovery ------------------------------------------------------
 # The TensorRT SDK is intentionally not vendored, so this never finds itself by
 # accident: it is reachable only through the explicit cache variables above.
@@ -94,12 +126,18 @@ add_library(kestrel_core
     src/core/presence.h
     src/core/idlepersona.cpp
     src/core/idlepersona.h
+    src/core/idletool.cpp
+    src/core/idletool.h
     src/core/voicesession.cpp
     src/core/voicesession.h
     src/runtime/cudadevice.cpp
     src/runtime/cudadevice.h
     src/runtime/modelbackend.cpp
     src/runtime/modelbackend.h
+    src/runtime/speechrecognizer.h
+    src/runtime/speechrecognizer.cpp
+    src/runtime/winrtspeechrecognizer.h
+    ${KESTREL_WINRT_SPEECH_SOURCE}
     ${KESTREL_CUDA_DISCOVERY_SOURCE}
     src/runtime/engineartifact.cpp
     src/runtime/engineartifact.h
@@ -190,6 +228,18 @@ endif()
 if(KESTREL_BUILD_UI)
     find_package(Qt6 6.6 COMPONENTS Core Quick QuickControls2 QUIET)
     if(Qt6_FOUND)
+        # TextToSpeech is optional on purpose. A Qt install without it still
+        # builds and runs; Kestrel then speaks as text, which is a supported
+        # outcome rather than a broken one, exactly as a missing llama.cpp
+        # degrades the GGUF backend to "unavailable" instead of failing the
+        # build.
+        #
+        # It is a separate find_package rather than another entry in COMPONENTS
+        # on purpose: one missing component there fails the whole find, which
+        # would silently drop the desktop target on a Qt install that has
+        # everything else. Asking for the module on its own cannot do that, and
+        # it defines Qt6::TextToSpeech when -- and only when -- it is present.
+        find_package(Qt6TextToSpeech QUIET)
         qt_standard_project_setup(REQUIRES 6.6)
 
         qt_add_executable(kestrel
@@ -198,6 +248,10 @@ if(KESTREL_BUILD_UI)
             src/app/appcontroller.h
             src/app/generationworker.cpp
             src/app/generationworker.h
+            src/app/speechsynthesizer.cpp
+            src/app/speechsynthesizer.h
+            src/app/listensession.cpp
+            src/app/listensession.h
             src/app/conversationentry.h
             src/app/messagemodel.cpp
             src/app/messagemodel.h
@@ -219,6 +273,14 @@ if(KESTREL_BUILD_UI)
         )
         target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT=1)
 
+        if(TARGET Qt6::TextToSpeech)
+            target_link_libraries(kestrel PRIVATE Qt6::TextToSpeech)
+            target_compile_definitions(kestrel PRIVATE KESTREL_HAS_TEXT_TO_SPEECH=1)
+            message(STATUS "Kestrel: Qt TextToSpeech found; responses can be spoken")
+        else()
+            message(STATUS "Kestrel: Qt TextToSpeech not found; responses are text-only")
+        endif()
+
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
         if(KESTREL_BUILD_TESTS)
@@ -231,6 +293,10 @@ if(KESTREL_BUILD_UI)
                 tests/app_tests.cpp
                 src/app/generationworker.cpp
                 src/app/generationworker.h
+                src/app/speechsynthesizer.cpp
+                src/app/speechsynthesizer.h
+                src/app/listensession.cpp
+                src/app/listensession.h
                 src/app/appcontroller.cpp
                 src/app/appcontroller.h
                 src/app/messagemodel.cpp
@@ -242,6 +308,10 @@ if(KESTREL_BUILD_UI)
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
             target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui)
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})
+            if(TARGET Qt6::TextToSpeech)
+                target_link_libraries(kestrel_app_tests PRIVATE Qt6::TextToSpeech)
+                target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_TEXT_TO_SPEECH=1)
+            endif()
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
 
             # A Qt-linked test needs Qt's DLLs resolvable at run time. CMake does

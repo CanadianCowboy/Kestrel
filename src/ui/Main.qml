@@ -30,43 +30,46 @@ ApplicationWindow {
     // A switch for the presence panel. Declared here rather than repeated three
     // times in the diagnostics column, because the file already styles every
     // control by hand and a stock CheckBox would not match it.
-    component IdleToggle: Item {
+    component IdleToggle: RowLayout {
         id: toggle
         required property string label
         property string hint: ""
         property bool checked: false
         signal toggled()
         Layout.fillWidth: true
-        implicitWidth: content.implicitWidth
-        implicitHeight: content.implicitHeight
+        spacing: 10
         activeFocusOnTab: true
         Keys.onSpacePressed: function(event) {
             toggle.toggled()
             event.accepted = true
         }
-        RowLayout {
-            id: content
-            anchors.fill: parent
-            spacing: 10
-            Rectangle {
-                Layout.preferredWidth: 14
-                Layout.preferredHeight: 14
-                radius: 4
-                color: toggle.checked ? window.accent : "#1a1d23"
-                border.color: toggle.activeFocus ? window.ink
-                                                : toggle.checked ? window.accent : window.line
-                Behavior on color { ColorAnimation { duration: 140 } }
-            }
-            Text {
-                text: toggle.label
-                color: window.ink
-                font.pixelSize: 12
-                Layout.fillWidth: true
-            }
+        Rectangle {
+            width: 14
+            height: 14
+            radius: 4
+            color: toggle.checked ? window.accent : "#1a1d23"
+            // Focus is drawn on the indicator because it is the one fixed-size
+            // part of the row, so a keyboard user can see where they are without
+            // the label having to change.
+            border.color: toggle.activeFocus ? window.ink
+                                            : toggle.checked ? window.accent : window.line
+            Behavior on color { ColorAnimation { duration: 140 } }
         }
+        Text {
+            text: toggle.label
+            color: window.ink
+            font.pixelSize: 12
+            Layout.fillWidth: true
+        }
+        // One MouseArea covering the whole row, so the label is the target and
+        // the hover that reveals the hint is the same gesture as the click. It
+        // is sized by the layout rather than anchored: anchors on a
+        // layout-managed item are undefined behaviour, and Qt says so at
+        // runtime.
         MouseArea {
             id: hover
-            anchors.fill: parent
+            Layout.fillWidth: true
+            Layout.fillHeight: true
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: {
@@ -390,53 +393,111 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             model: appController.messages
-                            spacing: 20
+                            spacing: 16
                             clip: true
                             delegate: Item {
-                                id: messageRow
+                                id: entry
                                 required property string author
                                 required property string content
                                 required property string status
                                 required property string note
                                 width: messageList.width
-                                height: bubble.implicitHeight + 4
+                                height: entryColumn.implicitHeight + 30
                                 readonly property bool fromAssistant: author === "assistant"
+                                readonly property bool streaming: status === "streaming"
+                                // Monospace only for the log furniture, never for
+                                // the text itself. Windows and every other
+                                // platform have a different default, so ask for
+                                // the generic family where Consolas is absent
+                                // rather than naming one and getting a fallback
+                                // nobody asked for.
+                                readonly property string monoFamily: Qt.platform.os === "windows"
+                                                                          ? "Consolas" : "monospace"
+
+                                // The rail. A transcript is one column with a
+                                // margin, not two stacks of boxes: a two-pixel
+                                // line the assistant owns and the user does not
+                                // is enough to tell the two apart, and it leaves
+                                // the full width for the words.
                                 Rectangle {
-                                    id: bubble
-                                    width: Math.min(parent.width * 0.78, bubbleColumn.implicitWidth + 30)
-                                    height: bubbleColumn.implicitHeight + 24
-                                    radius: 15
-                                    anchors.left: messageRow.fromAssistant ? parent.left : undefined
-                                    anchors.right: messageRow.fromAssistant ? undefined : parent.right
-                                    color: messageRow.fromAssistant ? "#15181d" : "#243b34"
-                                    border.color: messageRow.fromAssistant ? window.line : "#385b4e"
-                                    Column {
-                                        id: bubbleColumn
-                                        anchors.fill: parent
-                                        anchors.margins: 15
-                                        spacing: 6
+                                    x: 0
+                                    y: 14
+                                    width: 2
+                                    height: parent.height - 30
+                                    color: entry.fromAssistant ? window.accent : window.line
+                                    opacity: entry.fromAssistant ? 0.55 : 0.85
+                                    Behavior on opacity { NumberAnimation { duration: 220 } }
+                                }
+
+                                Column {
+                                    id: entryColumn
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 20
+                                    anchors.right: parent.right
+                                    spacing: 7
+
+                                    Row {
+                                        spacing: 10
                                         Text {
-                                            width: parent.width
-                                            text: messageRow.content
-                                            color: window.ink
-                                            font.pixelSize: 14
-                                            lineHeight: 1.35
-                                            wrapMode: Text.Wrap
+                                            text: entry.fromAssistant ? "KESTREL" : "YOU"
+                                            color: entry.fromAssistant ? window.accent : window.muted
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                            font.letterSpacing: 2
                                         }
-                                        // Terminal states stay visible rather than
-                                        // being discarded, so a stopped or failed
-                                        // response is still readable and recoverable.
                                         Text {
-                                            width: parent.width
-                                            visible: messageRow.status === "stopped"
-                                                         || messageRow.status === "failed"
-                                            text: messageRow.status === "failed"
-                                                  ? "Generation failed" + (messageRow.note ? ": " + messageRow.note : "")
-                                                  : "Stopped"
-                                            color: "#8a6a74"
-                                            font.pixelSize: 11
-                                            wrapMode: Text.Wrap
+                                            text: (entry.index + 1 < 10 ? "0" : "") + (entry.index + 1)
+                                            color: "#3f4652"
+                                            font.pixelSize: 10
+                                            font.family: entry.monoFamily
                                         }
+                                        Rectangle {
+                                            width: 18; height: 1
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            color: window.line
+                                            visible: entry.streaming || entry.status === "stopped"
+                                                     || entry.status === "failed"
+                                        }
+                                        // While tokens are still arriving the
+                                        // dot pulses with the presence engine,
+                                        // so the eye can tell live from finished
+                                        // without watching the text.
+                                        Rectangle {
+                                            width: 6; height: 6; radius: 3
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            visible: entry.streaming
+                                            color: window.accent
+                                            SequentialAnimation on opacity {
+                                                running: entry.streaming
+                                                loops: Animation.Infinite
+                                                NumberAnimation { from: 1.0; to: 0.25; duration: 620; easing.type: Easing.InOutSine }
+                                                NumberAnimation { from: 0.25; to: 1.0; duration: 620; easing.type: Easing.InOutSine }
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        width: parent.width
+                                        text: entry.content
+                                        color: entry.fromAssistant ? window.ink : "#cfd6d2"
+                                        font.pixelSize: 14
+                                        lineHeight: 1.4
+                                        wrapMode: Text.Wrap
+                                    }
+
+                                    // Terminal states stay visible rather than
+                                    // being discarded, so a stopped or failed
+                                    // response is still readable and recoverable.
+                                    Text {
+                                        width: parent.width
+                                        visible: entry.status === "stopped" || entry.status === "failed"
+                                        text: entry.status === "failed"
+                                              ? "GENERATION FAILED" + (entry.note ? " — " + entry.note : "")
+                                              : "STOPPED"
+                                        color: "#8a6a74"
+                                        font.pixelSize: 10
+                                        font.letterSpacing: 1.4
+                                        wrapMode: Text.Wrap
                                     }
                                 }
                             }
@@ -549,7 +610,7 @@ ApplicationWindow {
                                         // so the idle loop goes quiet before it can
                                         // decide anything.
                                         onTextChanged: appController.inputPending = length > 0
-                                        onActiveFocusChanged: appController.inputPending = length > 0
+                                        onActiveFocusChanged: appController.inputPending = activeFocus || length > 0
                                         placeholderText: "Message Kestrel..."
                                         placeholderTextColor: "#626a77"
                                         color: window.ink
@@ -727,6 +788,24 @@ ApplicationWindow {
                                 Layout.maximumWidth: 170
                             }
                         }
+                        // Which voice is speaking, or why nothing is. Said
+                        // plainly rather than as a silent failure: a reply that
+                        // was never spoken is otherwise indistinguishable from
+                        // one that was too fast to notice.
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text { text: "VOICE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                            Text {
+                                text: appController.ttsAvailable ? appController.ttsVoice
+                                                                : (appController.ttsError.length > 0 ? appController.ttsError : "text only")
+                                color: appController.ttsAvailable ? window.ink : window.muted
+                                font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 170
+                            }
+                        }
 
                         // The three switches that keep the idle loop inside its
                         // box: whether it runs at all, whether it may touch the
@@ -758,6 +837,59 @@ ApplicationWindow {
                             font.pixelSize: 11
                             font.italic: true
                             wrapMode: Text.Wrap
+                        }
+
+                        // Idle tools. A switch is not enough on its own: a tool
+                        // that is on but has not been granted what it declared
+                        // is still off, and the user is the one who decides
+                        // which is which. So each tool gets its own switch and
+                        // its own list of capabilities, each of which can be
+                        // granted here.
+                        Repeater {
+                            model: appController.idleTools
+                            delegate: ColumnLayout {
+                                required property var modelData
+                                readonly property var tool: modelData
+                                Layout.fillWidth: true
+                                spacing: 4
+
+                                IdleToggle {
+                                    label: tool.name
+                                    // Both states are worth saying out loud, and
+                                    // saying which one applies is the point of the
+                                    // hint rather than decoration.
+                                    hint: tool.enabled
+                                          ? (tool.permitted
+                                             ? tool.summary
+                                             : "needs: " + tool.missing.join(", "))
+                                          : "switch on to allow this"
+                                    checked: tool.enabled
+                                    onToggled: appController.setIdleToolEnabled(tool.name, !tool.enabled)
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.leftMargin: 24
+                                    spacing: 2
+                                    visible: tool.required.length > 0
+
+                                    Repeater {
+                                        model: tool.required
+                                        delegate: IdleToggle {
+                                            required property string modelData
+                                            required property var model
+                                            readonly property string capability: modelData
+                                            readonly property bool granted: !tool.missing.includes(capability)
+                                            label: capability
+                                            hint: granted
+                                                  ? "granted"
+                                                  : "Kestrel cannot do this until you allow it"
+                                            checked: granted
+                                            onToggled: appController.setToolPermission(capability, !granted)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
