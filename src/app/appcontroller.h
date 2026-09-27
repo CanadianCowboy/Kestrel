@@ -30,6 +30,14 @@ namespace kestrel::app {
 class GenerationWorker;
 class SpeechSynthesizer;
 class ListenSession;
+
+// How long a reply may wait for a voice to announce itself before the app stops
+// waiting and delivers it as text.
+//
+// The deadline on waiting for a voice lives with the voice: SpeechSynthesizer
+// owns it, because a response is owed audio because of what the engine is doing,
+// not because of anything the controller knows about engines.
+//
 // Forward declared as a class, not a struct, to match its definition in
 // speechsynthesizer.h. MSVC encodes that difference in the mangled name, so a
 // mismatched tag here compiles and then fails to link.
@@ -188,6 +196,18 @@ public:
     // clause pump can be driven on a machine with no voice installed. Mirrors
     // setBackendForTesting, for the same reason.
     void setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> backend);
+
+    // Test seam for the persona: put the dials somewhere the idle loop would
+    // have put them. The warmth dial reaches the synthesizer as a plain copy,
+    // and a copy from a value that happens to equal the voice persona's own
+    // default is indistinguishable from no copy at all -- so checking that the
+    // wiring exists needs a dial that has actually moved.
+    void setPersonaStateForTesting(const core::PersonaState& state);
+
+    // Test seam for the voice deadline: shorten or lengthen how long a reply may
+    // wait for an engine to announce itself. The production value is sized
+    // against a measured model load; a test cannot wait that long.
+    void setVoiceLoadTimeoutForTesting(int ms);
 
     [[nodiscard]] MessageModel* messages() const noexcept;
     [[nodiscard]] ConversationModel* conversations() const noexcept;
@@ -368,9 +388,27 @@ private:
     void onSpeechSegmentFinished();
     void onSpeechStopCompleted();
     void onSpeechFailed(const QString& reason);
+    // A voice became usable. A response that was asked for before the engine
+    // could answer is spoken here, if the engine turned up while it was still
+    // held. Whether anything is held, and whether the engine gave up being one,
+    // are the synthesizer's facts, not this class's.
+    void onSpeechAvailabilityChanged(bool available);
+    // A response that was owed a voice is now text, and delivering it is this
+    // class's job: only the controller completes the response, notes the
+    // assistant idle and emits the change. Raised wherever the promise ends
+    // without the audio -- the engine giving up, the user stopping, or the user
+    // leaving the conversation it belongs to -- so all of them arrive here.
+    void onOwedAudioReleased(bool voiceGaveUp);
     void startPlayback();
     void pumpNextSegment();
     void finishPlayback();
+    // The persona this response is spoken with, and the act of handing it to
+    // the engine. Called where audio is actually asked for, not once when
+    // playback happens to begin: the engine holds the pace it was last given,
+    // and a clause made under a pace this response was never given cannot be
+    // corrected when it plays. Sampled once per response, so the choice is
+    // still the persona's per-response one.
+    void applyResponseVoice();
     /// Offers a closing line if the delivered answer was long enough to warrant
     /// one. Called wherever delivery actually completes, text-only or spoken.
     void anticipateForDelivery();
@@ -473,6 +511,11 @@ private:
     // Voice state machine. Owns the response timeline and is the authority on
     // what the UI is allowed to offer next.
     core::VoiceSession m_voice;
+    // The persona the response being spoken was given, and whether one has been
+    // taken yet. Cleared when the response is delivered or its audio is stopped,
+    // so the next response picks up whatever the dials say then.
+    core::VoicePersona m_responseVoice;
+    bool m_responseVoiceTaken = false;
 
     // The personality, the presence projection of it, and the loop that keeps
     // the assistant company between turns. All three are portable core; this
@@ -499,8 +542,11 @@ private:
     std::unique_ptr<SpeechSynthesizer> m_speech;
     // The recognizer and the session that drives it. The recognizer stays a
     // plain runtime type -- no QObject, no Qt types in the portable layer -- so
-    // the app owns it and the session borrows it.
-    std::unique_ptr<runtime::MockSpeechRecognizer> m_recognizer;
+    // the app owns it and the session borrows it. The type is the interface
+    // rather than the scripted one because which implementation it is depends
+    // on the machine: a Windows box with a microphone gets the SAPI adapter,
+    // and everything else gets the preview recognizer.
+    std::unique_ptr<runtime::SpeechRecognizer> m_recognizer;
     std::unique_ptr<ListenSession> m_listen;
     // True from the first clause of a response until the last one is spoken.
     // Distinct from m_generating, because generation finishes long before the

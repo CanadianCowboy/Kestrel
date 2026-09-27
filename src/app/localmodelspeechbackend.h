@@ -37,6 +37,11 @@ public:
     ~LocalModelSpeechBackend() override;
 
     [[nodiscard]] bool usable() const override;
+    // The engine is on disk and has been launched, whether or not its model has
+    // finished loading. This is what tells the controller there is something to
+    // wait for, so a reply asked for during the load is spoken rather than
+    // downgraded to text.
+    [[nodiscard]] bool present() const override { return m_launched; }
     [[nodiscard]] QString description() const override;
 
     void applyVoice(const core::VoicePersona& persona) override;
@@ -78,13 +83,32 @@ protected:
     // sentence failing should not silence the rest of the reply, and the reason
     // is reported rather than swallowed.
     void noteClauseFailed(const QString& reason);
-    // Called once the engine is up and able to accept work.
-    void markStarted() { m_started = true; }
+    // Called once the driver process is up. Requests written to it from here on
+    // are answered, just not immediately: the driver queues them while the model
+    // loads. This is what makes present() true, and it is deliberately not the
+    // same moment as markStarted().
+    void markLaunched() { m_launched = true; }
+    // Called once the engine has answered for itself and can actually produce
+    // audio. Deliberately not the moment the process spawns: a local model is
+    // hundreds of megabytes loaded after its interpreter is already running, and
+    // reporting a voice before then is a claim nothing can back up.
+    void markStarted() {
+        if (m_started) {
+            return;
+        }
+        m_started = true;
+        reportAvailable();
+    }
+    // The engine will not be answering. Says so, so anything waiting on it stops
+    // waiting rather than holding a response that is never going to be spoken.
+    void markGivenUp();
     // The persona's speaking rate, as an engine should be told it.
     [[nodiscard]] double speedForRequest() const { return m_speed; }
 
     [[nodiscard]] QString engineExecutable() const;
-    void failIfNotStarted();
+    // Reports that the engine gave up before it ever started. Safe to call when
+    // it never could: the answer is the same either way.
+    void failIfNotStarted() { markGivenUp(); }
 
 private:
     void onMediaStatusChanged();
@@ -105,6 +129,12 @@ private:
 
     QString m_voice;
     double m_speed = 1.0;
+    // Launched: the driver process is up. Not the same as started, and not
+    // enough to take work -- nothing reaches this class until the engine has
+    // announced itself, because the synthesizer will not hand it a clause before
+    // then. It exists so present() can say a voice is coming.
+    bool m_launched = false;
+    // Started: the engine has confirmed it can produce audio now.
     bool m_started = false;
     bool m_speaking = false;
     int m_clause = 0;

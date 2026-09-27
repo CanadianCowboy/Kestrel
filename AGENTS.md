@@ -21,13 +21,17 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
 ## Vendor SDK boundary
 
 `src/runtime/cudadiscovery_cuda.cpp` is the only translation unit that may
-include a CUDA header, and `src/runtime/tensorrtbackend.cpp` is the only one that
-may include TensorRT headers. All other code, including `cudadevice.h`,
-`AppController`, and QML, reads device facts through the portable structs.
+include a CUDA header, `src/runtime/tensorrtbackend.cpp` is the only one that
+may include TensorRT headers, and `src/runtime/sapirecognizer_win32.cpp` is the
+only one that may include a SAPI header. All other code, including
+`cudadevice.h`, `sapirecognizer.h`, `AppController`, and QML, reads platform
+facts through the portable structs and interfaces.
 
 CMake picks `cudadiscovery_cuda.cpp` or `cudadiscovery_stub.cpp` based on
-`KESTREL_ENABLE_CUDA` and toolkit detection. Do not add a second CUDA-including
-file; extend `cudadevice.h` and the existing implementation instead.
+`KESTREL_ENABLE_CUDA` and toolkit detection, and `sapirecognizer_win32.cpp` or
+`sapirecognizer_stub.cpp` based on the Windows SDK. Do not add a second
+CUDA-including or SAPI-including file; extend the portable header and the
+existing implementation instead.
 
 ## Implementation conventions
 

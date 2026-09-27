@@ -171,6 +171,10 @@ AppController::AppController(QObject* parent)
             this, &AppController::onSpeechSegmentFinished);
     connect(m_speech.get(), &SpeechSynthesizer::stopCompleted,
             this, &AppController::onSpeechStopCompleted);
+    connect(m_speech.get(), &SpeechSynthesizer::availabilityChanged,
+            this, &AppController::onSpeechAvailabilityChanged);
+    connect(m_speech.get(), &SpeechSynthesizer::owedAudioReleased,
+            this, &AppController::onOwedAudioReleased);
     connect(m_speech.get(), &SpeechSynthesizer::failed, this, [this](const QString& reason) {
         // A voice that dies mid-response must not take the reply with it: the
         // text is already on screen, so the failure is reported and the
@@ -181,11 +185,23 @@ AppController::AppController(QObject* parent)
         emit ttsChanged();
     });
 
-    // Speech input. The recognizer is the same preview backend the mock
-    // generation path uses, so the whole voice loop -- partial words, barge-in,
-    // submission -- runs in a build with no microphone. A platform recognizer
-    // replaces it without anything above this line changing.
-    m_recognizer = std::make_unique<runtime::MockSpeechRecognizer>();
+    // Speech input. The recognizer is chosen for the machine rather than
+    // hardcoded: a box with a microphone gets the SAPI 5 adapter, and anything
+    // else gets the scripted preview recognizer, so the whole voice loop --
+    // partial words, barge-in, submission -- runs everywhere. Which one it is
+    // says so through sttDetail(), so a user who cannot dictate is told why
+    // rather than left to work it out.
+    //
+    // KESTREL_SPEECH_INPUT forces either branch, for the two callers that would
+    // otherwise be at the mercy of the machine's audio hardware: the test suite,
+    // which asserts on partial words only the scripted recognizer produces, and
+    // a user who wants the real adapter on a machine the probe says is deaf.
+    const QString requestedInput = qEnvironmentVariable("KESTREL_SPEECH_INPUT");
+    const runtime::SpeechInput preference =
+        requestedInput == QLatin1String("mock") ? runtime::SpeechInput::Mock
+        : requestedInput == QLatin1String("platform") ? runtime::SpeechInput::Platform
+                                                      : runtime::SpeechInput::Auto;
+    m_recognizer = runtime::makeBestSpeechRecognizer(preference);
     m_listen = std::make_unique<ListenSession>(*m_recognizer, this);
     connect(m_listen.get(), &ListenSession::utteranceFinal,
             this, &AppController::onUtteranceFinal);
@@ -630,6 +646,23 @@ void AppController::onSpeechSegmentFinished() {
     pumpNextSegment();
 }
 
+void AppController::applyResponseVoice() {
+    if (m_speech == nullptr) {
+        return;
+    }
+    // Taken once per response and reused for every clause after it, so the pace
+    // belongs to the reply rather than to the moment any one clause happens to
+    // be asked for. Re-handed on each request, because the engine holds the
+    // pace it was last given: a fresh engine starts at 1.0, and nothing else
+    // would put this response's pace back before the next clause was made.
+    if (!m_responseVoiceTaken) {
+        m_responseVoice = m_voice.voicePersona();
+        m_responseVoice.warmth = m_persona.state().warmth;
+        m_responseVoiceTaken = true;
+    }
+    m_speech->applyVoice(m_responseVoice);
+}
+
 void AppController::pumpNextSegment() {
     if (!m_speaking) {
         return;
@@ -651,6 +684,10 @@ void AppController::pumpNextSegment() {
     }
     m_hasPendingSegment = true;
     m_pendingSegmentEnd = segment->endOffset;
+    // Committed here rather than only at startPlayback, because this is the
+    // point the audio is asked for. The prefetch below asks for more of it in
+    // the same breath and must be made at the same pace.
+    applyResponseVoice();
     m_speech->speak(QString::fromStdString(segment->text), segment->leadingPauseMs);
 
     // Look one clause ahead. A synthesising engine needs real time to produce a
@@ -690,6 +727,44 @@ void AppController::anticipateForDelivery() {
                                                      : core::PersonaTrigger::TurnCompleted);
 }
 
+void AppController::onSpeechAvailabilityChanged(bool available) {
+    if (!available) {
+        // The engine will never answer. The synthesizer has already ended the
+        // hold it was holding, and onOwedAudioReleased delivered that response
+        // as text; there is nothing left to decide here.
+        return;
+    }
+    m_speechError.clear();
+    if (m_speech->audioOwed()) {
+        // The engine turned up, so the response it was holding is spoken
+        // now, from the same untouched text: the pump reads that response's
+        // own unspoken remainder, so nothing is re-sent and nothing stale is
+        // spoken.
+        startPlayback();
+    }
+}
+
+void AppController::setVoiceLoadTimeoutForTesting(int ms) {
+    if (m_speech != nullptr) {
+        m_speech->setVoiceLoadTimeout(ms);
+    }
+}
+
+void AppController::onOwedAudioReleased(bool voiceGaveUp) {
+    if (voiceGaveUp) {
+        m_speechError = tr("The local voice was still loading its model and has given up, "
+                           "so replies are being delivered as text.");
+    }
+    // The response is delivered as text -- the delivery it would have had
+    // anyway, at the moment it became true rather than at a moment chosen for
+    // convenience. The words are already in the transcript either way; what
+    // stops here is the promise of audio for them.
+    m_voice.complete(m_activeResponse);
+    noteAssistant(core::AssistantAction::Waiting);
+    anticipateForDelivery();
+    emit voiceChanged();
+}
+
 void AppController::onSpeechStopCompleted() {
     if (!m_speaking) {
         return;
@@ -702,12 +777,32 @@ void AppController::onSpeechStopCompleted() {
 }
 
 void AppController::startPlayback() {
+    // Whether the response is owed audio or handed over to text is decided
+    // here, once, and it is the decision that used to be made too early: a
+    // local model is installed and running before it can answer, so checking
+    // availability at the moment a request is made answered a cold-start reply
+    // in text and never revisited it. What the engine is doing is the
+    // synthesizer's business; this only asks, once, and moves on either way.
+    if (m_speech != nullptr) {
+        m_speech->oweAudio();
+    }
     if (!ttsAvailable()) {
-        // No voice installed: the text-only fallback owns delivery, and the
-        // response completes with generation.
         return;
     }
-    m_speech->applyVoice(m_voice.voicePersona());
+    // Every start is the start of a response: a new one, a held one being
+    // spoken for the first time, or a resume. The dials are read again here
+    // rather than carried over, because carrying them over was a real defect --
+    // a message sent while a reply is still speaking is a new response, and it
+    // was inheriting the persona the interrupted one had been given, so a
+    // back-and-forth at speed spoke every reply at the first reply's pace.
+    m_responseVoiceTaken = false;
+    // Warmth is the persona's to set, so the voice the synthesizer is handed
+    // carries the dial rather than the constant VoicePersona was born with.
+    // Filled in per response rather than per clause on purpose: a speed that
+    // changed mid-sentence would sound like the voice faltering, and the mood
+    // does not move that fast. It is committed again per clause, to the same
+    // persona, so the pace a clause is made at is the pace it is played at.
+    applyResponseVoice();
     m_speaking = true;
     m_openingPauseMs = 0;
     if (m_acknowledgement.isEmpty()) {
@@ -867,6 +962,12 @@ void AppController::setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> ba
     }
     m_speech->setBackendForTesting(std::move(backend));
     emit ttsChanged();
+}
+
+void AppController::setPersonaStateForTesting(const core::PersonaState& state) {
+    m_persona.setState(state);
+    m_presence.applyPersona(m_persona.state());
+    emit presenceChanged();
 }
 
 /// Returns whether this build provides an available llama.cpp backend.
@@ -1297,7 +1398,14 @@ void AppController::onGenerationFinished(quint64 requestId,
     // Delivery. With a voice installed the response is not finished until the
     // audio is, so completion waits for the playback pump. Without one this is
     // the text-only fallback VoiceSession defines for exactly that situation.
-    if (ttsAvailable()) {
+    //
+    // An owed response belongs in the first branch, not the second. It means the
+    // voice is not able to answer yet but an engine is installed that still
+    // might, so completing the response as text here would answer a cold-start
+    // reply in writing and strand the audio it is owed. The response stays open
+    // instead; onSpeechAvailabilityChanged speaks it when the engine turns up,
+    // or onOwedAudioReleased hands it to text when the engine gives up.
+    if (ttsAvailable() || (m_speech != nullptr && m_speech->audioOwed())) {
         m_acknowledgement.clear();
         finalizeStream(MessageStatus::Complete, {});
         // The pump can have gone idle earlier, waiting for answer text that had
@@ -1467,6 +1575,12 @@ void AppController::sendMessage(const QString& text) {
 }
 
 void AppController::stopGeneration() {
+    if (m_speech != nullptr) {
+        // Stop means stop. A reply being held for a voice that has not arrived
+        // yet is still audio the user is waiting on, and Escape did nothing at
+        // all without this.
+        m_speech->releaseOwedAudio();
+    }
     if (!m_generating && !m_speaking) {
         return;
     }
@@ -1726,6 +1840,15 @@ ConversationEntry* AppController::createConversation() {
 }
 
 void AppController::setActiveConversation(int id) {
+    if (id != m_activeId) {
+        // Leaving the conversation a held reply belongs to abandons its audio,
+        // the same way leaving abandons its generation. Without this the reply
+        // went on being promised, and the engine arriving a moment later spoke
+        // it into whatever conversation the user had moved to.
+        if (m_speech != nullptr) {
+            m_speech->releaseOwedAudio();
+        }
+    }
     m_activeId = id;
     m_messageModel->setEntry(findEntry(id));
     emit activeConversationChanged();

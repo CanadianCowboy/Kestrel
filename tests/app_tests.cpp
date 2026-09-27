@@ -134,13 +134,36 @@ signals:
 // utterance ends, so the whole path is exercised on a machine with no voice.
 class FakeSpeechBackend final : public kestrel::app::SpeechBackend {
 public:
-    [[nodiscard]] bool usable() const override { return true; }
-    [[nodiscard]] QString description() const override { return QStringLiteral("fake voice"); }
+    [[nodiscard]] bool usable() const override { return m_usable; }
+    [[nodiscard]] QString description() const override {
+        // Truthful about the two states, as the real engines are: a voice that
+        // is still coming up and a voice that is working are not the same
+        // report.
+        return m_usable ? QStringLiteral("fake voice")
+                        : QStringLiteral("the fake voice is still loading");
+    }
 
-    void applyVoice(const kestrel::core::VoicePersona&) override { ++voiceApplications; }
+    void applyVoice(const kestrel::core::VoicePersona& persona) override {
+        ++voiceApplications;
+        lastWarmth = persona.warmth;
+        // The pace is captured here and remembered, exactly as the local voice
+        // model does with speedForRequest(). That is the whole point of this
+        // fake: a backend holds the last pace it was handed, and audio already
+        // synthesised at the wrong one cannot be corrected when it plays.
+        m_speed = kestrel::core::paceFor(persona);
+    }
+
+    // A local model is installed before it can answer, which is the whole
+    // difference this fake has to be able to express.
+    [[nodiscard]] bool present() const override { return m_present; }
 
     void speak(const QString& text) override {
         spoken.append(text);
+        // Everything the engine is asked for, in the order it is asked, whether
+        // to speak it now or to have it ready. A reply whose second clause is
+        // requested before its first is one the engine numbers backwards.
+        requests.append(text);
+        speakSpeeds.append(m_speed);
         m_speaking = true;
         if (m_autoFinish) {
             // A real engine reports the end of an utterance from the audio
@@ -160,9 +183,38 @@ public:
     // does, and pass or fail depending on whether audio is installed.
     void setAutoFinish(bool value) { m_autoFinish = value; }
 
+    // Stands in for a local model coming up. Reports the same transition the
+    // engine reports, so the controller is driven by the engine announcing
+    // itself rather than by a test watching a boolean.
+    void becomeReady() {
+        m_usable = true;
+        reportAvailable();
+    }
+
+    // Stands in for an engine that will never answer.
+    void giveUp() {
+        m_present = false;
+        m_usable = false;
+        reportUnavailable();
+    }
+
+    // The starting state: installed, launched, still loading its model.
+    void startLoading() {
+        m_present = true;
+        m_usable = false;
+    }
+
     // A plain class cannot be a QTimer context, so the owner lends one. The
     // queued report is dropped if the owner dies first.
     void setTimerContext(QObject* context) { m_context = context; }
+
+    // A backend that can start work early records the pace it is being asked
+    // for right now, which is the pace that audio is then stuck with.
+    void prefetch(const QString& text) override {
+        prefetched.append(text);
+        requests.append(text);
+        prefetchSpeeds.append(m_speed);
+    }
 
     void stop() override { ++boundaryStops; }
 
@@ -177,11 +229,26 @@ public:
     }
 
     QStringList spoken;
+    QStringList prefetched;
+    // Every request the engine received, in order, prefetches included.
+    QStringList requests;
+    // The pace in force at the moment each clause was asked for, in the order
+    // they were asked. A reply whose clauses disagree here is a reply that
+    // changes speed partway through.
+    QList<double> speakSpeeds;
+    QList<double> prefetchSpeeds;
     int voiceApplications = 0;
+    // The warmth of the last voice persona the synthesizer was handed.
+    float lastWarmth = 0.0F;
+    // The pace the engine is currently set to.
+    [[nodiscard]] double speed() const { return m_speed; }
     int boundaryStops = 0;
     int immediateStops = 0;
 
 private:
+    double m_speed = 1.0;
+    bool m_usable = true;
+    bool m_present = true;
     bool m_speaking = false;
     bool m_autoFinish = false;
     QObject* m_context = nullptr;
@@ -848,6 +915,508 @@ void testSpokenResponseFollowsClauseOrder() {
     check(complete, "every generated word was spoken, in order, and nothing else");
 }
 
+// The persona's warmth dial has to reach the engine, or "warmer as the mood
+// shifts" is a claim about a constant. The persona is otherwise only reachable
+// through the idle loop, which drifts a dial far too slowly to assert on, so it
+// is put where the loop would have put it and the value the engine was handed
+// is read back.
+void testWarmthReachesTheVoice() {
+    std::cout << "the persona's warmth dial reaches the voice\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    // Deliberately not the voice persona's own default of 0.6, so a backend
+    // handed the constant and a backend handed the dial are distinguishable.
+    const float warm = 0.9F;
+    const float cool = 0.2F;
+
+    kestrel::core::PersonaState state;
+    state.warmth = warm;
+    controller.setPersonaStateForTesting(state);
+    controller.sendMessage(QStringLiteral("a warm question"));
+    QEventLoop warmTurn;
+    QTimer::singleShot(300, &warmTurn, &QEventLoop::quit);
+    warmTurn.exec();
+    check(observed->voiceApplications > 0, "the warm voice was handed to the engine");
+    check(qAbs(observed->lastWarmth - warm) < 0.001F,
+          "the engine was handed the persona's warmth, not the default");
+
+    // And the other direction, on a second response, so the check is that the
+    // dial is read per response rather than that a value was latched once.
+    for (int i = 0; i < 400 && controller.speaking(); ++i) {
+        if (!observed->speakingNow()) {
+            QEventLoop wait;
+            QTimer::singleShot(20, &wait, &QEventLoop::quit);
+            wait.exec();
+            continue;
+        }
+        observed->finishUtterance();
+    }
+    state.warmth = cool;
+    controller.setPersonaStateForTesting(state);
+    controller.sendMessage(QStringLiteral("a cool question"));
+    QEventLoop coolTurn;
+    QTimer::singleShot(300, &coolTurn, &QEventLoop::quit);
+    coolTurn.exec();
+    check(qAbs(observed->lastWarmth - cool) < 0.001F,
+          "a colder mood is handed over on the next response");
+    controller.stopGeneration();
+}
+
+// A reply asked for before the voice can answer is still a reply that was asked
+// for, and the first thing anyone hears in a session should not be text just
+// because a local model was still loading. The reply is owed audio until the
+// engine turns up, and spoken then -- from its own unspoken remainder, so
+// nothing is said twice and nothing left over from an earlier turn is spoken
+// in its place.
+void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
+    std::cout << "a reply asked for before the voice is ready is spoken once it is\n";
+
+    // A control run first: the same question, with the voice ready from the
+    // start. What the late voice has to produce is exactly this, which is the
+    // only way to notice a clause said twice or a previous turn's text spoken
+    // in place of this one's.
+    kestrel::app::AppController control;
+    control.setIdleLoopEnabled(false);
+    auto controlSpeech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* controlVoice = controlSpeech.get();
+    controlSpeech->setTimerContext(&control);
+    controlSpeech->setAutoFinish(true);
+    control.setSpeechBackendForTesting(std::move(controlSpeech));
+    const QString question = QStringLiteral("what did you make of that");
+    control.sendMessage(question);
+    // Read before the loop, while the cue is still the one about to be spoken.
+    const QString cue = control.acknowledgement();
+    for (int i = 0; i < 400 && control.speaking(); ++i) {
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+    check(!controlVoice->spoken.isEmpty(), "the control reply was spoken");
+    if (controlVoice->spoken.isEmpty()) {
+        return;
+    }
+    // The cue belongs to the moment the request was made. A reply whose audio
+    // starts late has no cue left to give, and saying "got it" several seconds
+    // late would be worse than not saying it, so the cue is the one thing
+    // allowed to differ. Everything after it is the reply.
+    QStringList expected = controlVoice->spoken;
+    if (!cue.isEmpty() && expected.first() == cue) {
+        expected.removeFirst();
+    }
+
+    // The real case: the engine is installed and launched but has not finished
+    // loading, which is what a cold start looks like.
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(question);
+    QEventLoop loading;
+    QTimer::singleShot(400, &loading, &QEventLoop::quit);
+    loading.exec();
+
+    check(observed->spoken.isEmpty(), "nothing is asked of a voice that cannot answer yet");
+    check(!controller.speaking(), "no playback is claimed while the voice is loading");
+
+    // The model finishes loading and the engine says so.
+    observed->becomeReady();
+    check(controller.ttsAvailable(), "the voice is available once the engine says it is");
+
+    for (int i = 0; i < 400 && controller.speaking(); ++i) {
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+
+    check(!observed->spoken.isEmpty(), "the held reply is spoken once the voice arrives");
+    check(observed->spoken == expected,
+          "the held reply speaks exactly the clauses a ready voice would have spoken");
+    check(observed->spoken.size() == expected.size(),
+          "no clause is spoken twice");
+    bool distinct = true;
+    for (int i = 0; i < observed->spoken.size(); ++i) {
+        for (int j = i + 1; j < observed->spoken.size(); ++j) {
+            distinct = distinct && observed->spoken.at(i) != observed->spoken.at(j);
+        }
+    }
+    check(distinct, "nothing from an earlier turn is spoken in place of this one");
+    check(!controller.speaking(), "playback finished");
+    controller.stopGeneration();
+}
+
+// An engine that will never answer is the other half of the same decision: the
+// reply is owed audio only while something is still going to produce it. With
+// nothing coming, the text is the honest delivery and the turn must not hang
+// waiting for a voice that does not exist.
+void testReplyIsDeliveredAsTextWhenTheVoiceNeverArrives() {
+    std::cout << "a held reply is delivered as text when the engine gives up\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("a question asked of a voice that never arrives"));
+    QEventLoop loading;
+    QTimer::singleShot(400, &loading, &QEventLoop::quit);
+    loading.exec();
+    check(observed->spoken.isEmpty(), "nothing is spoken while the engine is still starting");
+
+    observed->giveUp();
+    QEventLoop gaveUp;
+    QTimer::singleShot(200, &gaveUp, &QEventLoop::quit);
+    gaveUp.exec();
+
+    check(observed->spoken.isEmpty(), "an engine that gave up speaks nothing");
+    check(!controller.generating(), "the turn is over rather than left spinning");
+    check(!controller.speaking(), "nothing is claimed to be speaking");
+    controller.stopGeneration();
+}
+
+// A clause with a leading pause is held back so the gap before it is real
+// silence rather than a gap somewhere else. While it is held, the engine has not
+// been asked for it -- and the next clause's prefetch used to go straight past
+// and be asked for first. The reply was still spoken in the right order, because
+// the synthesiser commits the held clause in turn, but the engine numbered the
+// audio it produced in the order it was asked, so the reply's first sentence was
+// written to clause-1 and its second to clause-0. Ordering has to be a property
+// of the clause, not of when a file happened to be produced.
+void testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken() {
+    std::cout << "the engine is asked for clauses in the order they are spoken\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("why does a held clause still come first"));
+    // Read while the cue is still the one about to be spoken.
+    const QString cue = controller.acknowledgement();
+
+    // The pause is load-bearing and has to stay that way: the cue carries no
+    // pause and goes straight to the engine, while the first clause is still
+    // parked behind its lead-in when sendMessage returns. A fix that let the
+    // lookahead through by sending the clause early would show up here as a
+    // second entry in spoken before the event loop has even turned.
+    check(observed->spoken.size() <= 1,
+          "the first clause is still held back by its leading pause");
+
+    for (int i = 0; i < 400 && controller.speaking(); ++i) {
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+
+    // The clauses, in the order they are spoken, which is the order they are
+    // supposed to have been asked for. The cue is not one of them: it is spoken
+    // with no pause before it, so it never sat in front of anything.
+    QStringList clauses = observed->spoken;
+    if (!cue.isEmpty() && !clauses.isEmpty() && clauses.first() == cue) {
+        clauses.removeFirst();
+    }
+    QStringList asked = observed->requests;
+    if (!cue.isEmpty()) {
+        asked.removeAll(cue);
+    }
+
+    check(clauses.size() >= 2, "the reply had more than one clause");
+    check(!asked.isEmpty(), "the engine was asked for something");
+    if (clauses.size() < 2 || asked.isEmpty()) {
+        controller.stopGeneration();
+        return;
+    }
+
+    check(asked.first() == clauses.first(),
+          "the first clause is the first thing the engine is asked for");
+
+    // And never a later clause before an earlier one, anywhere in the reply.
+    int furthest = -1;
+    bool inOrder = true;
+    for (const QString& text : asked) {
+        const int at = clauses.indexOf(text);
+        if (at < 0) {
+            inOrder = false;
+            break;
+        }
+        if (at < furthest) {
+            inOrder = false;
+            break;
+        }
+        furthest = at;
+    }
+    check(inOrder, "no clause is asked for before the clause in front of it");
+    controller.stopGeneration();
+}
+
+// A reply held for a voice belongs to the conversation it was asked in. Leaving
+// that conversation abandons its audio, the same way leaving abandons its
+// generation -- otherwise the engine arriving a moment later speaks the reply
+// into whatever the user has moved on to, with nothing on screen to match it.
+void testLeavingAConversationDropsTheReplyItWasHolding() {
+    std::cout << "leaving a conversation drops the reply it was holding\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("a question asked of a voice still loading"));
+    QEventLoop loading;
+    QTimer::singleShot(300, &loading, &QEventLoop::quit);
+    loading.exec();
+    check(observed->spoken.isEmpty(), "nothing is spoken while the engine is loading");
+
+    controller.newConversation();
+    observed->becomeReady();
+    QEventLoop arrived;
+    QTimer::singleShot(300, &arrived, &QEventLoop::quit);
+    arrived.exec();
+
+    check(observed->spoken.isEmpty(),
+          "a reply held for the conversation the user left is not spoken afterwards");
+    check(!controller.speaking(), "nothing is left playing in the new conversation");
+    controller.stopGeneration();
+}
+
+// Escape is the user's way of saying stop. A reply waiting for a voice is still
+// audio they are waiting on, so stopping has to reach it.
+void testStoppingDropsAReplyHeldForAVoice() {
+    std::cout << "stopping drops a reply held for a voice\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("a question asked of a voice still loading"));
+    QEventLoop loading;
+    QTimer::singleShot(300, &loading, &QEventLoop::quit);
+    loading.exec();
+    check(observed->spoken.isEmpty(), "nothing is spoken while the engine is loading");
+
+    controller.stopGeneration();
+    observed->becomeReady();
+    QEventLoop arrived;
+    QTimer::singleShot(300, &arrived, &QEventLoop::quit);
+    arrived.exec();
+
+    check(observed->spoken.isEmpty(), "a stopped reply is not spoken when the voice arrives");
+    check(!controller.speaking(), "nothing is left playing");
+}
+
+// A message sent while a reply is still speaking is a new response, and it takes
+// its own reading of the dials. It used to inherit the interrupted response's
+// persona, because the reading was only taken once and nothing cleared it before
+// the next one started -- so a back-and-forth at speed spoke every reply at the
+// first reply's pace.
+void testAReplySentMidSpeechTakesItsOwnWarmth() {
+    std::cout << "a reply sent mid-speech takes its own warmth\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    kestrel::core::PersonaState state;
+    state.warmth = 0.9F;
+    controller.setPersonaStateForTesting(state);
+    controller.sendMessage(QStringLiteral("the first question"));
+    QEventLoop settle;
+    QTimer::singleShot(600, &settle, &QEventLoop::quit);
+    settle.exec();
+    check(observed->voiceApplications > 0, "the first reply was given the warm reading");
+    check(qAbs(observed->lastWarmth - 0.9F) < 0.001F, "the engine was handed 0.9");
+
+    // The user answers before the first reply has finished being spoken.
+    state.warmth = 0.2F;
+    controller.setPersonaStateForTesting(state);
+    controller.sendMessage(QStringLiteral("the second question, sent early"));
+    QEventLoop second;
+    QTimer::singleShot(600, &second, &QEventLoop::quit);
+    second.exec();
+
+    check(qAbs(observed->lastWarmth - 0.2F) < 0.001F,
+          "the new response reads the dials for itself, not the interrupted one's");
+    controller.stopGeneration();
+}
+
+// A held reply is waiting on a model that may never arrive. Half-synced weights,
+// a wedged interpreter, a load that runs out of memory: in each of those the
+// process is up and nothing ever says ready, so without a deadline the reply
+// waits forever -- text on screen, no audio, no reason given. The deadline has
+// to end it as text, say specifically what happened, and leave the app able to
+// speak again once a voice does turn up.
+void testAHeldReplyGivesUpIfTheVoiceNeverArrives() {
+    std::cout << "a held reply gives up if the voice never arrives\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    // The real deadline is sized against a measured load; shortened here so the
+    // test is not a minute long.
+    controller.setVoiceLoadTimeoutForTesting(150);
+
+    controller.sendMessage(QStringLiteral("a question the voice will never answer"));
+    QEventLoop held;
+    QTimer::singleShot(80, &held, &QEventLoop::quit);
+    held.exec();
+    check(observed->spoken.isEmpty(), "the reply is held while the engine is loading");
+    check(!controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
+          "nothing has given up yet");
+
+    // Past the deadline, with the engine still silent.
+    QEventLoop expired;
+    QTimer::singleShot(500, &expired, &QEventLoop::quit);
+    expired.exec();
+
+    check(controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
+          "the app says the voice gave up rather than failing silently");
+    check(controller.ttsError().contains(QLatin1String("model"), Qt::CaseInsensitive),
+          "the reason says what the voice was doing, not merely that it is loading");
+    check(!controller.generating(), "the turn is finished rather than left waiting");
+    check(!controller.speaking(), "nothing is claimed to be speaking");
+
+    // A second reply must not be held all over again for an engine that has
+    // already let us down once.
+    controller.sendMessage(QStringLiteral("a second question, to a voice that gave up"));
+    QEventLoop second;
+    QTimer::singleShot(300, &second, &QEventLoop::quit);
+    second.exec();
+    observed->becomeReady();
+    QEventLoop arrived;
+    QTimer::singleShot(400, &arrived, &QEventLoop::quit);
+    arrived.exec();
+    check(observed->spoken.isEmpty(),
+          "a reply after the give-up is not held and then spoken out of the blue");
+
+    // And once a voice really is there, the app speaks again.
+    controller.sendMessage(QStringLiteral("a third question, to a working voice"));
+    QEventLoop third;
+    QTimer::singleShot(600, &third, &QEventLoop::quit);
+    third.exec();
+    check(!observed->spoken.isEmpty(), "a later reply speaks normally once the voice is up");
+    check(!controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
+          "the stale reason is cleared when the voice comes back");
+    controller.stopGeneration();
+}
+
+// The pace a clause was synthesised at has to be the pace of the persona its
+// response was given, and that has to be established where the audio is asked
+// for rather than once when playback happened to begin. The engine holds the
+// pace it was last handed, and audio made under a pace this response was never
+// given cannot be corrected when it plays: a prefetched clause is made seconds
+// before it is heard, and an engine rebuilt mid-reply knows nothing at all.
+void testPaceIsCommittedWhereTheAudioIsAskedFor() {
+    std::cout << "the response pace is committed where audio is asked for\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    speech->setTimerContext(&controller);
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    // Deliberately not the persona's own default, so a backend handed the
+    // constant and a backend handed the dial are distinguishable.
+    const float warm = 0.9F;
+    kestrel::core::PersonaState state;
+    state.warmth = warm;
+    controller.setPersonaStateForTesting(state);
+
+    controller.sendMessage(QStringLiteral("a question that takes a while to answer"));
+    QEventLoop settle;
+    QTimer::singleShot(600, &settle, &QEventLoop::quit);
+    settle.exec();
+
+    check(!observed->speakSpeeds.isEmpty(), "clauses of the reply were made");
+    if (observed->speakSpeeds.isEmpty()) {
+        controller.stopGeneration();
+        return;
+    }
+    const double replyPace = observed->speakSpeeds.first();
+    check(qAbs(replyPace - 1.0) >= 0.0001,
+          "the reply was not made at an untouched engine's default pace");
+    check(qAbs(observed->lastWarmth - warm) < 0.001F,
+          "the engine was handed the persona's warmth");
+
+    // Move the dial mid-reply, which the idle persona does on its own. The
+    // response has to keep the pace it was given: a speed that shifts inside a
+    // reply is the fault this is about, and re-reading the dial per clause
+    // would trade that fault for a new one.
+    state.warmth = 0.2F;
+    controller.setPersonaStateForTesting(state);
+
+    // The engine is rebuilt while the reply is still being spoken, as it is
+    // when the voice engine is switched. The replacement has never been told
+    // about this response and begins at its own default, so the clauses still
+    // owed are precisely the ones that can come out at the wrong pace.
+    auto replacement = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* swapped = replacement.get();
+    replacement->setTimerContext(&controller);
+    replacement->setAutoFinish(true);
+    controller.setSpeechBackendForTesting(std::move(replacement));
+    // The clause the old engine was holding went with it, so no end-of-utterance
+    // report is coming from there. Let the pump move on to the new engine.
+    swapped->finishUtterance();
+
+    for (int i = 0; i < 400 && controller.speaking(); ++i) {
+        QEventLoop wait;
+        QTimer::singleShot(20, &wait, &QEventLoop::quit);
+        wait.exec();
+    }
+
+    check(swapped->speakSpeeds.size() >= 1, "the rest of the reply reached the new engine");
+    check(swapped->voiceApplications > 0,
+          "the response's persona reached the engine that spoke its remainder");
+    check(qAbs(swapped->lastWarmth - warm) < 0.001F,
+          "the new engine kept the warmth the response was given, not the moved dial");
+
+    // Every clause of the remainder, and every clause asked for early, was made
+    // at the pace the response was assigned.
+    bool uniform = !swapped->speakSpeeds.isEmpty();
+    for (const double pace : swapped->speakSpeeds) {
+        uniform = uniform && qAbs(pace - replyPace) < 0.0001;
+    }
+    for (const double pace : swapped->prefetchSpeeds) {
+        uniform = uniform && qAbs(pace - replyPace) < 0.0001;
+    }
+    check(uniform, "the remainder was synthesised at the response's own pace");
+    check(!swapped->prefetchSpeeds.isEmpty(), "clauses were still asked for early");
+    controller.stopGeneration();
+}
+
 // A user who starts typing mid-answer must cut the audio off at a clause
 // boundary rather than mid-word, and the new turn must take over cleanly.
 void testBargeInStopsAudioAtAClauseBoundary() {
@@ -957,6 +1526,14 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
 
     QCoreApplication app(argc, argv);
+
+    // Pin the recognizer. The app picks one for the machine it runs on -- SAPI 5
+    // when there is a microphone, the scripted preview recognizer when there is
+    // not -- and the tests below assert on partial words and on the timing of a
+    // barge-in, which only the scripted one produces. Without this, plugging in
+    // a microphone would change what the suite means.
+    qputenv("KESTREL_SPEECH_INPUT", "mock");
+
     testGenerationRunsOffCallingThread();
     testCancelStopsInFlightGeneration();
     testFileDialogUrlBecomesALocalPath();
@@ -970,6 +1547,15 @@ int main(int argc, char** argv) {
     testSpokenTurnIsNotDeliveredBeforeTheLastClause();
     testSpokenResponseFollowsClauseOrder();
     testBargeInStopsAudioAtAClauseBoundary();
+    testWarmthReachesTheVoice();
+    testReplyOwedAudioIsSpokenWhenTheVoiceArrives();
+    testReplyIsDeliveredAsTextWhenTheVoiceNeverArrives();
+    testPaceIsCommittedWhereTheAudioIsAskedFor();
+    testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken();
+    testLeavingAConversationDropsTheReplyItWasHolding();
+    testStoppingDropsAReplyHeldForAVoice();
+    testAReplySentMidSpeechTakesItsOwnWarmth();
+    testAHeldReplyGivesUpIfTheVoiceNeverArrives();
     testSpokenPhraseTakesTheTypedPath();
     testAbandonedPhraseIsNotSubmitted();
 

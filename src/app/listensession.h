@@ -5,6 +5,7 @@
 #include <QTimer>
 
 #include <memory>
+#include <string>
 
 #include "runtime/speechrecognizer.h"
 
@@ -68,8 +69,10 @@ signals:
     void partialChanged();
 
 private:
+    // Both run on this object's thread, whatever thread the recognizer
+    // delivers on. See startListening().
     void onResult(const runtime::RecognitionResult& result);
-    void onEnd(runtime::RecognitionEnd reason, std::string_view detail);
+    void onEnd(runtime::RecognitionEnd reason, const std::string& detail);
 
     runtime::SpeechRecognizer& m_recognizer;
     QTimer m_poll;

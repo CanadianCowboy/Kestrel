@@ -21,6 +21,10 @@ LocalModelSpeechBackend::LocalModelSpeechBackend(QObject* parent)
 
 void LocalModelSpeechBackend::completeSetup() {
     if (!m_scratch->isValid()) {
+        // No scratch directory means no audio files, so the engine can never
+        // answer. Reported, so a response waiting on a voice is not held for
+        // one that cannot exist.
+        markGivenUp();
         return;
     }
     // The engine's own order is the order of preference: Kokoro leads with the
@@ -51,14 +55,25 @@ bool LocalModelSpeechBackend::usable() const {
 }
 
 QString LocalModelSpeechBackend::description() const {
-    if (!m_started) {
-        return tr("no %1 voice is installed").arg(engineName());
+    if (m_started) {
+        return QStringLiteral("%1 (%2, local)").arg(m_voice, engineName());
     }
-    return QStringLiteral("%1 (%2, local)").arg(m_voice, engineName());
+    // Two different situations that both mean "no audio yet", and telling them
+    // apart is the difference between a voice that is starting and a machine
+    // that does not have one.
+    if (m_launched) {
+        return tr("the %1 voice is still loading").arg(engineName());
+    }
+    return tr("no %1 voice is installed").arg(engineName());
 }
 
-void LocalModelSpeechBackend::failIfNotStarted() {
+void LocalModelSpeechBackend::markGivenUp() {
+    m_launched = false;
+    if (!m_started) {
+        return;
+    }
     m_started = false;
+    reportUnavailable();
 }
 
 QString LocalModelSpeechBackend::engineExecutable() const {
@@ -66,12 +81,12 @@ QString LocalModelSpeechBackend::engineExecutable() const {
 }
 
 void LocalModelSpeechBackend::applyVoice(const core::VoicePersona& persona) {
-    // The persona's rate is a speaking rate, not a playback rate, so it is
-    // handed to the model rather than applied to finished audio. Pitch and
-    // warmth have no equivalent here and are ignored rather than approximated: a
-    // voice shifted by a resampler is a voice that sounds broken, and saying so
-    // is better than doing it.
-    m_speed = 0.5 + static_cast<double>(persona.rate);
+    // The persona's rate and warmth are speaking decisions, not playback ones, so
+    // they are handed to the model rather than applied to finished audio. Pitch
+    // has no equivalent here and is ignored rather than approximated: a voice
+    // shifted by a resampler is a voice that sounds broken, and saying so is
+    // better than doing it.
+    m_speed = core::paceFor(persona);
 }
 
 QString LocalModelSpeechBackend::nextScratchPath() {
@@ -149,9 +164,9 @@ void LocalModelSpeechBackend::noteClauseFailed(const QString& reason) {
 }
 
 void LocalModelSpeechBackend::noteEngineFailed(const QString& reason) {
-    m_started = false;
     m_speaking = false;
     m_pending.clear();
+    markGivenUp();
     reportFailed(reason.isEmpty() ? tr("the local voice failed") : reason);
 }
 

@@ -70,31 +70,27 @@ else()
 endif()
 
 # --- Platform speech recognition ---------------------------------------------
-# The Windows Runtime speech headers are part of the Windows SDK rather than
-# something Kestrel vendors, so this checks for them and says what it found
-# instead of assuming. On anything else -- or on a Windows SDK without them --
-# the stub compiles and the app reports that it cannot listen.
+# Exactly one of these two is compiled, for the same reason as CUDA discovery:
+# sapi.h is a Windows SDK header and belongs in a single translation unit, while
+# the app reports honestly on the platforms that do not have it.
 #
-# Note on what the SDK actually provides: the Windows.Media.SpeechRecognition
-# projection here exposes the ISpeechRecognizer interface but not a projected
-# runtime class, so there is no GetSpeechRecognizerAsync to call and reaching
-# the engine means creating the ABI interface through RoCreateInstance. The
-# desktop flavour of that API also has no interim-text event, so a recognizer
-# built on it can report a finished phrase but not the words so far. See
-# src/runtime/winrtspeechrecognizer.h.
-set(KESTREL_WINRT_SPEECH_SOURCE src/runtime/winrtspeechrecognizer_stub.cpp)
-set(KESTREL_WINRT_SPEECH OFF)
+# SAPI 5 rather than Windows.Media.SpeechRecognition. The latter's SDK
+# projection exposes the ISpeechRecognizer ABI interface but no projected runtime
+# class, so there is no activation factory to create and no GetSpeechRecognizerAsync
+# to call; the desktop flavour has no interim-text event either. SAPI's shared
+# recognizer is an ordinary COM class with real CoCreateInstance activation and
+# its interface is declared in sapi.h, so it needs no Speech SDK install. Every
+# call the adapter makes is a vtable call, so the only library it links is winmm,
+# for the capture-device count in the microphone probe.
+set(KESTREL_SAPI_SPEECH_SOURCE src/runtime/sapirecognizer_stub.cpp)
 if(WIN32)
-    find_path(KESTREL_CPPWINRT_INCLUDE_DIR
-        NAMES winrt/Windows.Media.SpeechRecognition.h
-        PATH_SUFFIXES cppwinrt
-    )
-    find_library(KESTREL_WINDOWSAPP_LIBRARY NAMES WindowsApp)
-    if(KESTREL_CPPWINRT_INCLUDE_DIR AND KESTREL_WINDOWSAPP_LIBRARY)
-        message(STATUS "Kestrel: Windows speech headers present; the recognizer stub is "
-                       "still used because the SDK ships no projected speech class")
+    find_path(KESTREL_SAPI_INCLUDE_DIR NAMES sapi.h)
+    find_library(KESTREL_WINMM_LIBRARY NAMES winmm)
+    if(KESTREL_SAPI_INCLUDE_DIR AND KESTREL_WINMM_LIBRARY)
+        set(KESTREL_SAPI_SPEECH_SOURCE src/runtime/sapirecognizer_win32.cpp)
+        message(STATUS "Kestrel: SAPI 5 headers found; desktop dictation enabled")
     else()
-        message(STATUS "Kestrel: Windows speech recognition headers not found; "
+        message(STATUS "Kestrel: SAPI 5 headers or winmm not found; "
                        "compiling the portable recognizer stub")
     endif()
 else()
@@ -136,8 +132,8 @@ add_library(kestrel_core
     src/runtime/modelbackend.h
     src/runtime/speechrecognizer.h
     src/runtime/speechrecognizer.cpp
-    src/runtime/winrtspeechrecognizer.h
-    ${KESTREL_WINRT_SPEECH_SOURCE}
+    src/runtime/sapirecognizer.h
+    ${KESTREL_SAPI_SPEECH_SOURCE}
     ${KESTREL_CUDA_DISCOVERY_SOURCE}
     src/runtime/engineartifact.cpp
     src/runtime/engineartifact.h
@@ -175,6 +171,13 @@ target_compile_options(kestrel_core PRIVATE ${KESTREL_STRICT_FLAGS})
 if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND)
     target_link_libraries(kestrel_core PRIVATE CUDA::cudart)
     target_compile_definitions(kestrel_core PRIVATE KESTREL_HAS_CUDA=1)
+endif()
+
+# waveInGetNumDevs, for the microphone probe that decides whether the SAPI
+# adapter or the mock is used. It is a device count rather than an attempt to
+# open a device, so probing cannot block or leave a handle behind.
+if(WIN32 AND KESTREL_SAPI_INCLUDE_DIR AND KESTREL_WINMM_LIBRARY)
+    target_link_libraries(kestrel_core PRIVATE ${KESTREL_WINMM_LIBRARY})
 endif()
 
 if(KESTREL_TENSORRT_ENABLED)

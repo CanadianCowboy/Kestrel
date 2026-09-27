@@ -56,16 +56,22 @@ QStringList KokoroSpeechBackend::engineVoices() const {
 
 void KokoroSpeechBackend::startEngine() {
     if (m_python.isEmpty() || m_serverScript.isEmpty()) {
+        // Nothing to launch, so nothing will ever answer. Said out loud, because
+        // a response waiting on this voice has to stop waiting rather than be
+        // held for an engine that was never coming.
+        markGivenUp();
         return;
     }
     m_process->start(m_python, {m_serverScript});
     if (!m_process->waitForStarted(5000)) {
+        markGivenUp();
         return;
     }
-    // The model is still loading at this point, which is deliberate: the server
-    // reads requests only once it is ready, so a clause sent during the load is
-    // queued and answered a moment later rather than lost.
-    markStarted();
+    // Launched, not ready. The model is still loading at this point, which is
+    // deliberate: the driver answers requests only once it has the model, and
+    // queues the ones that arrive before that rather than dropping them. The
+    // voice becomes usable when the driver announces itself, not here.
+    markLaunched();
 }
 
 void KokoroSpeechBackend::synthesise(const QString& text, const QString& path) {
@@ -90,6 +96,14 @@ void KokoroSpeechBackend::onReadyRead() {
         }
         const QJsonObject reply = document.object();
         if (reply.value(QStringLiteral("ready")).toBool()) {
+            // The driver announcing itself is the one moment this engine is
+            // known to be able to answer. It used to be discarded here and the
+            // voice was reported ready the moment the process spawned, which is
+            // earlier than anything can actually speak -- so a reply asked for
+            // during the load was handed audio to an engine that could not make
+            // it, and a reply asked for when the process failed was delivered as
+            // text with nothing ever arriving to change that.
+            markStarted();
             continue;
         }
         if (!reply.value(QStringLiteral("ok")).toBool()) {

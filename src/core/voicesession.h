@@ -80,7 +80,12 @@ struct VoicePersona {
     // Semitones. Neutral, because an assistant that sounds emphatic all the time
     // sounds like it is only sometimes paying attention.
     float pitch = 0.0F;
-    // 0 flat .. 1 warm. Drives the same knob whichever synthesizer is present.
+    // 0 flat .. 1 warm. The one pacing value a user hears rather than reads, and
+    // the only one that moves: the app fills it from the persona's warmth dial
+    // at the start of each response, so a mood that has shifted is audible in
+    // the next reply. Read it as pace rather than timbre, because pace is the
+    // thing every synthesizer here can actually change -- see
+    // core::PersonaState::warmth.
     float warmth = 0.6F;
     // The gap before the very first clause.
     int leadInMs = 90;
@@ -92,6 +97,21 @@ struct VoicePersona {
 };
 
 [[nodiscard]] const VoicePersona& defaultVoicePersona() noexcept;
+
+// The pace a synthesizer should be asked for. The persona's rate, shifted by
+// however far its warmth has moved from neutral: warmer is slower, cooler is
+// brisker.
+//
+// A free function in core rather than an expression inside a backend, because it
+// is a statement about the voice and not about one engine. Kokoro and Piper both
+// take a speed, and a warmth that moved them by different amounts would be a
+// warmth the user could hear changing between machines.
+//
+// Written as a deviation rather than an absolute on purpose: at neutral warmth
+// it returns the 0.5 + rate the engine has always been given, so a persona that
+// has not drifted sounds exactly as it did before warmth was wired up. The first
+// thing anyone would notice otherwise is the voice changing for no reason.
+[[nodiscard]] float paceFor(const VoicePersona& persona) noexcept;
 
 // One clause, ready to hand to a synthesizer.
 struct SpeechSegment {

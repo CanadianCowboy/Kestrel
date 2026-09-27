@@ -58,3 +58,8 @@ Thumbs.db
 # model, so they are an artefact of running the voice locally rather than
 # something the repository should carry.
 voice-samples/
+
+# Window captures taken while reviewing a UI change. Same reasoning: they
+# record one machine's screen at one moment, and the reasoning they support
+# belongs in the commit message rather than in the tree.
+audit/

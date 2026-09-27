@@ -364,11 +364,20 @@ ApplicationWindow {
                         anchors.bottomMargin: 20
                         spacing: 20
 
-                        Item { Layout.fillHeight: true; Layout.minimumHeight: 24 }
-
+                        // The empty state and the transcript both ask to fill the
+                        // leftover height, and exactly one of them is ever
+                        // visible, so exactly one of them is ever in the layout.
+                        //
+                        // There used to be a spacer Item here filling the same
+                        // space as the transcript, which meant the two competed
+                        // for whatever height was left over and the transcript
+                        // lost: it was laid out at zero or twenty-odd pixels tall
+                        // and every message was clipped away. A spacer and a
+                        // conversation must never both want the same space.
                         Column {
                             visible: messageList.count === 0
                             Layout.alignment: Qt.AlignHCenter
+                            Layout.fillHeight: true
                             spacing: 16
                             Text { text: "✦"; color: window.accent; font.pixelSize: 32; anchors.horizontalCenter: parent.horizontalCenter }
                             Text { text: "A quieter way to think."; color: window.ink; font.pixelSize: 28; font.weight: Font.Light; anchors.horizontalCenter: parent.horizontalCenter }
@@ -392,6 +401,12 @@ ApplicationWindow {
                             visible: count > 0
                             Layout.fillWidth: true
                             Layout.fillHeight: true
+                            // The transcript is the point of the window, so it is
+                            // the last thing allowed to be squeezed. Without a
+                            // floor, a short window leaves it a sliver tall while
+                            // the composer keeps its full height -- which is the
+                            // arrangement that made a conversation invisible.
+                            Layout.minimumHeight: 160
                             model: appController.messages
                             spacing: 16
                             clip: true

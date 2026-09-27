@@ -129,11 +129,15 @@ public:
             return;
         }
         // Rate and pitch come straight from the core persona, so the pacing the
-        // timeline was planned with is the pacing that gets spoken. Volume
-        // carries the warmth dial, which has no other meaning at playback time.
+        // timeline was planned with is the pacing that gets spoken.
+        //
+        // Warmth is not read here. It used to drive volume, which was only
+        // defensible while the dial never moved; now that it drifts with the
+        // mood, the same mapping would make the assistant audibly pump quieter
+        // and louder as it got thoughtful. Volume is left alone and warmth is
+        // left to an engine that can express it as pace.
         m_voice.setRate(static_cast<double>(persona.rate));
         m_voice.setPitch(static_cast<double>(persona.pitch) * kPitchPerSemitone);
-        m_voice.setVolume(0.5 + 0.5 * static_cast<double>(persona.warmth));
     }
 
     void speak(const QString& text) override { m_voice.say(text); }
@@ -204,6 +208,9 @@ SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
     : QObject(parent), d(std::make_unique<SpeechSynthesizerPrivate>()) {
     m_pauseTimer.setSingleShot(true);
     connect(&m_pauseTimer, &QTimer::timeout, this, &SpeechSynthesizer::speakNow);
+    m_voiceLoadDeadline.setSingleShot(true);
+    connect(&m_voiceLoadDeadline, &QTimer::timeout, this, &SpeechSynthesizer::onVoiceLoadDeadline);
+    m_voiceLoadTimeoutMs = kVoiceLoadDeadlineMs;
 
     m_backend = std::make_unique<PlatformSpeechBackend>();
     m_backend->setCallbacks([this] { onBackendFinished(); },
@@ -245,6 +252,19 @@ void SpeechSynthesizer::prefetch(const QString& text) {
     if (m_backend == nullptr || text.trimmed().isEmpty()) {
         return;
     }
+    // A clause with a leading pause has not reached the engine yet: it is being
+    // held back so the gap before it is silence in the right place rather than
+    // silence somewhere else. Handing the following clause over first would ask
+    // the engine for the second clause before the first, and the engine numbers
+    // the audio it produces in the order it was asked -- so the reply's first
+    // sentence would be written to clause-1 and its second to clause-0. The
+    // lookahead therefore waits for the clause in front of it and leaves in the
+    // same instant, which costs none of the overlap it exists for: synthesis of
+    // the next clause still runs while the current one is being heard.
+    if (!m_pending.trimmed().isEmpty()) {
+        m_queuedPrefetch = text;
+        return;
+    }
     m_backend->prefetch(text);
 }
 
@@ -267,14 +287,73 @@ void SpeechSynthesizer::setBackendForTesting(std::unique_ptr<SpeechBackend> back
     m_pauseTimer.stop();
     m_pending.clear();
     m_pendingText.clear();
+    m_queuedPrefetch.clear();
     m_stoppingAtBoundary = false;
     m_backend = std::move(backend);
     m_backend->setCallbacks([this] { onBackendFinished(); },
                             [this](const QString& reason) { onBackendFailed(reason); });
+    m_backend->setAvailabilityCallbacks(
+        [this] { onBackendAvailable(); },
+        [this] { onBackendUnavailable(); });
+}
+
+void SpeechSynthesizer::onBackendAvailable() {
+    // A voice that turns up is a voice worth waiting for again, and the reason
+    // it was given up on no longer describes anything.
+    m_voiceGaveUp = false;
+    m_voiceLoadDeadline.stop();
+    emit availabilityChanged(true);
+}
+
+void SpeechSynthesizer::onBackendUnavailable() {
+    // The engine will never answer, so waiting longer cannot produce audio.
+    releaseOwedAudio();
+    emit availabilityChanged(false);
+}
+
+void SpeechSynthesizer::onVoiceLoadDeadline() {
+    // The engine is not going to say it is ready. Half-synced weights, a wedged
+    // interpreter and a load that ran out of memory are indistinguishable from
+    // here, and none of them is fixed by waiting longer.
+    m_voiceGaveUp = true;
+    releaseOwedAudio();
+}
+
+bool SpeechSynthesizer::audioOwed() const {
+    return m_audioOwed;
+}
+
+void SpeechSynthesizer::oweAudio() {
+    m_voiceLoadDeadline.stop();
+    // Holding every reply for the same voice that already failed would give the
+    // user the same silence over and over instead of an answer.
+    m_audioOwed = !available() && present() && !m_voiceGaveUp;
+    if (m_audioOwed) {
+        m_voiceLoadDeadline.start(m_voiceLoadTimeoutMs);
+    }
+}
+
+void SpeechSynthesizer::releaseOwedAudio() {
+    m_voiceLoadDeadline.stop();
+    if (!m_audioOwed) {
+        return;
+    }
+    // Cleared before the signal so a handler that reaches back here cannot find
+    // the hold still open and release it twice.
+    m_audioOwed = false;
+    emit owedAudioReleased(m_voiceGaveUp);
+}
+
+void SpeechSynthesizer::setVoiceLoadTimeout(int ms) {
+    m_voiceLoadTimeoutMs = ms;
 }
 
 bool SpeechSynthesizer::available() const {
     return m_backend != nullptr && m_backend->usable();
+}
+
+bool SpeechSynthesizer::present() const {
+    return m_backend != nullptr && m_backend->present();
 }
 
 QString SpeechSynthesizer::voiceDescription() const {
@@ -314,6 +393,7 @@ void SpeechSynthesizer::requestStop() {
         // let finish: this is already a boundary.
         m_pauseTimer.stop();
         m_pending.clear();
+        m_queuedPrefetch.clear();
         emit stopCompleted();
         return;
     }
@@ -329,6 +409,7 @@ void SpeechSynthesizer::stopNow() {
     m_pauseTimer.stop();
     m_pending.clear();
     m_pendingText.clear();
+    m_queuedPrefetch.clear();
     m_stoppingAtBoundary = false;
     if (available()) {
         m_backend->stopImmediately();
@@ -352,6 +433,14 @@ void SpeechSynthesizer::speakNow() {
     m_pendingText = m_pending;
     m_pending.clear();
     m_backend->speak(m_pendingText);
+    // The clause in front is now the engine's problem, so the lookahead goes
+    // with it. At most one can ever be waiting: the pump asks for a lookahead
+    // once per clause, and each clause is committed before the next is taken.
+    if (!m_queuedPrefetch.isEmpty()) {
+        const QString ahead = m_queuedPrefetch;
+        m_queuedPrefetch.clear();
+        m_backend->prefetch(ahead);
+    }
 }
 
 void SpeechSynthesizer::onBackendFinished() {
@@ -370,6 +459,7 @@ void SpeechSynthesizer::onBackendFailed(const QString& reason) {
     m_pauseTimer.stop();
     m_pending.clear();
     m_pendingText.clear();
+    m_queuedPrefetch.clear();
     m_stoppingAtBoundary = false;
     emit failed(reason);
     emit stopCompleted();
