@@ -10,7 +10,7 @@ namespace kestrel::runtime {
 enum class BackendKind {
     Mock,
     LlamaCpp,
-    TensorRT,
+    OrtGenAI,
 };
 
 struct GenerationRequest {

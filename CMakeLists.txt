@@ -34,6 +34,21 @@ set(KESTREL_TENSORRT_ROOT "" CACHE PATH "Root of an unpacked TensorRT SDK")
 option(KESTREL_ENABLE_LLAMA_CPP "Link llama.cpp for GGUF inference" ON)
 set(KESTREL_LLAMA_CPP_ROOT "" CACHE PATH "Root of a llama.cpp install or build tree")
 
+# The llama.cpp tree lives outside the repository and its path is per machine,
+# so it cannot be committed. Reading it from the environment as well as from
+# -D means one exported variable is enough to make every build of this checkout
+# -- including the one the desktop packager runs -- link real inference.
+#
+# Without this the default build links no llama.cpp at all, so every runtime
+# backend reports unavailable and the registry falls through to the mock. That
+# is not a degraded mode someone chose: it is what an ordinary build produced,
+# and it is why the app answered with canned text by default.
+if(NOT KESTREL_LLAMA_CPP_ROOT AND DEFINED ENV{KESTREL_LLAMA_CPP_ROOT})
+    set(KESTREL_LLAMA_CPP_ROOT "$ENV{KESTREL_LLAMA_CPP_ROOT}")
+    message(STATUS
+        "Kestrel: KESTREL_LLAMA_CPP_ROOT from the environment: ${KESTREL_LLAMA_CPP_ROOT}")
+endif()
+
 # Resolution order: a CMake package config first, then an explicit root. Never
 # found by accident, because a wrong llama.cpp would produce subtly wrong
 # tokens rather than a link error.
@@ -51,7 +66,40 @@ if(KESTREL_ENABLE_LLAMA_CPP)
     endif()
 endif()
 
-# --- CUDA discovery source selection -----------------------------------------
+# ONNX Runtime GenAI is the Windows-native real-inference path. See
+# src/runtime/ortgenaibackend.h for why this exists instead of a TensorRT path.
+#
+# The tree is laid out with include/, lib/ and bin/ beside one another, which is
+# what the NuGet packages unpack to once the contents of
+# Microsoft.ML.OnnxRuntimeGenAI (the GenAI extension) and
+# Microsoft.ML.OnnxRuntime.Gpu.Windows (onnxruntime.dll with the CUDA execution
+# provider) are placed in one directory. It is read from the environment as well
+# as from -D, for the same reason KESTREL_LLAMA_CPP_ROOT is: the tree lives
+# outside the repository and its path differs per machine.
+option(KESTREL_ENABLE_ORT_GENAI "Link ONNX Runtime GenAI for ONNX model inference" ON)
+set(KESTREL_ORT_GENAI_ROOT "" CACHE PATH "Root of an ONNX Runtime GenAI tree (include/, lib/, bin/)")
+if(NOT KESTREL_ORT_GENAI_ROOT AND DEFINED ENV{KESTREL_ORT_GENAI_ROOT})
+    set(KESTREL_ORT_GENAI_ROOT "$ENV{KESTREL_ORT_GENAI_ROOT}")
+    message(STATUS
+        "Kestrel: KESTREL_ORT_GENAI_ROOT from the environment: ${KESTREL_ORT_GENAI_ROOT}")
+endif()
+
+set(KESTREL_ORT_GENAI_ENABLED OFF)
+if(KESTREL_ENABLE_ORT_GENAI)
+    # The GenAI header is the marker, and the import library beside it is what
+    # proves the tree has a native half rather than only managed assemblies --
+    # a NuGet folder dropped in wholesale satisfies neither of these checks in
+    # the place CMake looks.
+    if(KESTREL_ORT_GENAI_ROOT AND EXISTS "${KESTREL_ORT_GENAI_ROOT}/include/ort_genai.h")
+        set(KESTREL_ORT_GENAI_ENABLED ON)
+        message(STATUS
+            "Kestrel: ONNX Runtime GenAI headers found at ${KESTREL_ORT_GENAI_ROOT}")
+    else()
+        message(STATUS
+            "Kestrel: ONNX Runtime GenAI not found; that backend will report unavailable")
+    endif()
+endif()
+
 # Exactly one of these two is compiled. Both define probeCuda(); only the CUDA
 # one may include a CUDA header. See src/runtime/cudadevice.h.
 if(KESTREL_ENABLE_CUDA)
@@ -160,8 +208,8 @@ add_library(kestrel_core
     src/runtime/mockbackend.h
     src/runtime/llamacppbackend.cpp
     src/runtime/llamacppbackend.h
-    src/runtime/tensorrtbackend.cpp
-    src/runtime/tensorrtbackend.h
+    src/runtime/ortgenaibackend.cpp
+    src/runtime/ortgenaibackend.h
     src/storage/atomicfile.cpp
     src/storage/atomicfile.h
     src/storage/json.cpp
@@ -273,6 +321,200 @@ if(KESTREL_LLAMA_CPP_ENABLED)
             )
         endif()
     endif()
+
+    # --- llama.cpp runtime staging -------------------------------------------
+    # Linking an import library is only half the job on Windows. llama.dll and
+    # the ggml*.dll chain under it are resolved by name when the process loads,
+    # not from the link line, so a binary linked against a perfectly good
+    # llama.lib still dies before main() with STATUS_DLL_NOT_FOUND (0xc0000135).
+    #
+    # That failure is worth spelling out because it is not a crash you can see.
+    # There is no dialog, no message box and no stderr: the process simply never
+    # reaches the first line of main, so a test binary prints nothing, a CTest
+    # job reports "no output", and a launcher reports nothing at all. It reads
+    # exactly like a hang or a silent skip, which is how it cost an afternoon.
+    #
+    # Copying the DLLs beside the executable is what fixes all of it at once,
+    # and unlike the PATH fix-up used for cudart further down it also covers
+    # the real application: PATH is only set for CTest, so a double-clicked or
+    # packaged kestrel.exe would still fail to start. Staging at build time
+    # additionally leaves the DLLs in the staging directory, which is where the
+    # desktop packager collects everything else.
+    if(WIN32)
+        if(TARGET llama)
+            get_target_property(_kestrel_llama_loc llama IMPORTED_LOCATION_RELEASE)
+            if(NOT _kestrel_llama_loc)
+                get_target_property(_kestrel_llama_loc llama IMPORTED_LOCATION)
+            endif()
+            if(_kestrel_llama_loc)
+                get_filename_component(_kestrel_llama_bin "${_kestrel_llama_loc}" DIRECTORY)
+            endif()
+        else()
+            set(_kestrel_llama_bin "${KESTREL_LLAMA_CPP_ROOT}/bin")
+        endif()
+
+        if(_kestrel_llama_bin AND EXISTS "${_kestrel_llama_bin}")
+            file(GLOB _kestrel_llama_dlls "${_kestrel_llama_bin}/*.dll")
+            # Recorded so the desktop packager ships the same set. Package on a
+            # different machine than the build is the normal case, and a
+            # hand-maintained second list is how that drifts.
+            set(KESTREL_LLAMA_CPP_DLLS "${_kestrel_llama_dlls}" CACHE INTERNAL
+                "llama.cpp runtime DLLs to stage and ship")
+            if(_kestrel_llama_dlls)
+                list(LENGTH _kestrel_llama_dlls _kestrel_llama_dll_count)
+                message(STATUS
+                    "Kestrel: staging ${_kestrel_llama_dll_count} llama.cpp runtime DLL(s) from ${_kestrel_llama_bin}")
+            else()
+                message(WARNING
+                    "Kestrel: found no DLLs in ${_kestrel_llama_bin}; a llama.cpp build will "
+                    "fail to start with STATUS_DLL_NOT_FOUND until the runtime is staged")
+            endif()
+        else()
+            message(WARNING
+                "Kestrel: llama.cpp links, but no DLL directory was found (looked in "
+                "'${_kestrel_llama_bin}'); the built binaries will fail to start")
+        endif()
+    endif()
+endif()
+
+# --- ONNX Runtime GenAI: link and runtime staging -----------------------------
+if(KESTREL_ORT_GENAI_ENABLED)
+    target_compile_definitions(kestrel_core PRIVATE KESTREL_HAS_ORT_GENAI=1)
+    target_include_directories(kestrel_core PRIVATE "${KESTREL_ORT_GENAI_ROOT}/include")
+    if(WIN32)
+        set(_kestrel_ort_libs "")
+        # onnxruntime.lib is needed for the GenAI DLL's own imports to resolve
+        # at load time even though this code calls only the GenAI entry points,
+        # and onnxruntime-genai.lib carries those. Both are named only if
+        # present, so a tree with the GenAI half but no runtime half still
+        # configures and reports its own problem at run time rather than
+        # failing here with a path CMake would otherwise have to guess at.
+        # onnxruntime-genai-cuda is listed alongside the others because the CUDA
+        # build of ONNX Runtime GenAI ships it as a separate DLL. Without it the
+        # CUDA execution provider fails at load time with Error 126 -- "failed
+        # to load library" -- which arrives as a load failure naming a file the
+        # package plainly does not contain, and is otherwise a long afternoon.
+        foreach(_comp onnxruntime-genai onnxruntime-genai-cuda onnxruntime)
+            if(EXISTS "${KESTREL_ORT_GENAI_ROOT}/lib/${_comp}.lib")
+                list(APPEND _kestrel_ort_libs "${KESTREL_ORT_GENAI_ROOT}/lib/${_comp}.lib")
+            endif()
+        endforeach()
+        target_link_libraries(kestrel_core PRIVATE ${_kestrel_ort_libs})
+    else()
+        target_link_libraries(kestrel_core PRIVATE
+            "${KESTREL_ORT_GENAI_ROOT}/lib/libonnxruntime-genai.so"
+            "${KESTREL_ORT_GENAI_ROOT}/lib/libonnxruntime.so"
+        )
+    endif()
+
+    # The same STATUS_DLL_NOT_FOUND problem llama.cpp has, for the same reason:
+    # these are resolved by name when the process loads. onnxruntime.dll plus
+    # the provider DLLs are staged beside the executable, which also means the
+    # desktop packager finds them already in the build tree.
+    set(KESTREL_ORT_GENAI_DLLS "" CACHE INTERNAL "ONNX Runtime GenAI DLLs to stage and ship")
+    if(WIN32 AND EXISTS "${KESTREL_ORT_GENAI_ROOT}/bin")
+        file(GLOB _kestrel_ort_dlls "${KESTREL_ORT_GENAI_ROOT}/bin/*.dll")
+        set(KESTREL_ORT_GENAI_DLLS "${_kestrel_ort_dlls}" CACHE INTERNAL
+            "ONNX Runtime GenAI DLLs to stage and ship")
+        if(_kestrel_ort_dlls)
+            list(LENGTH _kestrel_ort_dlls _kestrel_ort_dll_count)
+            message(STATUS
+                "Kestrel: staging ${_kestrel_ort_dll_count} ONNX Runtime DLL(s) from ${KESTREL_ORT_GENAI_ROOT}/bin")
+            # The CUDA execution provider is a separate DLL loaded by
+            # onnxruntime.dll. Without it the backend still runs, on the CPU,
+            # and says so -- which is correct behaviour rather than a failure,
+            # so this is reported as information and not as a warning.
+            if(EXISTS "${KESTREL_ORT_GENAI_ROOT}/bin/onnxruntime_providers_cuda.dll"
+               AND EXISTS "${KESTREL_ORT_GENAI_ROOT}/bin/onnxruntime-genai-cuda.dll")
+                message(STATUS "Kestrel: ONNX Runtime has the CUDA execution provider")
+            elseif(EXISTS "${KESTREL_ORT_GENAI_ROOT}/bin/onnxruntime_providers_cuda.dll")
+                message(WARNING
+                    "Kestrel: onnxruntime_providers_cuda.dll is present but "
+                    "onnxruntime-genai-cuda.dll is not; the CUDA execution provider will fail to "
+                    "load. Add Microsoft.ML.OnnxRuntimeGenAI.CUDA to the tree.")
+            else()
+                message(STATUS "Kestrel: ONNX Runtime is CPU-only; this backend will use the CPU provider")
+            endif()
+        else()
+            message(WARNING
+                "Kestrel: found no DLLs in ${KESTREL_ORT_GENAI_ROOT}/bin; an ONNX Runtime GenAI "
+                "build will fail to start with STATUS_DLL_NOT_FOUND")
+        endif()
+    endif()
+endif()
+
+# Copies the staged llama.cpp DLLs beside one executable, so that executable
+# can start. Call it for every target that links kestrel_core: the desktop
+# app, the offline engine builder and each test binary. The one that links the
+# library is the one that inherits the load-time dependency, so a test failing
+# without this is not a special case.
+#
+# Called explicitly rather than from a cmake_language(DEFER) sweep over
+# BUILDSYSTEM_TARGETS. The DEFER does run at the end of this directory, but the
+# target list it sees there is empty -- verified on CMake 4.4 with an explicit
+# print -- so the sweep silently stages nothing and the failure it was meant to
+# prevent comes straight back. An explicit call is visible at the point the
+# executable is created, which is where a reader can check it.
+#
+# It is a no-op when llama.cpp is not linked, when the platform resolves
+# libraries some other way, or when no DLLs were found at configure time.
+function(kestrel_stage_llama_runtime target)
+    if(NOT KESTREL_LLAMA_CPP_ENABLED OR NOT WIN32 OR NOT KESTREL_LLAMA_CPP_DLLS)
+        return()
+    endif()
+    if(NOT TARGET ${target})
+        # Optional targets (the app, the Qt tests) do not exist in every
+        # configuration, so their call sites run inside their own if() blocks.
+        # Reaching here means a caller got the target name wrong.
+        message(FATAL_ERROR "kestrel_stage_llama_runtime: no such target '${target}'")
+    endif()
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${KESTREL_LLAMA_CPP_DLLS} "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Staging llama.cpp runtime beside ${target}")
+endfunction()
+
+# The same job for ONNX Runtime GenAI, for the same reason and with the same
+# no-op guard. Separate from the llama.cpp one rather than generalised, because
+# the two runtimes are independently optional: a build may have either, both or
+# neither, and a shared function would have to decide what "staged" means when
+# one list is empty and the other is not.
+function(kestrel_stage_ort_genai_runtime target)
+    if(NOT KESTREL_ORT_GENAI_ENABLED OR NOT WIN32 OR NOT KESTREL_ORT_GENAI_DLLS)
+        return()
+    endif()
+    if(NOT TARGET ${target})
+        message(FATAL_ERROR "kestrel_stage_ort_genai_runtime: no such target '${target}'")
+    endif()
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${KESTREL_ORT_GENAI_DLLS} "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Staging ONNX Runtime beside ${target}")
+endfunction()
+
+# Staging the runtimes once, at configure time, into the build directory.
+#
+# This replaced a POST_BUILD copy attached to every executable, which failed.
+# Nine targets each copied the same five files into the same directory at the
+# same time, and one of them failed on onnxruntime_providers_shared.dll with
+# "No such file or directory" -- a 187 MB provider DLL being written by several
+# concurrent copies. The nine copies were also nine times the work for one
+# result.
+#
+# A configure-time copy has neither problem. In a single-configuration build
+# every executable lands in CMAKE_BINARY_DIR, so one copy reaches all of them,
+# it happens before anything is run, and it cannot race itself. The per-target
+# function above stays for the multi-configuration case, where executables go to
+# a per-configuration subdirectory that CMAKE_BINARY_DIR alone does not cover.
+if(WIN32)
+    if(KESTREL_LLAMA_CPP_DLLS)
+        file(COPY ${KESTREL_LLAMA_CPP_DLLS} DESTINATION "${CMAKE_BINARY_DIR}")
+    endif()
+    if(KESTREL_ORT_GENAI_DLLS)
+        file(COPY ${KESTREL_ORT_GENAI_DLLS} DESTINATION "${CMAKE_BINARY_DIR}")
+    endif()
 endif()
 
 if(KESTREL_BUILD_UI)
@@ -376,6 +618,13 @@ if(KESTREL_BUILD_UI)
             message(STATUS "Kestrel: Qt Multimedia not found; no local neural voice")
         endif()
 
+        # The app links kestrel_core, so it carries the llama.cpp load-time
+        # dependency and cannot start without the runtime beside it. This is the
+        # one call that is not a test, and it is the one the packager depends
+        # on: the staging directory is assembled from build outputs.
+        kestrel_stage_llama_runtime(kestrel)
+        kestrel_stage_ort_genai_runtime(kestrel)
+
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
         if(KESTREL_BUILD_TESTS)
@@ -418,6 +667,11 @@ if(KESTREL_BUILD_UI)
                 target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
             endif()
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
+            # Links kestrel_core, so it needs the llama.cpp runtime beside it for
+            # the same reason the non-Qt tests do. kestrel_qml_tests below
+            # deliberately does not: it links no kestrel_core.
+            kestrel_stage_llama_runtime(kestrel_app_tests)
+            kestrel_stage_ort_genai_runtime(kestrel_app_tests)
 
             # Geometry tests for the QML itself. The app test proves a reply
             # arrives; nothing proves the reply is legible, which is how a
@@ -504,6 +758,8 @@ endif()
 # links only the portable core, so it builds with no Qt and no CUDA toolkit.
 add_executable(kestrel-engine-build src/tools/enginebuild.cpp)
 target_link_libraries(kestrel-engine-build PRIVATE kestrel_core)
+kestrel_stage_llama_runtime(kestrel-engine-build)
+kestrel_stage_ort_genai_runtime(kestrel-engine-build)
 
 if(KESTREL_TENSORRT_ENABLED)
     target_include_directories(kestrel-engine-build PRIVATE "${KESTREL_TENSORRT_ROOT}/include")
@@ -600,4 +856,18 @@ if(KESTREL_BUILD_TESTS)
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
         endforeach()
     endif()
+
+    # Every test binary links kestrel_core and so needs the llama.cpp runtime
+    # beside it. Listed rather than derived: the same list as the cudart fix-up
+    # above, so a test cannot be added to one and forgotten in the other.
+    foreach(_kestrel_llama_test
+            kestrel_core_tests
+            kestrel_runtime_tests
+            kestrel_storage_tests
+            kestrel_json_tests
+            kestrel_profile_tests
+            kestrel_secretsearch_tests)
+        kestrel_stage_llama_runtime(${_kestrel_llama_test})
+        kestrel_stage_ort_genai_runtime(${_kestrel_llama_test})
+    endforeach()
 endif()

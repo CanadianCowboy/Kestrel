@@ -531,10 +531,18 @@ void testIdleStaysSilentWhileTheUserIsPresent() {
 
 void testIdleDefaultPolicyIsLocalOnly() {
     core::IdlePolicy policy;
-    // Everything that is just a string is allowed; the one capability that
-    // leaves pure computation is not.
-    assert(policy.permittedCount() == 6);
-    assert(!policy.permits(core::IdleTaskKind::ModelWarmup));
+    // The default grants every task, including the one that touches the model
+    // runtime. It used to withhold exactly that one, on the reasoning that
+    // prewarming is the only capability leaving pure computation -- and the
+    // effect of that default was a feature that never ran. A policy that
+    // guarantees the warmup does not happen is not a safe default for a
+    // warmup; it is a warmup that is off, described as one that is on.
+    //
+    // What still holds is the part that matters: nothing here can reach the
+    // network or the filesystem, and every task can still be switched off
+    // individually and collectively, which the second half of this test proves.
+    assert(policy.permittedCount() == 7);
+    assert(policy.permits(core::IdleTaskKind::ModelWarmup));
     assert(policy.permits(core::IdleTaskKind::SelfReflection));
     assert(policy.permits(core::IdleTaskKind::AmbientWhisper));
     assert(policy.permits(core::IdleTaskKind::ContextReindex));
@@ -676,6 +684,11 @@ void testIdleGreetsOncePerAbsence() {
     greetings.allowContextReindex = false;
     greetings.allowCacheAudit = false;
     greetings.allowCreativeThoughts = false;
+    // Named explicitly even though it happens to be the default. This test is
+    // about one task kind, and leaving the other permitted kinds to the
+    // default is how it broke when the default changed: the loop had two
+    // choices instead of one, picked the other, and there was no greeting.
+    greetings.allowModelWarmup = false;
     idle.setPolicy(greetings);
     idle.setTopic("tensorrt");
 

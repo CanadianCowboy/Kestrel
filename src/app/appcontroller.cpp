@@ -10,6 +10,7 @@
 #endif
 #include "runtime/backendregistry.h"
 #include "runtime/llamacppbackend.h"
+#include "runtime/ortgenaibackend.h"
 
 #include <QClipboard>
 #include <QDateTime>
@@ -997,26 +998,59 @@ void AppController::loadModelFromUrl(const QString& url) {
     struct LoadResult {
         QString path;
         QString error;
-        std::unique_ptr<runtime::LlamaCppBackend> candidate;
+        std::unique_ptr<runtime::ModelBackend> candidate;
     };
     auto result = std::make_shared<LoadResult>();
     m_discardModelLoad = false;
     m_modelLoadThread.reset(QThread::create([url, result] {
         result->path = QUrl(url).toLocalFile();
         if (result->path.isEmpty()) {
-            result->error = tr("That is not a local file. Choose a GGUF from disk.");
+            result->error = tr("That is not a local file. Choose a model from disk.");
             return;
         }
         const QFileInfo info(result->path);
-        if (!info.exists() || !info.isFile()) {
+        if (!info.exists()) {
             result->error = tr("No such file: %1").arg(result->path);
             return;
         }
-        if (info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) != 0) {
-            result->error = tr("%1 is not a GGUF file.").arg(info.fileName());
+
+        // The backend is chosen from the shape of what was handed over, not
+        // from a preference order. There are two real formats and they are not
+        // interchangeable:
+        //
+        //   * a .gguf file            -> llama.cpp
+        //   * a folder with
+        //     genai_config.json      -> ONNX Runtime GenAI
+        //
+        // A GenAI model is a folder -- a config, one or more ONNX graphs and
+        // external data -- so a check for a .gguf *file* rejects every one of
+        // them. That is not a hypothetical gap: it is how the ONNX Runtime
+        // backend would have been built, linked, listed in the diagnostics and
+        // still impossible to hand a model, which is the same defect the
+        // TensorRT stub was removed for. The backend is picked here, from the
+        // thing itself, so a new format is one branch rather than a new
+        // preference entry.
+        const bool isDirectory = info.isDir();
+        const bool isGenAi = isDirectory && QFileInfo::exists(
+            result->path + QStringLiteral("/genai_config.json"));
+        const bool isGguf = !isDirectory
+            && info.suffix().compare(QStringLiteral("gguf"), Qt::CaseInsensitive) == 0;
+
+        if (isGenAi) {
+            result->candidate = std::make_unique<runtime::OrtGenAiBackend>();
+        } else if (isGguf) {
+            result->candidate = std::make_unique<runtime::LlamaCppBackend>();
+        } else if (isDirectory) {
+            result->error = tr("%1 is a folder but not an ONNX Runtime GenAI model: "
+                               "it has no genai_config.json.").arg(info.fileName());
+            return;
+        } else {
+            result->error = tr("%1 is not a model Kestrel can read. Expected a .gguf file "
+                               "or a folder containing genai_config.json.")
+                               .arg(info.fileName());
             return;
         }
-        result->candidate = std::make_unique<runtime::LlamaCppBackend>();
+
         if (!result->candidate->status().available) {
             result->error = QString::fromStdString(result->candidate->status().detail);
             return;

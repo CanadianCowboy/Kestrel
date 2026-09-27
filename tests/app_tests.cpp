@@ -276,6 +276,23 @@ void useSilentVoice(kestrel::app::AppController& controller) {
     controller.setSpeechBackendForTesting(std::move(speech));
 }
 
+// Gives a controller a model backend that answers immediately, for any test
+// that sends a message and then asserts on what came back.
+//
+// This is the counterpart to useSilentVoice and exists for the same underlying
+// reason. A controller with no backend injected adopts whatever the registry
+// offers, and for as long as this build linked no llama.cpp that was the mock
+// -- so a great many tests here were, without saying so, testing the mock.
+// The moment a real backend became available they adopted it instead, no model
+// was loaded, nothing was generated, and the assertions failed for a reason
+// that had nothing to do with what they were written to check.
+//
+// A test that names its backend cannot fail that way, and cannot quietly stop
+// being a test of the controller and become a test of llama.cpp.
+void useImmediateModel(kestrel::app::AppController& controller) {
+    controller.setBackendForTesting(std::make_unique<kestrel::runtime::MockBackend>());
+}
+
 // A turn is over when the words are done *and* the voice has stopped, which are
 // two different moments once text-to-speech is installed.
 //
@@ -622,8 +639,16 @@ void testPresenceAndIdleLoopProject() {
     check(controller.statusWhisper() == QString::fromUtf8("Standing by\u2026"),
           "the status line says the same thing in one line");
     check(controller.idleLoopEnabled(), "the idle loop is on by default");
-    check(!controller.idlePrewarmEnabled(),
-          "the one idle task that reaches past the process is off until asked for");
+    // Prewarming is on by default now, and can still be switched off. It was
+    // the reverse, and that default meant the warmup never ran: a capability
+    // that is off is not a capability, whatever the setting is called. So this
+    // asserts both halves -- on by default, and still switchable -- because
+    // only the first was ever verified.
+    check(controller.idlePrewarmEnabled(),
+          "prewarming is on by default, so a cold GPU is warmed at all");
+    controller.setIdlePrewarmEnabled(false);
+    check(!controller.idlePrewarmEnabled(), "prewarming can still be turned off");
+    controller.setIdlePrewarmEnabled(true);
     check(!controller.showIdleThoughts(), "private thoughts are not revealed by default");
     check(controller.ambientThought().isEmpty(), "nothing has been thought yet");
     check(controller.idleTaskLabel().isEmpty(), "no idle task has run yet");
@@ -776,6 +801,7 @@ void testIdleToolNeedsPermissionBeforeItRuns() {
     std::cout << "an idle tool runs only once it is permitted\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     const auto tools = controller.idleTools();
     check(!tools.isEmpty(), "the panel has something to show");
@@ -839,6 +865,16 @@ void testSpokenResponseFollowsClauseOrder() {
     auto backend = std::make_unique<kestrel::runtime::MockBackend>();
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
+    // The backend is injected, not inherited. A `backend` local that was
+    // constructed and then dropped on the floor was the only reason this test
+    // passed: the controller picked whatever the registry offered, and for as
+    // long as no llama.cpp was linked that was the mock. The moment a real
+    // backend became available the controller adopted it, no model was loaded,
+    // nothing was generated, and the assertions below failed -- which is the
+    // same coupling that made the shipped app answer with the mock.
+    //
+    // A test that states which backend it drives cannot break that way.
+    controller.setBackendForTesting(std::move(backend));
     controller.setSpeechBackendForTesting(std::move(speech));
 
     check(controller.ttsAvailable(), "the adopted backend reports itself available");
@@ -924,6 +960,7 @@ void testWarmthReachesTheVoice() {
     std::cout << "the persona's warmth dial reaches the voice\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -982,6 +1019,7 @@ void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
     // in place of this one's.
     kestrel::app::AppController control;
     control.setIdleLoopEnabled(false);
+    useImmediateModel(control);
     auto controlSpeech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* controlVoice = controlSpeech.get();
     controlSpeech->setTimerContext(&control);
@@ -1012,6 +1050,7 @@ void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
     // The real case: the engine is installed and launched but has not finished
     // loading, which is what a cold start looks like.
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1062,6 +1101,7 @@ void testReplyIsDeliveredAsTextWhenTheVoiceNeverArrives() {
     std::cout << "a held reply is delivered as text when the engine gives up\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1099,6 +1139,7 @@ void testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken() {
     std::cout << "the engine is asked for clauses in the order they are spoken\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1173,6 +1214,7 @@ void testLeavingAConversationDropsTheReplyItWasHolding() {
     std::cout << "leaving a conversation drops the reply it was holding\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1205,6 +1247,7 @@ void testStoppingDropsAReplyHeldForAVoice() {
     std::cout << "stopping drops a reply held for a voice\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1238,6 +1281,7 @@ void testAReplySentMidSpeechTakesItsOwnWarmth() {
     std::cout << "a reply sent mid-speech takes its own warmth\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1277,6 +1321,7 @@ void testAHeldReplyGivesUpIfTheVoiceNeverArrives() {
     std::cout << "a held reply gives up if the voice never arrives\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1342,6 +1387,7 @@ void testPaceIsCommittedWhereTheAudioIsAskedFor() {
     std::cout << "the response pace is committed where audio is asked for\n";
 
     kestrel::app::AppController controller;
+    useImmediateModel(controller);
     controller.setIdleLoopEnabled(false);
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1426,6 +1472,7 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     controller.setIdleLoopEnabled(false);
     // Slow enough that the turn is still running when the second message lands.
     auto backend = std::make_unique<SlowBackend>(400, 1);
+    controller.setBackendForTesting(std::move(backend));
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
     controller.setSpeechBackendForTesting(std::move(speech));

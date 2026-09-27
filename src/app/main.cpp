@@ -1,3 +1,6 @@
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QEventLoop>
 #include <QImage>
@@ -72,6 +75,93 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
     }
     const QString value = arguments.at(index + 1);
     return value.startsWith(QStringLiteral("--")) ? QString() : value;
+}
+
+// The model to load when nobody named one on the command line.
+//
+// A model used to be reachable only through --model, so an ordinary launch --
+// double-clicked from Explorer, started from the desktop shortcut -- had no
+// model at all. Every real backend then reported itself unavailable and the
+// registry handed the conversation to the mock, which is why the app talked in
+// canned lines by default and why a real model had to be passed on the command
+// line to see one working. A launcher with no way to reach the point of the
+// product is the defect, not the missing flag.
+//
+// Two sources, in order:
+//
+//   1. KESTREL_MODEL, for a model kept anywhere on the machine. This is what
+//      a developer sets, because build trees and model stores are separate.
+//   2. A `models` directory beside the executable. This is what the packaged
+//      app uses, and it is why the packager ships that directory: dropping a
+//      model in it is the whole installation step.
+//
+// Two layouts are recognised, because Kestrel has two real backends reading two
+// model formats:
+//
+//   * a .gguf file, for llama.cpp;
+//   * a *directory* holding genai_config.json, for ONNX Runtime GenAI. A GenAI
+//     model is a config plus one or more ONNX graphs plus external data, so it
+//     is a folder rather than a file, and requiring a .gguf here would have
+//     made the ONNX backend unreachable from a plain launch -- the same class of
+//     defect as the one this function was written to fix.
+//
+// Among candidates the largest wins. A quantisation of the same family differs
+// in size by a wide margin, and among different families the larger model is the
+// more capable one -- picking alphabetically would hand a 0.5 B model chosen
+// for the name starting with 'a' over the 8 B one sitting next to it. Kestrel
+// shipped a `qwen.gguf` next to a much better local model precisely because the
+// name said nothing about the contents.
+QString discoverModel(const QString& explicitPath) {
+    if (!explicitPath.isEmpty()) {
+        return explicitPath;
+    }
+
+    const QString fromEnvironment =
+        qEnvironmentVariable("KESTREL_MODEL", QString());
+    if (!fromEnvironment.isEmpty() && QFileInfo::exists(fromEnvironment)) {
+        return fromEnvironment;
+    }
+
+    const QString modelDirectory =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/models");
+    QDir directory(modelDirectory);
+    if (!directory.exists()) {
+        return {};
+    }
+
+    QString best;
+    qint64 bestBytes = -1;
+    const auto consider = [&best, &bestBytes](const QString& path, qint64 bytes) {
+        if (bytes > bestBytes) {
+            bestBytes = bytes;
+            best = path;
+        }
+    };
+
+    for (const QString& entry :
+         directory.entryList({QStringLiteral("*.gguf")}, QDir::Files, QDir::Name)) {
+        const QFileInfo info(directory.filePath(entry));
+        if (info.isFile() && info.isReadable()) {
+            consider(info.absoluteFilePath(), info.size());
+        }
+    }
+    for (const QString& entry :
+         directory.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+        // A GenAI model is identified by its config, not by its name, so the
+        // presence of that one file is what makes a directory a candidate.
+        const QDir candidate(directory.filePath(entry));
+        if (!candidate.exists(QStringLiteral("genai_config.json"))) {
+            continue;
+        }
+        qint64 bytes = 0;
+        const QFileInfoList files =
+            candidate.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+        for (const QFileInfo& file : files) {
+            bytes += file.size();
+        }
+        consider(candidate.absolutePath(), bytes);
+    }
+    return best;
 }
 
 // Sends one message through the real window and reports whether a reply came
@@ -262,7 +352,8 @@ int main(int argc, char* argv[]) {
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
+    const QString modelArgument =
+        discoverModel(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
     if (reportRuntime && modelArgument.isEmpty()) {
         attachToLaunchConsole();

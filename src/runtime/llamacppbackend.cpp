@@ -1,8 +1,12 @@
 #include "runtime/llamacppbackend.h"
 
+#include "core/pathtext.h"
+#include "runtime/cudadevice.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #ifdef KESTREL_HAS_LLAMA_CPP
@@ -57,6 +61,85 @@ int tokenizeInto(const llama_vocab* vocab,
     }
     out.resize(static_cast<std::size_t>(written));
     return written;
+}
+
+// Bytes of KV cache one token occupies for `model`, or zero when the model's
+// shape is not something the arithmetic can be trusted for.
+//
+// One K row and one V row per layer per cached token, each
+// (embedding / heads) * kvHeads elements. Under grouped-query attention those
+// rows are far narrower than the model's embedding, which is the only reason a
+// long context is affordable at all on a card this size.
+std::size_t kvBytesPerTokenFor(const llama_model* model) {
+    const int32_t layers = llama_model_n_layer(model);
+    const int32_t heads = llama_model_n_head(model);
+    const int32_t headsKv = llama_model_n_head_kv(model);
+    const int32_t embd = llama_model_n_embd(model);
+    if (layers <= 0 || heads <= 0 || headsKv <= 0 || embd <= 0 || embd % heads != 0) {
+        // Without a clean head dimension any figure here would be invented.
+        return 0;
+    }
+    const auto rowElements = static_cast<int64_t>(embd / heads) * headsKv;
+    return static_cast<std::size_t>(layers) * (ggml_row_size(GGML_TYPE_F16, rowElements)
+                                              + ggml_row_size(GGML_TYPE_F16, rowElements));
+}
+
+// How much of the device's memory the KV cache may take, once the weights are
+// resident.
+//
+// Two thirds, after a fixed 512 MB is set aside. The shortfall is not slack for
+// its own sake: the CUDA context itself costs a few hundred megabytes before a
+// single byte of cache exists, and a cache sized to exactly the remaining bytes
+// does not fail politely -- it fails at context creation, with an
+// out-of-memory error that names no setting the user can change.
+constexpr double kKvBudgetShare = 0.66;
+constexpr std::size_t kFixedOverheadBytes = 512ULL * 1024ULL * 1024ULL;
+
+// The context to create for `model` on this machine.
+//
+// Three numbers, in order of authority: what the model was trained for, what
+// this machine can hold, and a floor for a machine that can be asked neither.
+int chooseContextLength(const llama_model* model) {
+    const int trained = llama_n_ctx_train(model);
+    const int ceiling = trained > 0 ? trained : 8192;
+
+    const std::size_t perToken = kvBytesPerTokenFor(model);
+    if (perToken == 0) {
+        return std::min(ceiling, 8192);
+    }
+
+    const CudaProbe probe = probeCuda();
+    const CudaDeviceInfo* device = probe.selectedDevice();
+    if (device == nullptr || device->totalMemoryBytes == 0) {
+        // No GPU to budget against. System RAM is the next honest thing to size
+        // against, and llama.cpp will place the KV there, but it is not known
+        // cheaply and a wrong guess is expensive; 8192 is safe everywhere.
+        return std::min(ceiling, 8192);
+    }
+
+    const std::size_t total = device->totalMemoryBytes;
+    // The weights are already resident by the time this runs, so the honest
+    // budget is what is left. Approximated from the model's own file rather
+    // than re-read, because the file is megabytes to gigabytes and the load has
+    // just been through it.
+    const std::size_t weights = static_cast<std::size_t>(
+        std::max<int64_t>(llama_model_size(model), 0));
+    const std::size_t spare = total > weights + kFixedOverheadBytes
+                                  ? total - weights - kFixedOverheadBytes
+                                  : 0;
+    const auto affordable = static_cast<std::size_t>(
+        static_cast<double>(spare) * kKvBudgetShare) / perToken;
+    if (affordable < 1024) {
+        // The model does not fit with a usable context. 1024 is still a context
+        // -- enough for a system prompt and a short reply -- and the caller
+        // will see a small window reported rather than a load that failed for a
+        // reason nobody could act on.
+        return 1024;
+    }
+    // Rounded down to a multiple of 1024 so the reported figure reads as a
+    // deliberate choice rather than the residue of a division.
+    const int budgeted = static_cast<int>((affordable / 1024) * 1024);
+    return std::min(ceiling, budgeted);
 }
 
 } // namespace
@@ -120,8 +203,8 @@ RuntimeStatus LlamaCppBackend::status() const {
     return m_status;
 }
 
-/// Releases the previous model/context and loads a GGUF with a fresh 4096-token context.
-/// Returns false with an error on failure; serializes access with m_mutex.
+/// Releases the previous model/context and loads a GGUF with a context sized to
+/// the machine. Returns false with an error on failure; serializes access with m_mutex.
 bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -157,9 +240,19 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     }
 
     llama_context_params contextParams = llama_context_default_params();
-    // The training context is not a sensible default for chat; size the KV
-    // cache to something a desktop agent can actually hold.
-    contextParams.n_ctx = 4096;
+    // The context used to be a literal 4096 with the comment "the training
+    // context is not a sensible default for chat". True as far as it went, and
+    // it left the question of what *is* sensible unanswered -- so every model
+    // got the same 4K window regardless of the machine, and a conversation
+    // longer than that silently lost its oldest turns. Qwen3.5 declares
+    // 262144; the useful range on real hardware is set by VRAM, not by the
+    // model card, so the number is derived from the device rather than chosen.
+    //
+    // Fallback when there is no device to reason about: 8192, which holds a
+    // system prompt and a long conversation on any machine Kestrel runs on and
+    // is still small enough for an 8 GB card with a 4B model resident.
+    const int contextLength = chooseContextLength(model);
+    contextParams.n_ctx = contextLength;
 
     llama_context* context = llama_init_from_model(model, contextParams);
     if (context == nullptr) {
@@ -189,7 +282,11 @@ void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
     if (loaded) {
-        const auto path = std::filesystem::u8path(m_impl->modelPath);
+        // u8path is deprecated in C++20 and the path constructor takes the same
+        // u8string. Built from an explicit conversion rather than a silent
+        // reinterpret: the source is a std::string, and whether its bytes are
+        // UTF-8 is the caller's claim, not something to assert here.
+        const std::filesystem::path path(m_impl->modelPath);
         // core::pathText rather than filename().string(): a model file under a
         // user name the ANSI code page cannot spell throws from string() on
         // Windows, and this is the line that decides what the UI calls the model.

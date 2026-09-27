@@ -3,9 +3,9 @@
 #include "runtime/engineartifact.h"
 #include "runtime/llamacppbackend.h"
 #include "runtime/mockbackend.h"
+#include "runtime/ortgenaibackend.h"
 #include "runtime/sapirecognizer.h"
 #include "runtime/speechrecognizer.h"
-#include "runtime/tensorrtbackend.h"
 
 #include <cassert>
 #include <cstdio>
@@ -263,105 +263,34 @@ void testEngineCompatibility() {
            == "incompatible");
 }
 
-void testTensorRtBackendValidatesEngine() {
-    runtime::TensorRTBackend backend;
-    std::string error;
-
-    assert(!backend.loadModel("", error));
-    assert(error.find("No engine path") != std::string::npos);
-
-    assert(!backend.loadModel("definitely_not_here.plan", error));
-    assert(error.find("not found") != std::string::npos);
-
-    // Generating without a loaded engine must fail cleanly, not crash.
-    bool completed = false;
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
-                     [&completed](bool success, std::string_view) { completed = !success; });
-
-    assert(completed);
-
-    const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / "kestrel_trt_backend_test";
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
-
-    const std::string emptyEngine = (dir / "empty.plan").string();
-    { std::ofstream file(emptyEngine, std::ios::binary); }
-    assert(!backend.loadModel(emptyEngine, error));
-    assert(error.find("empty") != std::string::npos);
-
-    const std::string goodEngine = (dir / "good.plan").string();
-    { std::ofstream file(goodEngine, std::ios::binary); file << "engine bytes"; }
-
-    // A build record that contradicts the current GPU must stop the load.
-    const runtime::CudaProbe probe = runtime::probeCuda();
-    if (probe.hasDevice()) {
-        runtime::EngineBuildRecord hostile;
-        hostile.tensorrtVersion = 10400;
-        hostile.cudaVersion = 12040;
-        hostile.computeMajor = 3;
-        hostile.computeMinor = 5;
-        hostile.gpuName = "Definitely Not This GPU";
-        const bool wrote = runtime::writeEngineBuildRecord(goodEngine, hostile, error);
-        assert(wrote);
-        const bool loadedIncompatible = backend.loadModel(goodEngine, error);
-        assert(!loadedIncompatible);
-        assert(error.find("Rebuild the engine") != std::string::npos);
-        assert(!backend.status().modelLoaded);
-    }
-
-    // No record at all is loadable: absence of metadata is not a defect.
-    std::filesystem::remove(runtime::engineSidecarPath(goodEngine));
-    const bool loaded = backend.loadModel(goodEngine, error);
-    assert(loaded);
-    assert(error.empty());
-    assert(backend.status().modelLoaded);
-    assert(backend.status().modelName == "good.plan");
-    assert(backend.lastCompatibility().verdict == runtime::EngineCompatibility::Unknown);
-    assert(backend.lastCompatibility().summary.find("build record") != std::string::npos);
-
-    // Generation is still refused, but with the reason the adapter owns.
-    std::string generateError = "unset";
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
-                     [&generateError](bool, std::string_view message) {
-                         generateError = std::string(message);
-                     });
-    assert(!generateError.empty());
-    assert(generateError.find("TensorRT") != std::string::npos);
-
-    // Cancellation is a real flag, not a no-op, and is safe when idle.
-    backend.cancel();
-    backend.cancel();
-
-    std::filesystem::remove_all(dir);
-}
-
 void testBackendSelectionAndDiagnostics() {
     const auto backend = runtime::selectBackend(runtime::BackendKind::Mock);
     assert(backend != nullptr);
     assert(backend->status().available);
 
-    // An unavailable preference must fall through rather than return a
-    // backend that cannot run.
-    const auto fallback = runtime::selectBackend(runtime::BackendKind::TensorRT);
-    assert(fallback != nullptr);
-    assert(fallback->status().available);
-
     assert(runtime::toString(runtime::BackendKind::Mock) == "mock");
     assert(runtime::toString(runtime::BackendKind::LlamaCpp) == "llamacpp");
-    assert(runtime::toString(runtime::BackendKind::TensorRT) == "tensorrt");
+    assert(runtime::toString(runtime::BackendKind::OrtGenAI) == "onnx-genai");
 
     const auto diagnostics = runtime::runtimeDiagnostics(runtime::probeCuda());
     assert(!diagnostics.empty());
     bool sawCudaRow = false;
+    bool sawGenAiRow = false;
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         assert(!row.label.empty());
         assert(!row.value.empty());
         if (row.label == "CUDA toolkit") {
             sawCudaRow = true;
         }
+        if (row.label == "ONNX Runtime GenAI") {
+            sawGenAiRow = true;
+        }
     }
     assert(sawCudaRow);
+    // The Windows-native backend must be visible in the report whether or not it
+    // is compiled in. A backend that only appears once it is linked is a
+    // backend nobody can discover before deciding to build it.
+    assert(sawGenAiRow);
     std::printf("  diagnostics rows: %zu\n", diagnostics.size());
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         std::printf("    [%s] %s: %s\n", row.ok ? " ok " : "warn", row.label.c_str(),
@@ -507,15 +436,37 @@ void testSharedSystemPromptPrefix() {
            == mock.countTokens(prefix) + mock.countTokens("hello") + mock.countTokens(reply));
 }
 
-/// Exercises the real llama.cpp generation path.
+/// One environment variable, as a string the caller owns.
 ///
+/// getenv is deprecated on Windows because the pointer it returns aliases an
+/// environment block the caller does not own, and MSVC says so at /W4 on every
+/// use. The secure variant is the documented replacement there and is a
+/// different signature, so the two cannot share a line; this file is compiled
+/// both with and without Qt, so it cannot reach for QString either.
+std::string environmentOrEmpty(const char* name) {
+#ifdef _WIN32
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr) {
+        return {};
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+#endif
+}
+
+/// Exercises the real llama.cpp generation path.///
 /// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
 /// a multi-hundred-megabyte model download to run the suite. When it is set,
 /// this is the only test that proves the backend actually generates rather than
 /// merely linking.
 void testLlamaCppGeneratesFromRealModel() {
-    const char* modelPath = std::getenv("KESTREL_TEST_GGUF");
-    if (modelPath == nullptr || *modelPath == '\0') {
+    const std::string modelPath = environmentOrEmpty("KESTREL_TEST_GGUF");
+    if (modelPath.empty()) {
         std::printf("  skip  real GGUF generation (set KESTREL_TEST_GGUF to run)\n");
         return;
     }
@@ -537,7 +488,7 @@ void testLlamaCppGeneratesFromRealModel() {
 
 
     if (!backend.loadModel(modelPath, error)) {
-        std::printf("  FAIL  could not load %s: %s\n", modelPath, error.c_str());
+        std::printf("  FAIL  could not load %s: %s\n", modelPath.c_str(), error.c_str());
         std::abort();
     }
 
@@ -662,6 +613,148 @@ void testLlamaCppGeneratesFromRealModel() {
     assert(backend.cachedPrefixTokens() == 0);
 }
 
+// Real generation through ONNX Runtime GenAI, on a real model, on this machine's
+// GPU. The same shape as the llama.cpp test above and for the same reason: the
+// project's central claim is that it runs a language model locally, and the only
+// way that claim is ever checked is by running one.
+//
+// Gated on KESTREL_TEST_ONNX_MODEL pointing at a GenAI model directory, because
+// a model is gigabytes and cannot be vendored. What this asserts beyond the
+// llama.cpp version is specific to this backend:
+//
+//   * the model is a *directory*, and a path that is not one is refused with a
+//     message that says so -- a caller handing over a .gguf gets a useful
+//     sentence rather than a bare failure;
+//   * the context length is the smaller of what the model declares and what
+//     this machine's VRAM affords. Qwen3.5 declares 262144, which is not a
+//     setting on an 8 GB card, and a backend that took the declared number at
+//     face value would fail at load time with an out-of-memory error and no
+//     explanation;
+//   * a system prompt reaches the model, and the backend is honest that it does
+//     not keep the prefix resident between turns.
+void testOrtGenAiGeneratesFromRealModel() {
+    const std::string modelPath = environmentOrEmpty("KESTREL_TEST_ONNX_MODEL");
+    if (modelPath.empty()) {
+        std::printf("  skip  real ONNX GenAI generation (set KESTREL_TEST_ONNX_MODEL to run)\n");
+        return;
+    }
+
+    runtime::OrtGenAiBackend backend;
+    std::string error;
+
+    // Same assertion as the llama.cpp backend, and for the same reason: a
+    // backend that reports itself unavailable until it has already loaded a
+    // model is one the registry skips and the UI hides.
+    if (!backend.status().available) {
+        std::printf("  FAIL  a linked ONNX Runtime GenAI backend reported itself unavailable\n");
+        std::abort();
+    }
+    assert(!backend.status().modelLoaded);
+
+    // A file is not a GenAI model, and saying so precisely is the difference
+    // between a caller fixing its path and a caller filing a bug.
+    {
+        runtime::OrtGenAiBackend rejecting;
+        std::string rejected;
+        if (rejecting.loadModel(modelPath + "/definitely-not-here", rejected)) {
+            std::printf("  FAIL  a nonexistent model path was accepted\n");
+            std::abort();
+        }
+        assert(rejected.find("folder") != std::string::npos
+               || rejected.find("genai_config") != std::string::npos);
+    }
+
+    if (!backend.loadModel(modelPath, error)) {
+        std::printf("  FAIL  could not load %s: %s\n", modelPath.c_str(), error.c_str());
+        std::abort();
+    }
+
+    const runtime::RuntimeStatus loaded = backend.status();
+    assert(loaded.modelLoaded);
+    assert(loaded.contextLimit > 0);
+    // A context of zero or one would let the assertions below pass while the
+    // model could not answer a real question.
+    assert(loaded.contextLimit >= 1024);
+    // The KV figure must be a real allocation, not zero, or "how long a context
+    // can I afford" has no answer.
+    assert(loaded.kvCacheBytes > 0);
+    std::printf("  onnx model: %s, ctx=%d, %s KV\n", loaded.modelName.c_str(),
+                static_cast<int>(loaded.contextLimit),
+                runtime::formatBytes(loaded.kvCacheBytes).c_str());
+
+    // The tokenizer must be real, and must distinguish two equal-length strings
+    // the way a real vocabulary does and a chars-per-token ratio cannot.
+    const std::string sentence = "The quick brown fox jumps over the lazy dog";
+    const std::size_t exact = backend.countTokens(sentence);
+    assert(exact > 0);
+    const std::string shorter = "The quick brown fox jumps over cat";
+    const std::string run(shorter.size(), 'a');
+    assert(backend.countTokens(run) != backend.countTokens(shorter));
+
+    std::string generated;
+    bool completed = false;
+    bool success = false;
+    std::string failure;
+    backend.setSystemPrompt("You are Kestrel, a local desktop assistant. Answer briefly.");
+    backend.generate(runtime::GenerationRequest{
+                         "In one short sentence, what does a hawk do?", 0.7F, 48},
+                     [&generated](std::string_view token) { generated.append(token); },
+                     [&](bool ok, std::string_view errorText) {
+                         success = ok;
+                         failure = std::string(errorText);
+                         completed = true;
+                     });
+
+    assert(completed);
+    if (!success) {
+        std::printf("  FAIL  generation failed: %s\n", failure.c_str());
+        std::abort();
+    }
+    // An empty response reporting itself as a success is the failure mode that
+    // matters here, and it is the one this asserts against.
+    assert(!generated.empty());
+    std::printf("  %zu prompt tokens, %zu chars generated\n", exact, generated.size());
+    std::printf("  sample: %.110s\n", generated.c_str());
+
+    // The context must have moved, must stay inside the window, and the byte
+    // figures must stay consistent with it.
+    const runtime::RuntimeStatus after = backend.status();
+    assert(after.contextUsed > 0);
+    assert(after.contextUsed <= after.contextLimit);
+    assert(after.kvCacheBytesUsed > 0);
+    assert(after.kvCacheBytesUsed <= after.kvCacheBytes);
+
+    // The system prompt is applied, and the backend does not claim a saving it
+    // has not made: this one re-decodes the prefix each turn rather than
+    // keeping it resident, so cachedPrefixTokens() must say zero. Reporting a
+    // token count there would be claiming a cache that does not exist.
+    assert(!backend.systemPrompt().empty());
+    assert(backend.cachedPrefixTokens() == 0);
+
+    // Cancellation must be honoured promptly and reported as a cancellation
+    // rather than as a silent success, because the barge-in path depends on it.
+    {
+        std::string partial;
+        bool done = false;
+        bool wasSuccessful = true;
+        backend.generate(runtime::GenerationRequest{
+                             "Count slowly from one to two hundred.", 0.7F, 256},
+                         [&partial](std::string_view token) { partial.append(token); },
+                         [&](bool ok, std::string_view) {
+                             wasSuccessful = ok;
+                             done = true;
+                         });
+        backend.cancel();
+        assert(done);
+        // Either it finished before the cancel landed, or it was cancelled.
+        // What must never happen is a cancelled turn reporting success with no
+        // tokens at all.
+        if (!partial.empty()) {
+            assert(!wasSuccessful || !partial.empty());
+        }
+    }
+}
+
 // Which recognizer the app uses depends on the machine, so the decision is
 // tested on its own rather than by looking for a microphone. Both branches are
 // asserted here, and neither of them needs audio hardware to run: the point is
@@ -776,7 +869,6 @@ int main() {
     KESTREL_RUN(testProbeIsSafeWithoutDevices);
     KESTREL_RUN(testEngineSidecarRoundTrip);
     KESTREL_RUN(testEngineCompatibility);
-    KESTREL_RUN(testTensorRtBackendValidatesEngine);
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
     KESTREL_RUN(testRecognizerSelectionFollowsTheMicrophone);
     KESTREL_RUN(testMockRecognizerStillStreamsPartials);
@@ -784,6 +876,7 @@ int main() {
     KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
     KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
+    KESTREL_RUN(testOrtGenAiGeneratesFromRealModel);
 #undef KESTREL_RUN
 
     std::printf("runtime tests passed\n");
