@@ -348,8 +348,22 @@ if(UNIX AND NOT APPLE)
     if(_kestrel_llama_rpath)
         foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
             if(TARGET ${_kestrel_rpath_target})
+                # Qt's setup gives an installed binary "$ORIGIN:$ORIGIN/../lib"
+                # so it can find the Qt libraries installed beside it. Append
+                # rather than replace: a binary that resolves llama.cpp but not
+                # Qt6Core is no more useful than one that resolves neither.
+                get_target_property(_kestrel_target_rpath
+                    ${_kestrel_rpath_target} INSTALL_RPATH)
+                if(_kestrel_target_rpath AND
+                   NOT _kestrel_target_rpath MATCHES "-NOTFOUND$")
+                    set(_kestrel_merged_rpath
+                        "${_kestrel_target_rpath}:${_kestrel_llama_rpath}")
+                else()
+                    set(_kestrel_merged_rpath
+                        "$ORIGIN:$ORIGIN/../lib:${_kestrel_llama_rpath}")
+                endif()
                 set_target_properties(${_kestrel_rpath_target} PROPERTIES
-                    INSTALL_RPATH "${_kestrel_llama_rpath}")
+                    INSTALL_RPATH "${_kestrel_merged_rpath}")
             endif()
         endforeach()
     endif()

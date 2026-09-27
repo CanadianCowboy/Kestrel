@@ -198,6 +198,30 @@ jobs:
       - name: Install into a staging prefix
         run: cmake --install build --prefix "$RUNNER_TEMP/kestrel"
 
+      # The llama.cpp path is opt-in, so nothing above exercises it and a
+      # mistake in it would ship silently. Configuring against a stub prefix is
+      # enough: which libraries get linked, and the rpath that records where
+      # they live, are both decided at configure time. Nothing is built, so a
+      # stub shared object is harmless.
+      - name: A llama.cpp prefix is discovered and linked
+        run: |
+          FAKE="$RUNNER_TEMP/llama-prefix"
+          mkdir -p "$FAKE/include" "$FAKE/lib"
+          printf 'int kestrel_stub_placeholder(void) { return 0; }\n' > placeholder.c
+          gcc -shared -fPIC -o "$FAKE/lib/libllama.so" placeholder.c
+          cmake -S . -B "$RUNNER_TEMP/build-llama" \
+            -DKESTREL_BUILD_UI=ON \
+            -DKESTREL_BUILD_TESTS=OFF \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DKESTREL_LLAMA_CPP_ROOT="$FAKE" 2>&1 | tee configure.log
+          # The exact library list is reported rather than guessed, so a prefix
+          # that stopped being picked up fails here instead of at link time on
+          # a contributor's machine.
+          grep -q "linking llama.cpp from $FAKE/lib.*libllama\.so" configure.log || {
+            echo "::error::the llama.cpp prefix was not linked"
+            exit 1
+          }
+
       - name: The install tree is complete
         run: |
           STAGE="$RUNNER_TEMP/kestrel"
