@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -29,6 +30,54 @@ void check(bool condition, const std::string& what) {
 
 std::string hexOf(const std::array<std::uint8_t, storage::Sha256::kDigestBytes>& digest) {
     return storage::toHex(digest);
+}
+
+// std::getenv reads an environment variable; C++ has no portable spelling for
+// changing one. putenv is the spelling both platforms have, and an empty value
+// is exactly the state under test: paths.cpp collapses an absent variable and
+// an empty one into the same unusable directory, so the test does not need the
+// variable to be truly removed.
+//
+// The buffer handed to putenv has to outlive the call -- putenv keeps the
+// pointer rather than copying -- so it is a member that is never touched again
+// between the putenv and the next one.
+class ScopedEnvironment {
+public:
+    explicit ScopedEnvironment(const char* name) : m_name(name) {
+        const char* value = std::getenv(name);
+        m_saved = value != nullptr ? value : "";
+        apply("");
+    }
+
+    ~ScopedEnvironment() {
+        apply(m_saved);
+    }
+
+    ScopedEnvironment(const ScopedEnvironment&) = delete;
+    ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+private:
+    void apply(const std::string& value) {
+        m_assignment = m_name + "=" + value;
+        ::putenv(m_assignment.data());
+    }
+
+    std::string m_name;
+    std::string m_saved;
+    std::string m_assignment;
+};
+
+// How many sealed blobs are sitting in the process's working directory. The
+// point of the no-home-directory test is that this number does not move.
+int countSealedBlobsHere() {
+    int found = 0;
+    std::error_code code;
+    for (const auto& entry : fs::directory_iterator(fs::current_path(), code)) {
+        if (entry.path().extension() == ".sealed") {
+            found += 1;
+        }
+    }
+    return found;
 }
 
 // A scratch directory that removes itself, so a failing assert cannot leave a
@@ -257,6 +306,52 @@ void testPlatformStore() {
           "the profile is forgotten: " + error);
 }
 
+// The data directory is named by the environment, and the environment is not
+// something Kestrel controls. A login session with no LOCALAPPDATA, or a
+// service account with no HOME, is an ordinary way to run a program, and on
+// Windows the install directory is an ordinary working directory.
+//
+// paths.h answers an unusable environment with an empty path and says callers
+// must treat that as "do not persist". This is the test that the platform store
+// actually honours that, and it is separate from testPlatformStore because that
+// one returns early when the store reports itself unavailable -- so on a machine
+// with no data directory it would skip the very thing this is about.
+void testPlatformStoreRefusesWithoutAHomeDirectory() {
+    // All three are cleared, not just the one this platform uses: on Linux an
+    // empty XDG_DATA_HOME falls back to HOME, so clearing one is not enough.
+    ScopedEnvironment localAppData("LOCALAPPDATA");
+    ScopedEnvironment xdgDataHome("XDG_DATA_HOME");
+    ScopedEnvironment home("HOME");
+
+    check(storage::userDataDirectory().empty(),
+          "an environment with no home directory has no data directory");
+    check(storage::sealedBlobDirectory().empty(),
+          "and therefore no place to keep a sealed profile");
+
+    auto store = storage::makePlatformSecretStore();
+    const std::vector<std::uint8_t> secret{'n', 'o', 't', ' ', 'h', 'e', 'r', 'e'};
+    const std::string account = "storage-tests-no-home";
+    std::string error;
+
+    const int sealedBefore = countSealedBlobsHere();
+    check(!store->seal(account, storage::kProfileService, secret, error),
+          "the store refuses to seal with nowhere to put the blob");
+    check(!error.empty(), "and says why");
+    // Checked here, immediately after the write that would cause it, rather
+    // than at the end of the test: an unguarded forget would otherwise tidy up
+    // the evidence and the check would agree with a store that did leak.
+    check(countSealedBlobsHere() == sealedBefore,
+          "nothing was written into the working directory");
+
+    check(!store->sealed(account, storage::kProfileService, error).has_value(),
+          "the store does not claim a profile it cannot read");
+    check(!store->forget(account, storage::kProfileService, error),
+          "the store does not claim to have forgotten something it never stored");
+    check(!error.empty(), "and says why that is not a success");
+    check(countSealedBlobsHere() == sealedBefore,
+          "and the working directory is still clean afterwards");
+}
+
 } // namespace
 
 int main() {
@@ -265,6 +360,7 @@ int main() {
     testAtomicWriteReplacesAndLeavesNoScratch();
     testInMemoryStoreContract();
     testPlatformStore();
+    testPlatformStoreRefusesWithoutAHomeDirectory();
 
     if (g_failures == 0) {
         std::cout << "storage tests passed\n";

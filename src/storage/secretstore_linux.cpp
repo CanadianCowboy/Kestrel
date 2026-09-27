@@ -42,25 +42,35 @@ std::string shellQuote(const std::string& value) {
     return quoted;
 }
 
-// secret-tool prints the secret to stdout, so the output has to be collected
-// separately from the input.
-bool runCapturing(const std::string& command, std::string& output, std::string& error) {
-    std::FILE* pipe = ::popen(command.c_str(), "r");
+// Runs a secret-tool command, collects everything it said with standard error
+// folded in, and returns its exit status.
+//
+// The fold is what makes the result readable at all. libsecret uses exit 1 for
+// two entirely different things: in secret_tool_action_lookup a miss returns 1
+// having printed nothing, while a real failure returns 1 after printing the
+// GError message. Nothing in the status alone tells them apart, and the
+// difference is the difference between a first run and a keyring that will not
+// open.
+int runCapturing(const std::string& command, std::string& output) {
+    const std::string withDiagnostics = command + " 2>&1";
+    std::FILE* pipe = ::popen(withDiagnostics.c_str(), "r");
     if (pipe == nullptr) {
-        error = "could not run " + command;
-        return false;
+        return -1;
     }
     std::array<char, 512> chunk{};
     output.clear();
     while (std::fgets(chunk.data(), static_cast<int>(chunk.size()), pipe) != nullptr) {
         output.append(chunk.data());
     }
-    const int status = ::pclose(pipe);
-    if (status != 0) {
-        error = "the keyring command failed: " + command;
-        return false;
+    return ::pclose(pipe);
+}
+
+std::string trimmed(const std::string& text) {
+    std::string result = text;
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
     }
-    return true;
+    return result;
 }
 
 std::string toHex(const std::vector<std::uint8_t>& bytes) {
@@ -122,6 +132,9 @@ bool sealViaTool(std::string_view account, std::string_view service,
         error = "could not run secret-tool";
         return false;
     }
+    // Hex, and hex only: libsecret refuses to store a secret that is not valid
+    // UTF-8, and it reads standard input to end of file, so the newline below
+    // is stored with the digits and stripped again on the way back.
     const std::string hex = toHex(blob);
     std::fwrite(hex.data(), 1, hex.size(), pipe);
     std::fputc('\n', pipe);
@@ -138,17 +151,26 @@ std::optional<std::vector<std::uint8_t>> readViaTool(std::string_view account,
     const std::string command = "secret-tool lookup service " + shellQuote(std::string(service)) +
                                 " account " + shellQuote(std::string(account));
     std::string output;
-    if (!runCapturing(command, output, error)) {
+    const int status = runCapturing(command, output);
+    if (status < 0) {
+        error = "could not run secret-tool to read the profile";
         return std::nullopt;
     }
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-        output.pop_back();
-    }
-    if (output.empty()) {
-        // Nothing stored is a first run, not a failure.
+    const std::string said = trimmed(output);
+    if (status != 0) {
+        if (said.empty()) {
+            // libsecret's documented result for a miss: exit 1 and silence.
+            // Nothing stored is a first run, not a failure.
+            return std::nullopt;
+        }
+        // Whatever it did say is the reason, and the user is going to need it.
+        error = "the keyring would not release the profile: " + said;
         return std::nullopt;
     }
-    auto bytes = fromHex(output);
+    if (said.empty()) {
+        return std::nullopt;
+    }
+    auto bytes = fromHex(said);
     if (!bytes.has_value()) {
         error = "the keyring returned something that is not a sealed profile";
         return std::nullopt;
@@ -156,13 +178,22 @@ std::optional<std::vector<std::uint8_t>> readViaTool(std::string_view account,
     return bytes;
 }
 
-void forgetViaTool(std::string_view account, std::string_view service) {
+bool forgetViaTool(std::string_view account, std::string_view service, std::string& error) {
     const std::string command = "secret-tool clear service " + shellQuote(std::string(service)) +
                                 " account " + shellQuote(std::string(account));
-    std::string ignored;
-    // secret-tool exits non-zero when there was nothing to clear, which is the
-    // state the caller asked for, so the result is not inspected.
-    runCapturing(command, ignored, ignored);
+    std::string output;
+    const int status = runCapturing(command, output);
+    if (status == 0) {
+        // Which includes there being nothing to clear: libsecret's clearv
+        // succeeds on a miss, so this is the state the caller asked for.
+        return true;
+    }
+    // Reporting "forgotten" when the keyring refused would be the one lie this
+    // store must not tell, because the profile is still in the keyring.
+    const std::string said = trimmed(output);
+    error = "the keyring would not forget the profile: " +
+            (said.empty() ? std::string("the command failed") : said);
+    return false;
 }
 
 class LinuxSecretStore final : public SecretStore {
@@ -186,7 +217,10 @@ public:
             unavailableReason = "the keyring did not accept a test value: " + error;
             return false;
         }
-        forgetViaTool("probe", "com.kestrel.probe");
+        // The probe is thrown away either way; a keyring that will not release
+        // it was already reported above.
+        std::string ignored;
+        forgetViaTool("probe", "com.kestrel.probe", ignored);
         return true;
     }
 
@@ -201,9 +235,8 @@ public:
         return readViaTool(account, service, error);
     }
 
-    bool forget(std::string_view account, std::string_view service, std::string&) override {
-        forgetViaTool(account, service);
-        return true;
+    bool forget(std::string_view account, std::string_view service, std::string& error) override {
+        return forgetViaTool(account, service, error);
     }
 };
 

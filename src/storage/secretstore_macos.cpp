@@ -41,11 +41,15 @@ CFStringRef copyString(std::string_view text) {
                                    static_cast<CFIndex>(text.size()), kCFStringEncodingUTF8, false);
 }
 
-// The keychain is searched by an opaque label rather than by the account name.
-// A label is something a user can read in Keychain Access, and putting a
-// conversation-derived name in it would leak the name into a field every tool
-// on the machine can enumerate.
-CFStringRef labelFor(std::string_view service, std::string_view account) {
+// A generic-password item is identified by exactly three things: its class, its
+// service and its account. Nothing else takes part, so the account is where the
+// per-profile separation has to live.
+//
+// It cannot be the account name itself. Keychain Access is a window every tool
+// on the machine can open, and anything in kSecAttrAccount is a line of text in
+// it, so a conversation-derived name would sit there in plain sight. The digest
+// separates just as well and reads as nothing.
+CFStringRef accountKeyFor(std::string_view service, std::string_view account) {
     std::string composed(service);
     composed.push_back('\n');
     composed.append(account);
@@ -60,8 +64,23 @@ CFStringRef labelFor(std::string_view service, std::string_view account) {
     return copyString(hex);
 }
 
+CFMutableDictionaryRef makeDictionary() {
+    return CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+                                     &kCFTypeDictionaryValueCallBacks);
+}
+
 void put(CFMutableDictionaryRef dictionary, CFStringRef key, CFTypeRef value) {
     CFDictionarySetValue(dictionary, key, value);
+}
+
+// The search keys, and only the search keys. A keychain query that also carries
+// the new values is not the same thing as one that does not: the values are
+// what a replace changes, and mixing them into the query is how an update ends
+// up matching nothing.
+void putSearchKeys(CFMutableDictionaryRef dictionary, CFStringRef service, CFStringRef account) {
+    put(dictionary, kSecClass, kSecClassGenericPassword);
+    put(dictionary, kSecAttrService, service);
+    put(dictionary, kSecAttrAccount, account);
 }
 
 // The three operations below are free functions rather than members for a
@@ -73,46 +92,49 @@ void put(CFMutableDictionaryRef dictionary, CFStringRef key, CFTypeRef value) {
 bool sealInKeychain(std::string_view account, std::string_view service,
                     const std::vector<std::uint8_t>& blob, std::string& error) {
     CFStringRef serviceRef = copyString(service);
-    CFStringRef label = labelFor(service, account);
-    CFStringRef accessible = CFStringCreateWithCString(kCFAllocatorDefault,
-                                                       "kSecAttrAccessibleAfterFirstUnlock",
-                                                       kCFStringEncodingUTF8);
-    // The default accessibility class would show a prompt every time the
-    // assistant starts. This one is readable once the user has logged in,
-    // which is the only time Kestrel runs.
+    CFStringRef accountRef = accountKeyFor(service, account);
+    CFStringRef label = copyString("Kestrel profile");
+    // The framework's constant, not a string spelling of its name. The value of
+    // kSecAttrAccessibleAfterFirstUnlock is a short opaque tag; the identifier
+    // text would be rejected as an accessibility class or ignored. The default
+    // class would also prompt every time the assistant starts, and this one is
+    // readable once the user has logged in, which is the only time Kestrel runs.
+    CFStringRef accessible = kSecAttrAccessibleAfterFirstUnlock;
     CFDataRef data = CFDataCreate(kCFAllocatorDefault, blob.data(),
                                   static_cast<CFIndex>(blob.size()));
-    CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                                             &kCFTypeDictionaryKeyCallBacks,
-                                                             &kCFTypeDictionaryValueCallBacks);
-    put(query, kSecClass, kSecClassGenericPassword);
-    put(query, kSecAttrService, serviceRef);
-    put(query, kSecAttrLabel, label);
-    put(query, kSecAttrAccessible, accessible);
-    put(query, kSecValueData, data);
 
-    // Update-or-add. Adding alone fails with errSecDuplicateItem on every save
-    // after the first, which would mean a profile that can only ever be written
-    // once.
-    //
-    // Apple's documentation for SecItemUpdate specifies NULL for
-    // attributesToUpdate to mean "every attribute named in the query", which is
-    // exactly what a replace needs, and the SDK header marks that parameter
-    // nonnull regardless. The warning is about the annotation, not the call.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnonnull"
-    const OSStatus updated = SecItemUpdate(query, nullptr);
-    OSStatus status = updated;
-    if (updated == errSecItemNotFound) {
-        status = SecItemAdd(query, nullptr);
+    CFMutableDictionaryRef search = makeDictionary();
+    putSearchKeys(search, serviceRef, accountRef);
+
+    CFMutableDictionaryRef attributes = makeDictionary();
+    put(attributes, kSecAttrLabel, label);
+    put(attributes, kSecAttrAccessible, accessible);
+    put(attributes, kSecValueData, data);
+
+    // Update-or-add, and the add branch has to be reachable: an item that is
+    // only ever added fails with errSecDuplicateItem on the second save, which
+    // would mean a profile that can be written once and never again.
+    OSStatus status = SecItemUpdate(search, attributes);
+    if (status == errSecItemNotFound) {
+        // An add needs the search keys and the new values in one dictionary,
+        // because that is the only shape SecItemAdd accepts.
+        CFMutableDictionaryRef fresh = makeDictionary();
+        putSearchKeys(fresh, serviceRef, accountRef);
+        put(fresh, kSecAttrLabel, label);
+        put(fresh, kSecAttrAccessible, accessible);
+        put(fresh, kSecValueData, data);
+        status = SecItemAdd(fresh, nullptr);
+        CFRelease(fresh);
     }
-#pragma clang diagnostic pop
 
-    CFRelease(query);
+    CFRelease(search);
+    CFRelease(attributes);
+    // data, label, serviceRef and accountRef are ours to release. `accessible`
+    // is a framework constant, and releasing it would be a bug of its own.
     CFRelease(data);
-    CFRelease(accessible);
     CFRelease(label);
     CFRelease(serviceRef);
+    CFRelease(accountRef);
 
     if (status != errSecSuccess) {
         error = "the keychain would not store the profile: " + statusText(status);
@@ -125,13 +147,9 @@ std::optional<std::vector<std::uint8_t>> readFromKeychain(std::string_view accou
                                                           std::string_view service,
                                                           std::string& error) {
     CFStringRef serviceRef = copyString(service);
-    CFStringRef label = labelFor(service, account);
-    CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                                             &kCFTypeDictionaryKeyCallBacks,
-                                                             &kCFTypeDictionaryValueCallBacks);
-    put(query, kSecClass, kSecClassGenericPassword);
-    put(query, kSecAttrService, serviceRef);
-    put(query, kSecAttrLabel, label);
+    CFStringRef accountRef = accountKeyFor(service, account);
+    CFMutableDictionaryRef query = makeDictionary();
+    putSearchKeys(query, serviceRef, accountRef);
     put(query, kSecReturnData, kCFBooleanTrue);
     put(query, kSecMatchLimit, kSecMatchLimitOne);
 
@@ -139,8 +157,8 @@ std::optional<std::vector<std::uint8_t>> readFromKeychain(std::string_view accou
     const OSStatus status = SecItemCopyMatching(query, &found);
 
     CFRelease(query);
-    CFRelease(label);
     CFRelease(serviceRef);
+    CFRelease(accountRef);
 
     if (status == errSecItemNotFound) {
         // Nothing stored is a first run, not a failure.
@@ -160,25 +178,24 @@ std::optional<std::vector<std::uint8_t>> readFromKeychain(std::string_view accou
     return bytes;
 }
 
-void forgetFromKeychain(std::string_view account, std::string_view service, std::string& error) {
+bool forgetFromKeychain(std::string_view account, std::string_view service, std::string& error) {
     CFStringRef serviceRef = copyString(service);
-    CFStringRef label = labelFor(service, account);
-    CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                                             &kCFTypeDictionaryKeyCallBacks,
-                                                             &kCFTypeDictionaryValueCallBacks);
-    put(query, kSecClass, kSecClassGenericPassword);
-    put(query, kSecAttrService, serviceRef);
-    put(query, kSecAttrLabel, label);
+    CFStringRef accountRef = accountKeyFor(service, account);
+    CFMutableDictionaryRef query = makeDictionary();
+    putSearchKeys(query, serviceRef, accountRef);
     const OSStatus status = SecItemDelete(query);
     CFRelease(query);
-    CFRelease(label);
     CFRelease(serviceRef);
+    CFRelease(accountRef);
 
     if (status == errSecSuccess || status == errSecItemNotFound) {
         // Deleting what was not there is the state the caller asked for.
-        return;
+        return true;
     }
+    // Anything else means the profile is still in the keychain, and saying
+    // otherwise is the one thing this store must not do.
     error = "the keychain would not forget the profile: " + statusText(status);
+    return false;
 }
 
 class MacSecretStore final : public SecretStore {
@@ -195,7 +212,10 @@ public:
             unavailableReason = "the keychain did not accept a test value: " + error;
             return false;
         }
-        forgetFromKeychain("probe", "com.kestrel.probe", error);
+        // The probe is thrown away either way; a keychain that will not release
+        // it was already reported above.
+        std::string ignored;
+        forgetFromKeychain("probe", "com.kestrel.probe", ignored);
         return true;
     }
 
@@ -211,8 +231,7 @@ public:
     }
 
     bool forget(std::string_view account, std::string_view service, std::string& error) override {
-        forgetFromKeychain(account, service, error);
-        return error.empty();
+        return forgetFromKeychain(account, service, error);
     }
 };
 

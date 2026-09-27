@@ -82,6 +82,23 @@ std::filesystem::path blobPath(std::string_view service, std::string_view accoun
     return sealedBlobDirectory() / (name + ".sealed");
 }
 
+// Whether there is anywhere to put a blob at all.
+//
+// paths.h defines an empty directory as "do not persist", and an empty
+// directory here would make blobPath resolve to a bare relative filename. The
+// profile would then be written into whatever directory the process happened to
+// be started in -- which on Windows is often the install directory, and is
+// never where the user would look for it, or be able to delete it. Every entry
+// point has to ask, not just available(): a caller that has already decided to
+// save is exactly the caller that will not check first.
+bool haveBlobDirectory(std::string& error) {
+    if (sealedBlobDirectory().empty()) {
+        error = "LOCALAPPDATA is not set, so there is nowhere to keep a sealed profile.";
+        return false;
+    }
+    return true;
+}
+
 class WindowsSecretStore final : public SecretStore {
 public:
     std::string description() const override {
@@ -106,12 +123,15 @@ public:
             unavailableReason = error;
             return false;
         }
-        removeBlob("com.kestrel.probe", "probe");
+        removeBlob("com.kestrel.probe", "probe", error);
         return true;
     }
 
     bool seal(std::string_view account, std::string_view service,
               const std::vector<std::uint8_t>& blob, std::string& error) override {
+        if (!haveBlobDirectory(error)) {
+            return false;
+        }
         std::vector<std::uint8_t> sealedBytes;
         if (!cryptProtect(blob, sealedBytes, error)) {
             return false;
@@ -125,6 +145,9 @@ public:
     std::optional<std::vector<std::uint8_t>> sealed(std::string_view account,
                                                     std::string_view service,
                                                     std::string& error) override {
+        if (!haveBlobDirectory(error)) {
+            return std::nullopt;
+        }
         std::vector<std::uint8_t> sealedBytes;
         if (!readWholeFile(blobPath(service, account), sealedBytes, error)) {
             return std::nullopt;
@@ -136,17 +159,32 @@ public:
         return cryptUnprotect(sealedBytes, error);
     }
 
-    bool forget(std::string_view account, std::string_view service, std::string&) override {
-        removeBlob(service, account);
-        return true;
+    bool forget(std::string_view account, std::string_view service, std::string& error) override {
+        if (!haveBlobDirectory(error)) {
+            return false;
+        }
+        return removeBlob(service, account, error);
     }
 
 private:
-    // Removing something that was never there is the state the caller asked
-    // for, not a failure, so nothing here inspects the removal's result.
-    static void removeBlob(std::string_view service, std::string_view account) {
+    // A removal that fails is a removal that did not happen, and the caller is
+    // about to tell a user that Kestrel has forgotten them. The only status that
+    // counts as success is one where the file is gone, or was never there.
+    static bool removeBlob(std::string_view service, std::string_view account, std::string& error) {
+        const std::filesystem::path path = blobPath(service, account);
         std::error_code code;
-        std::filesystem::remove(blobPath(service, account), code);
+        const bool removed = std::filesystem::remove(path, code);
+        if (removed) {
+            return true;
+        }
+        if (std::error_code exists;
+            !std::filesystem::exists(path, exists) && !exists) {
+            // Never there is the state the caller asked for.
+            return true;
+        }
+        error = "could not remove " + path.string() + ": " +
+                (code ? code.message() : std::string("the file is still there"));
+        return false;
     }
 
     static bool cryptProtect(const std::vector<std::uint8_t>& plain,
