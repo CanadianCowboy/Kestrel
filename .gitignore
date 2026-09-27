@@ -53,3 +53,8 @@ Thumbs.db
 
 # Freebuff agent worktrees
 .freebuff/
+
+# Generated audio comparisons. These are rendered from a downloaded speech
+# model, so they are an artefact of running the voice locally rather than
+# something the repository should carry.
+voice-samples/
