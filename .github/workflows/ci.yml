@@ -192,9 +192,14 @@ jobs:
           # directory, so a wrong path now fails loudly instead.
           EXE=""
           for candidate in \
+            "$PWD/build/kestrel.app/Contents/MacOS/kestrel" \
             "$PWD/build/Release/kestrel.exe" \
             "$PWD/build/kestrel.exe" \
             "$PWD/build/kestrel"; do
+            # A bundle on macOS, a plain executable on Windows and Linux. The
+            # bundle path is not a guess: MACOSX_BUNDLE puts the binary at
+            # .app/Contents/MacOS/, and -f matches the binary inside it, so the
+            # guard that rejects a directory still holds.
             if [ -f "$candidate" ]; then
               EXE="$candidate"
               break

@@ -216,7 +216,26 @@ if(KESTREL_BUILD_UI)
     if(Qt6_FOUND)
         qt_standard_project_setup(REQUIRES 6.6)
 
-        qt_add_executable(kestrel
+        # MACOSX_BUNDLE, which qt_add_executable does not turn on by itself --
+        # WIN32 and MACOSX_BUNDLE are both opt-in arguments there, and without
+        # them the command is a plain add_executable.
+        #
+        # A macOS application has to be a bundle. Not for tidiness: a GUI
+        # process that is not a bundle has no Info.plist, so it has no bundle
+        # identifier for the window server to associate a Dock icon with, and
+        # it cannot carry the metadata macOS expects of an app.
+        #
+        # It also does not build at all without this. Qt puts the generated
+        # QML module for a target in a directory named after that target, so
+        # with no bundle the link step tries to write a file named kestrel
+        # where a directory named kestrel already is, and ld fails with
+        # "open() failed, errno=21 (Is a directory) for 'kestrel'". Putting the
+        # executable inside kestrel.app/Contents/MacOS puts it somewhere the
+        # generated module never goes.
+        #
+        # Ignored on Windows and Linux, so this line changes nothing for the
+        # other two desktop jobs.
+        qt_add_executable(kestrel MACOSX_BUNDLE
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
