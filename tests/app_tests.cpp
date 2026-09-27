@@ -10,6 +10,7 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QObject>
+#include <QRegularExpression>
 #include <QStringList>
 #include <QThread>
 #include <QTemporaryFile>
@@ -25,6 +26,7 @@
 #include "app/appcontroller.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
+#include "app/speechsynthesizer.h"
 #include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
 
@@ -123,6 +125,68 @@ signals:
     void finishedSignal();
 };
 
+// A speech backend with no audio behind it.
+//
+// The playback pump -- cue first, then one clause at a time, cursor advancing
+// only once a clause has actually been spoken, response complete when the last
+// one lands -- is the part worth testing, and it is platform-independent. This
+// records what would have been spoken and lets the test decide when each
+// utterance ends, so the whole path is exercised on a machine with no voice.
+class FakeSpeechBackend final : public kestrel::app::SpeechBackend {
+public:
+    [[nodiscard]] bool usable() const override { return true; }
+    [[nodiscard]] QString description() const override { return QStringLiteral("fake voice"); }
+
+    void applyVoice(const kestrel::core::VoicePersona&) override { ++voiceApplications; }
+
+    void speak(const QString& text) override {
+        spoken.append(text);
+        m_speaking = true;
+        if (m_autoFinish) {
+            // A real engine reports the end of an utterance from the audio
+            // stack some time later. Queuing the report keeps the pump's
+            // ordering honest while still running the loop, which is what
+            // makes a test that speaks through to completion deterministic on
+            // a machine that has a voice installed. The report is queued
+            // rather than raised here because speak() is called from inside the
+            // pump, and a callback that re-enters it would be a real defect
+            // rather than something a test should pretend does not exist.
+            QTimer::singleShot(0, m_context, [this] { finishUtterance(); });
+        }
+    }
+
+    // Tests about anything other than speech want a turn that finishes when the
+    // text does. Without this they inherit whatever the host machine's voice
+    // does, and pass or fail depending on whether audio is installed.
+    void setAutoFinish(bool value) { m_autoFinish = value; }
+
+    // A plain class cannot be a QTimer context, so the owner lends one. The
+    // queued report is dropped if the owner dies first.
+    void setTimerContext(QObject* context) { m_context = context; }
+
+    void stop() override { ++boundaryStops; }
+
+    void stopImmediately() override { ++immediateStops; }
+
+    [[nodiscard]] bool speakingNow() const override { return m_speaking; }
+
+    // Simulates the engine reaching the end of an utterance.
+    void finishUtterance() {
+        m_speaking = false;
+        reportFinished();
+    }
+
+    QStringList spoken;
+    int voiceApplications = 0;
+    int boundaryStops = 0;
+    int immediateStops = 0;
+
+private:
+    bool m_speaking = false;
+    bool m_autoFinish = false;
+    QObject* m_context = nullptr;
+};
+
 int failures = 0;
 
 void check(bool condition, const char* what) {
@@ -132,6 +196,39 @@ void check(bool condition, const char* what) {
         std::cout << "  FAIL " << what << "\n";
         ++failures;
     }
+}
+
+// Gives a controller a voice that speaks without an audio device, so a test
+// about presence, prompts, or the transcript reaches the same end state whether
+// or not the machine running it has text-to-speech installed. The speech tests
+// drive FakeSpeechBackend themselves and must not call this.
+void useSilentVoice(kestrel::app::AppController& controller) {
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    speech->setAutoFinish(true);
+    speech->setTimerContext(&controller);
+    controller.setSpeechBackendForTesting(std::move(speech));
+}
+
+// A turn is over when the words are done *and* the voice has stopped, which are
+// two different moments once text-to-speech is installed.
+//
+// The wait polls rather than driving off a signal on purpose. The controller
+// raises metricsChanged while it is still deciding what happens next, so the
+// moment the last token arrives is also the moment generation has ended and
+// playback has not yet begun. A signal-driven wait can observe that gap, decide
+// the turn is finished, and walk away in the middle of a sentence.
+void runTurnToCompletion(kestrel::app::AppController& controller) {
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(5);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        if (!controller.generating() && !controller.speaking()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    poll.start();
+    loop.exec();
 }
 
 // Runs the event loop until `collector` finishes or `timeoutMs` elapses.
@@ -462,6 +559,7 @@ void testPresenceAndIdleLoopProject() {
           "the one idle task that reaches past the process is off until asked for");
     check(!controller.showIdleThoughts(), "private thoughts are not revealed by default");
     check(controller.ambientThought().isEmpty(), "nothing has been thought yet");
+    check(controller.idleTaskLabel().isEmpty(), "no idle task has run yet");
 
     int presenceSignals = 0;
     QObject::connect(&controller, &kestrel::app::AppController::presenceChanged,
@@ -470,6 +568,7 @@ void testPresenceAndIdleLoopProject() {
     // Switched off for the rest of the test: the tick timer runs on its own
     // schedule, and a test that raced it would fail on a slow machine rather
     // than on a real defect.
+    useSilentVoice(controller);
     controller.setIdleLoopEnabled(false);
     check(!controller.idleLoopEnabled(), "the loop can be switched off");
     check(controller.ambientThought().isEmpty(), "switching it off clears its output");
@@ -492,14 +591,7 @@ void testPresenceAndIdleLoopProject() {
     check(controller.sessionTopic().contains(QStringLiteral("tensorrt")),
           "the session keeps what the conversation is about");
 
-    QEventLoop loop;
-    QObject::connect(&controller, &kestrel::app::AppController::metricsChanged, &loop, [&] {
-        if (!controller.generating()) {
-            loop.quit();
-        }
-    });
-    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
-    loop.exec();
+    runTurnToCompletion(controller);
 
     check(!controller.generating(), "the turn finished");
     check(controller.acknowledgement().isEmpty(), "the cue is cleared once the answer is underway");
@@ -518,21 +610,281 @@ void testLongAnswerIsOfferedToContinue() {
     // truncated, which is the condition for the offer to be made at all.
     auto backend = std::make_unique<SlowBackend>(200, 0);
     controller.setBackendForTesting(std::move(backend));
+    useSilentVoice(controller);
     controller.setIdleLoopEnabled(false);
 
     controller.sendMessage(QStringLiteral("Explain tensorrt"));
-    QEventLoop loop;
-    QObject::connect(&controller, &kestrel::app::AppController::metricsChanged, &loop, [&] {
-        if (!controller.generating()) {
-            loop.quit();
-        }
-    });
-    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
-    loop.exec();
+    runTurnToCompletion(controller);
 
     check(!controller.generating(), "the long turn finished");
     check(controller.statusWhisper().startsWith(QStringLiteral("Would you like me to continue")),
           "a long answer is offered to continue rather than left hanging");
+}
+
+// The whole point of speaking clause by clause: the cue lands first, the answer
+// follows in order, and the response is only delivered once the audio is.
+// The regression this file exists to keep: a turn must not be declared
+// delivered until the last clause has actually been spoken.
+//
+// The pump starts the moment a request is accepted, so the acknowledgement cue
+// can be heard while the model is still working. That means the pump runs a
+// second time, very early, when there is no answer text to speak yet. An empty
+// result there means "nothing more to say right now", not "the response is
+// over" -- and treating it as the second truncates the reply at whatever the
+// first few tokens happened to be, and skips the follow-up line entirely.
+void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
+    std::cout << "a turn is not delivered before the last clause is spoken\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    // Slow enough that the cue finishes while generation is still in flight,
+    // which is the only window in which this bug is reachable.
+    auto backend = std::make_unique<SlowBackend>(60, 25);
+    controller.setBackendForTesting(std::move(backend));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("Explain the plan for tensorrt"));
+    QEventLoop settle;
+    QTimer::singleShot(300, &settle, &QEventLoop::quit);
+    settle.exec();
+
+    check(!observed->spoken.isEmpty(), "the cue reached the engine");
+    check(controller.generating(), "the model is still working when the cue ends");
+    check(controller.speaking(), "the turn is still in the speaker's mouth");
+
+    // The cue is finished. There is no answer text yet, and the pump must
+    // simply wait rather than conclude that the response has been delivered.
+    observed->finishUtterance();
+    QEventLoop afterCue;
+    QTimer::singleShot(150, &afterCue, &QEventLoop::quit);
+    afterCue.exec();
+
+    check(controller.generating(), "the model is still working after the cue");
+    check(controller.speaking(), "the response is not delivered before it is spoken");
+    check(!controller.statusWhisper().startsWith(QStringLiteral("Would you like me to continue")),
+          "no follow-up is offered for a response that has not been given");
+
+    // Drive the rest of the pump, then confirm the whole reply was spoken rather
+    // than only the part that happened to exist when the cue ended.
+    for (int i = 0; i < 600 && controller.speaking(); ++i) {
+        if (!observed->speakingNow()) {
+            QEventLoop wait;
+            QTimer::singleShot(10, &wait, &QEventLoop::quit);
+            wait.exec();
+            continue;
+        }
+        observed->finishUtterance();
+    }
+    QEventLoop last;
+    QTimer::singleShot(300, &last, &QEventLoop::quit);
+    last.exec();
+
+    const auto withoutSpace = [](QString text) {
+        text.remove(QRegularExpression(QStringLiteral("\\s+")));
+        return text;
+    };
+    QString spokenAnswer;
+    for (int i = 1; i < observed->spoken.size(); ++i) {
+        spokenAnswer += observed->spoken.at(i);
+    }
+    const QString delivered = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::ContentRole).toString();
+    if (withoutSpace(spokenAnswer) != withoutSpace(delivered)) {
+        std::cout << "       spoke " << observed->spoken.size() << " utterances, "
+                  << spokenAnswer.size() << " chars of a " << delivered.size()
+                  << " char reply\n";
+    }
+    check(withoutSpace(spokenAnswer) == withoutSpace(delivered),
+          "the whole reply is spoken, not only the text that existed early");
+    check(!controller.speaking(), "the turn ends when the last clause is spoken");
+}
+
+void testSpokenResponseFollowsClauseOrder() {
+    std::cout << "a spoken response is delivered clause by clause\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    check(controller.ttsAvailable(), "the adopted backend reports itself available");
+    check(controller.speaking() == false, "nothing is speaking before a request");
+
+    controller.sendMessage(QStringLiteral("Hello there"));
+    // The cue is spoken immediately and the first real clause waits out the
+    // pause the persona asked for, so let the event loop turn rather than
+    // assuming an instant transition.
+    QEventLoop settle;
+    QTimer::singleShot(600, &settle, &QEventLoop::quit);
+    settle.exec();
+
+    check(controller.ttsAvailable(), "audio is still available after the request");
+    check(!observed->spoken.isEmpty(), "something was spoken");
+    check(observed->voiceApplications > 0, "the voice persona was applied to the engine");
+
+    // The first utterance is the acknowledgement, not the answer: that is what
+    // makes a request sound accepted before it sounds answered.
+    check(observed->spoken.first() == controller.acknowledgement()
+              || observed->spoken.first().endsWith(QLatin1Char('.')),
+          "the first utterance is the acknowledgement cue");
+    check(controller.speaking(), "the controller reports speech in progress");
+
+    // Drive the pump to the end: every clause finishes, one at a time.
+    //
+    // A clause is only reported finished once the engine has actually been
+    // handed it. Finishing one that is still waiting out its leading pause
+    // would advance the controller's cursor for a clause nobody heard, and the
+    // response would appear to complete while most of it went unsaid -- which
+    // is exactly the failure this test exists to catch.
+    for (int i = 0; i < 400 && controller.speaking(); ++i) {
+        if (!observed->speakingNow()) {
+            QEventLoop wait;
+            QTimer::singleShot(20, &wait, &QEventLoop::quit);
+            wait.exec();
+            continue;
+        }
+        observed->finishUtterance();
+    }
+    // One more pump step: the final finish schedules the completion through a
+    // queued call, so the event loop has to turn once more.
+    QEventLoop last;
+    QTimer::singleShot(200, &last, &QEventLoop::quit);
+    last.exec();
+
+    check(!controller.speaking(), "playback ends when the last clause is spoken");
+    check(!controller.generating(), "generation finished before playback did");
+    const auto status = controller.messages()->data(controller.messages()->index(1, 0),
+                                                    kestrel::app::MessageModel::StatusRole).toString();
+    check(status == kestrel::app::toStatusString(kestrel::app::MessageStatus::Complete),
+          "the response is complete once it has been spoken");
+
+    // Everything after the cue is the answer, in order and in full. Whitespace
+    // between clauses is deliberately not spoken -- it is the pause -- so both
+    // sides are compared with spacing removed.
+    const auto withoutSpace = [](QString text) {
+        text.remove(QRegularExpression(QStringLiteral("\\s+")));
+        return text;
+    };
+    QString spokenAnswer;
+    for (int i = 1; i < observed->spoken.size(); ++i) {
+        spokenAnswer += observed->spoken.at(i);
+    }
+    const QString delivered = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::ContentRole).toString();
+    check(!spokenAnswer.isEmpty(), "the answer was spoken, not only the cue");
+    const bool complete = withoutSpace(spokenAnswer) == withoutSpace(delivered);
+    if (!complete) {
+        std::cout << "       spoke " << observed->spoken.size() << " utterances, "
+                  << spokenAnswer.size() << " chars of a " << delivered.size()
+                  << " char reply\n";
+    }
+    check(complete, "every generated word was spoken, in order, and nothing else");
+}
+
+// A user who starts typing mid-answer must cut the audio off at a clause
+// boundary rather than mid-word, and the new turn must take over cleanly.
+void testBargeInStopsAudioAtAClauseBoundary() {
+    std::cout << "barge-in stops audio at a clause boundary\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    // Slow enough that the turn is still running when the second message lands.
+    auto backend = std::make_unique<SlowBackend>(400, 1);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    FakeSpeechBackend* observed = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+
+    controller.sendMessage(QStringLiteral("first question"));
+    QEventLoop settle;
+    QTimer::singleShot(400, &settle, &QEventLoop::quit);
+    settle.exec();
+    check(controller.speaking(), "the first answer is being spoken");
+
+    controller.sendMessage(QStringLiteral("actually, second question"));
+    check(observed->boundaryStops == 1, "a barge-in asks for a boundary stop");
+    check(observed->immediateStops == 0, "a barge-in does not cut the clause in flight");
+    check(observed->spoken.size() >= 2, "the cue and at least part of the answer were spoken");
+
+    // The abandoned response is replaced, not resumed: the spoken text is kept
+    // for the record and the new turn owns the timeline.
+    const bool stopped = controller.voiceState() == QLatin1String("interrupted")
+                      || controller.voiceState() == QLatin1String("cancelled")
+                      || controller.voiceState() == QLatin1String("generating")
+                      || controller.voiceState() == QLatin1String("speaking")
+                      || controller.voiceState() == QLatin1String("queued");
+    check(stopped, "the interrupted response moves out of the speaking state");
+    controller.stopGeneration();
+}
+
+// The whole claim about speech input: a recognized phrase is a typed phrase
+// that happened to arrive by ear. Everything downstream -- the transcript row,
+// the acknowledgement, the barge-in, the presence projection -- must be identical
+// because it is literally the same code path.
+void testSpokenPhraseTakesTheTypedPath() {
+    std::cout << "a spoken phrase is submitted as if it were typed\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto backend = std::make_unique<SlowBackend>(200, 1);
+    controller.setBackendForTesting(std::move(backend));
+
+    check(controller.sttAvailable(), "a recognizer is available");
+    check(controller.listening() == false, "not listening before asked");
+    check(controller.startListening(), "listening starts");
+    check(controller.listening(), "the controller reports listening");
+    check(controller.partialTranscript().isEmpty(), "nothing heard yet");
+
+    // Drive the preview recognizer until it produces a complete phrase. Partial
+    // text is expected along the way: it is what tells the user the microphone
+    // is live.
+    bool sawPartial = false;
+    for (int i = 0; i < 100 && controller.listening(); ++i) {
+        QEventLoop step;
+        QTimer::singleShot(30, &step, &QEventLoop::quit);
+        step.exec();
+        if (!controller.partialTranscript().isEmpty()) {
+            sawPartial = true;
+        }
+    }
+    check(sawPartial, "partial words appear while the user is still speaking");
+    check(!controller.listening(), "listening ends when the phrase completes");
+    check(controller.generating(), "the recognized phrase started a turn");
+    check(controller.messages()->rowCount() == 2,
+          "the transcript holds the spoken request and its reply");
+    check(controller.messages()->data(controller.messages()->index(0, 0),
+                                      kestrel::app::MessageModel::ContentRole)
+              .toString().contains(QStringLiteral("tensorrt"), Qt::CaseInsensitive),
+          "the spoken words are in the transcript as a user message");
+    check(!controller.acknowledgement().isEmpty(),
+          "a spoken request is acknowledged exactly like a typed one");
+    controller.stopGeneration();
+}
+
+// A phrase the user abandoned must never be submitted. Half a sentence turned
+// into a turn is worse than losing the words.
+void testAbandonedPhraseIsNotSubmitted() {
+    std::cout << "an abandoned phrase is discarded, not submitted\n";
+
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    controller.setBackendForTesting(std::move(backend));
+
+    check(controller.startListening(), "listening starts");
+    QEventLoop partial;
+    QTimer::singleShot(200, &partial, &QEventLoop::quit);
+    partial.exec();
+    check(!controller.partialTranscript().isEmpty(), "partial words were heard");
+
+    controller.abandonListening();
+    check(!controller.listening(), "abandoning stops listening");
+    check(controller.partialTranscript().isEmpty(), "the partial text is cleared");
+    check(!controller.generating(), "an abandoned phrase starts no turn");
+    check(controller.messages()->rowCount() == 0, "nothing was added to the transcript");
 }
 
 /// Runs the Qt worker and file-URL tests; returns nonzero if any check fails.
@@ -551,6 +903,11 @@ int main(int argc, char** argv) {
     testModelLoadReportsAsynchronously();
     testPresenceAndIdleLoopProject();
     testLongAnswerIsOfferedToContinue();
+    testSpokenTurnIsNotDeliveredBeforeTheLastClause();
+    testSpokenResponseFollowsClauseOrder();
+    testBargeInStopsAudioAtAClauseBoundary();
+    testSpokenPhraseTakesTheTypedPath();
+    testAbandonedPhraseIsNotSubmitted();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

@@ -175,6 +175,13 @@ int printRuntime(const kestrel::app::AppController& controller) {
     out << "  gpu summary  : " << controller.gpuSummary() << "\n";
     out << "  capability   : " << controller.computeCapability() << "\n";
     out << "  device count : " << controller.gpuDeviceCount() << "\n";
+    // Voice and dictation are optional the same way the compute backends are,
+    // so they are reported for the same reason: the answer must be readable
+    // without launching the window and watching the panel.
+    out << "  voice        : " << (controller.ttsAvailable() ? "available" : "unavailable")
+        << " (" << controller.ttsVoice() << ")\n";
+    out << "  dictation    : " << (controller.sttAvailable() ? "available" : "unavailable")
+        << " (" << controller.sttDetail() << ")\n";
     out << "  diagnostics  :\n";
     for (const QVariant& row : controller.runtimeDiagnostics()) {
         const QVariantMap entry = row.toMap();
