@@ -17,6 +17,21 @@ jobs:
   core:
     name: Core (no Qt) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # macOS is advisory here, on purpose, and for a reason that is not a
+    # technical problem in this repository: nobody who pushes to it runs macOS,
+    # so a red macOS build cannot be acted on by the person who caused it. It
+    # still runs and still reports, so a macOS-only break stays visible to
+    # whoever does have a Mac, and this line is the one to delete when that
+    # becomes a gate.
+    #
+    # Linux and Windows are the real gates. The core is portable code, and
+    # Linux is the only place in this matrix that compiles the POSIX half of
+    # every platform file -- a break there is a break in the product for
+    # everyone who is not on Windows.
+    #
+    # `matrix.os`, not `runner.os`: only github, needs, strategy, matrix, vars
+    # and inputs are available on a job's own keys.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -65,17 +80,23 @@ jobs:
   desktop:
     name: Desktop (Qt ${{ matrix.qt }}) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Non-gating on macOS only, and only because of a problem no change here
-    # can fix: Qt 6.9.0's arm64 macOS libraries reference AGL, Apple's legacy
-    # 32-bit OpenGL framework, which was removed from macOS 11 and later. The
-    # link fails with "ld: framework 'AGL' not found". Pinning the install to
-    # the runner's architecture did not help -- the native arm64 Qt is what
-    # gets used -- so this is an upstream packaging problem.
+    # Non-gating on macOS for two reasons, and only because of a problem no
+    # change here can fix, plus a decision nobody who pushes here can act on.
+    # First the technical one: Qt 6.9.0's arm64 macOS libraries reference AGL,
+    # Apple's legacy 32-bit OpenGL framework, which was removed from macOS 11
+    # and later. The link fails with "ld: framework 'AGL' not found". Pinning
+    # the install to the runner's architecture did not help -- the native arm64
+    # Qt is what gets used -- so this is an upstream packaging problem. Second
+    # the practical one: no macOS machine is available to reproduce or fix it,
+    # so a gating macOS job would only ever be a red light nobody can turn
+    # green.
     #
     # The job still runs and still reports its result, so the gap stays
     # visible; it is non-gating rather than skipped or disabled. The cost is
-    # that macOS desktop coverage is not currently enforced. Delete this line
-    # when a Qt release whose arm64 build no longer mentions AGL is in use.
+    # that macOS desktop coverage is not currently enforced, on either this job
+    # or the core job above. Delete both continue-on-error lines when a Mac is
+    # in the loop and a Qt release whose arm64 build no longer mentions AGL is
+    # in use.
     #
     # `matrix.os`, not `runner.os`: only github, needs, strategy, matrix, vars
     # and inputs are available on a job's own keys, and using `runner` here

@@ -1,12 +1,18 @@
 #include "storage/atomicfile.h"
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace kestrel::storage {
@@ -19,6 +25,70 @@ std::string describe(const std::error_code& code) {
     return code ? code.message() : std::string("no further detail is available");
 }
 
+// A scratch suffix no other writer, in this process or any other, can be
+// holding at this moment. The process id keeps a second Kestrel -- or a backup
+// tool that happens to use the same name -- off this write's scratch file; the
+// counter keeps two saves inside one process off each other's. Sharing a
+// single fixed name is what makes two overlapping saves interleave, after
+// which one rename can publish a mixture of both payloads.
+std::string scratchSuffix() {
+    static std::atomic<unsigned long> sequence{0};
+    const unsigned long unique = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+#if defined(_WIN32)
+    const auto pid = static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+    const auto pid = static_cast<unsigned long>(::getpid());
+#endif
+    return std::to_string(pid) + "-" + std::to_string(unique);
+}
+
+// Pushes a file's own buffers out to the device before its name is published.
+// Without this the ordering "name durable, contents not" is still reachable,
+// and it produces a file that exists and is empty.
+bool flushToDevice(const fs::path& path, std::string& error) {
+#if defined(_WIN32)
+    // Two things are wrong with the obvious spelling of this call. CreateFile
+    // returns INVALID_HANDLE_VALUE on failure, not nullptr, so a truth test on
+    // the handle is always true and goes on to flush an invalid one. And
+    // FlushFileBuffers needs GENERIC_WRITE: opened GENERIC_READ it fails with
+    // ERROR_ACCESS_DENIED, which is a no-op that looks like it worked.
+    HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        error = "could not reopen " + path.string() + " in order to flush it: Windows error " +
+                std::to_string(::GetLastError());
+        return false;
+    }
+    const BOOL flushed = ::FlushFileBuffers(handle);
+    const DWORD flushError = ::GetLastError();
+    ::CloseHandle(handle);
+    if (!flushed) {
+        error = "could not flush " + path.string() + " to the device: Windows error " +
+                std::to_string(flushError);
+        return false;
+    }
+    return true;
+#else
+    // A C++ stream flush stops at the library's own buffer, which is not the
+    // device. fsync is the only call here that reaches the disk.
+    const int descriptor = ::open(path.c_str(), O_WRONLY);
+    if (descriptor < 0) {
+        error = "could not reopen " + path.string() + " in order to flush it: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    const bool synced = ::fsync(descriptor) == 0;
+    const int syncError = errno;
+    ::close(descriptor);
+    if (!synced) {
+        error = "could not flush " + path.string() + " to the device: " +
+                std::string(std::strerror(syncError));
+        return false;
+    }
+    return true;
+#endif
+}
+
 } // namespace
 
 bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>& bytes,
@@ -28,10 +98,10 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
         fs::create_directories(target.parent_path(), code);
     }
 
-    // The temp name has to be unique per write: two saves in quick succession
+    // The scratch name has to be unique per write: two saves in quick succession
     // would otherwise race on the same scratch file, and the loser's rename
     // would publish the winner's bytes.
-    const fs::path scratch = target.string() + ".tmp";
+    const fs::path scratch = target.string() + "." + scratchSuffix() + ".tmp";
     {
         std::ofstream out(scratch, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -45,19 +115,23 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
         out.flush();
         if (!out) {
             error = "could not write " + scratch.string() + ": " + describe(code);
+            std::error_code ignored;
+            fs::remove(scratch, ignored);
             return false;
         }
     }
 
-#if defined(_WIN32)
-    // Flush the file's own buffers to the device before the rename. Without
-    // this the name can be durable while the contents are not, which is the
-    // one ordering that produces a file that exists and is empty.
-    if (HANDLE handle = ::CreateFileW(scratch.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                      OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, nullptr)) {
-        ::FlushFileBuffers(handle);
-        ::CloseHandle(handle);
+    // Content before name. Bailing out here leaves the previous file exactly
+    // as it was, which is the entire reason this function exists.
+    if (!flushToDevice(scratch, error)) {
+        std::error_code ignored;
+        fs::remove(scratch, ignored);
+        return false;
     }
+
+#if defined(_WIN32)
+    // MOVEFILE_WRITE_THROUGH because the rename itself is the second half of
+    // the ordering, and it is the one Windows will otherwise skip.
     if (!::MoveFileExW(scratch.c_str(), target.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         error = "could not replace " + target.string() + ": Windows error " +
@@ -67,17 +141,14 @@ bool writeFileAtomically(const fs::path& target, const std::vector<std::uint8_t>
         return false;
     }
 #else
-    std::ofstream flushOnly(scratch, std::ios::binary | std::ios::app);
-    flushOnly.flush();
-    flushOnly.close();
-
     // rename(2) replaces atomically within a filesystem, which is the reason
     // the scratch file is a sibling rather than something in a temp directory.
     std::error_code renameCode;
     fs::rename(scratch, target, renameCode);
     if (renameCode) {
         error = "could not replace " + target.string() + ": " + describe(renameCode);
-        fs::remove(scratch, code);
+        std::error_code ignored;
+        fs::remove(scratch, ignored);
         return false;
     }
 #endif
@@ -91,13 +162,26 @@ bool writeFileAtomically(const fs::path& target, std::string_view text, std::str
 
 bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::string& error) {
     std::error_code code;
-    if (!fs::exists(path, code)) {
+    const bool present = fs::exists(path, code);
+    // exists() answers false for a file that is not there and for one that
+    // cannot be reached -- a directory the process may not enter, a dead mount,
+    // a path with a component that is not a directory. Only the first of those
+    // is a first run. Folding the second into it would report an unreadable
+    // profile as an absent one, and the next save would then overwrite whatever
+    // was really there.
+    if (code && code != std::errc::no_such_file_or_directory) {
+        error = "could not reach " + path.string() + ": " + describe(code);
+        bytes.clear();
+        return false;
+    }
+    if (!present) {
         bytes.clear();
         return true;
     }
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         error = "could not open " + path.string() + " for reading";
+        bytes.clear();
         return false;
     }
     in.seekg(0, std::ios::end);
@@ -105,6 +189,7 @@ bool readWholeFile(const fs::path& path, std::vector<std::uint8_t>& bytes, std::
     in.seekg(0, std::ios::beg);
     if (size < 0) {
         error = "could not measure " + path.string();
+        bytes.clear();
         return false;
     }
     bytes.resize(static_cast<std::size_t>(size));

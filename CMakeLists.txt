@@ -348,16 +348,25 @@ if(KESTREL_BUILD_TESTS)
     add_test(NAME kestrel_storage_tests COMMAND kestrel_storage_tests)
     # Deliberately not part of the Qt PATH fix-up further down: this binary
     # links no Qt. It does link the platform keystore, whose library is either
-    # the system one or already a load-time dependency of the process.
+    # the system one or already a load-time dependency of the process. It does
+    # need cudart under a CUDA build, which is handled with the other tests.
 
     # A CUDA-enabled build links the cudart import library, so cudart's DLL has
     # to be resolvable when the tests actually run. CMake does not do that
     # implicitly on Windows.
+    # Every binary below links kestrel_core, which links CUDA::cudart, so every
+    # one of them inherits the dependency -- not just the runtime tests, which
+    # is why this started out wrong.
     # Same reason as the Qt fix-up above: a Windows PATH interpolated into
     # ENVIRONMENT is truncated at the first `;`, which would drop everything
     # after cudart's own directory.
     if(KESTREL_ENABLE_CUDA AND CUDAToolkit_FOUND AND WIN32)
-        set_tests_properties(kestrel_runtime_tests PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
+        foreach(_kestrel_cuda_test
+                kestrel_core_tests
+                kestrel_runtime_tests
+                kestrel_storage_tests)
+            set_tests_properties(${_kestrel_cuda_test} PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CUDAToolkit_BIN_DIR}")
+        endforeach()
     endif()
 endif()

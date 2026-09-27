@@ -115,9 +115,28 @@ void testAtomicWriteReplacesAndLeavesNoScratch() {
           "the overwrite is what is on disk");
 
     // A reader must never see a half-written file, and the scratch file must
-    // not survive: a leftover "profile.bin.tmp" is the visible symptom of the
-    // window this function exists to close.
-    check(!fs::exists(target.string() + ".tmp"), "no scratch file is left behind");
+    // not survive: a leftover "profile.bin.<pid>-<n>.tmp" is the visible
+    // symptom of the window this function exists to close.
+    //
+    // Matched by pattern rather than by a fixed name on purpose. The scratch
+    // name carries a process id and a counter precisely so that two overlapping
+    // writes cannot land on the same file, which means "profile.bin.tmp" is a
+    // name this function will never produce -- a check for it would pass
+    // whether or not the cleanup works.
+    int leftovers = 0;
+    std::string leftoverName;
+    for (const auto& entry : fs::directory_iterator(scratch.path())) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() > target.filename().string().size() &&
+            name.compare(0, target.filename().string().size(), target.filename().string()) == 0 &&
+            name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+            leftovers += 1;
+            leftoverName = name;
+        }
+    }
+    check(leftovers == 0,
+          "no scratch file is left behind" +
+              (leftovers > 0 ? ", found " + leftoverName : std::string()));
 
     // A missing file is not an error, because a first run has one.
     std::vector<std::uint8_t> absent;
@@ -234,10 +253,8 @@ void testPlatformStore() {
         }
         check(!foundReadableCopy, "no sealed file on disk contains the plaintext");
     }
-    // Checked, not discarded: the test is the only thing asserting the store
-    // can be emptied, and this line is the last chance to notice if it cannot.
     check(store->forget(account, storage::kProfileService, error),
-          "the platform store can be emptied again: " + error);
+          "the profile is forgotten: " + error);
 }
 
 } // namespace

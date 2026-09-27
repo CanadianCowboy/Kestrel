@@ -10,15 +10,18 @@
 namespace kestrel::storage {
 namespace {
 
-// Whether a program exists, found by asking the shell to run it. Used once per
-// process and cached, because the answer cannot change while Kestrel is up and
-// spawning a shell to find out is not free.
-bool haveProgram(const char* program, bool& found) {
+// Whether secret-tool is on PATH. Asked of the shell once and cached, because
+// the answer cannot change while Kestrel is up and spawning a shell to find out
+// is not free.
+//
+// This is deliberately not a function of an arbitrary program name: the only
+// caller wants one answer, and a cache keyed on nothing but a function-local
+// static is how a "find secret-tool" helper ends up answering "yes" for every
+// program it is later asked about.
+bool haveSecretTool() {
     static const bool present = [] {
-        const std::string command = std::string("command -v ") + program + " >/dev/null 2>&1";
-        return std::system(command.c_str()) == 0;
+        return std::system("command -v secret-tool >/dev/null 2>&1") == 0;
     }();
-    found = present;
     return present;
 }
 
@@ -40,7 +43,7 @@ std::string shellQuote(const std::string& value) {
 }
 
 // secret-tool prints the secret to stdout, so the output has to be collected
-// separately from the input above.
+// separately from the input.
 bool runCapturing(const std::string& command, std::string& output, std::string& error) {
     std::FILE* pipe = ::popen(command.c_str(), "r");
     if (pipe == nullptr) {
@@ -100,6 +103,68 @@ std::optional<std::vector<std::uint8_t>> fromHex(const std::string& text) {
     return bytes;
 }
 
+// The three operations below are free functions rather than members for a
+// reason that is not stylistic: available() is const, and it has to perform a
+// real write and a real delete to find out whether a locked keyring will
+// accept anything. A const member cannot call a non-const member, so a probe
+// implemented in terms of seal() and forget() does not compile. This is the
+// same shape the Windows backend uses for its probe.
+bool sealViaTool(std::string_view account, std::string_view service,
+                 const std::vector<std::uint8_t>& blob, std::string& error) {
+    // The secret goes on standard input. Passing it as an argument would put
+    // the user's profile in the process list, where every other process on
+    // the machine can read it.
+    const std::string command = "secret-tool store --label='Kestrel profile' service " +
+                                shellQuote(std::string(service)) + " account " +
+                                shellQuote(std::string(account));
+    std::FILE* pipe = ::popen(command.c_str(), "w");
+    if (pipe == nullptr) {
+        error = "could not run secret-tool";
+        return false;
+    }
+    const std::string hex = toHex(blob);
+    std::fwrite(hex.data(), 1, hex.size(), pipe);
+    std::fputc('\n', pipe);
+    if (::pclose(pipe) != 0) {
+        error = "secret-tool would not store the profile; is the keyring unlocked?";
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::vector<std::uint8_t>> readViaTool(std::string_view account,
+                                                     std::string_view service,
+                                                     std::string& error) {
+    const std::string command = "secret-tool lookup service " + shellQuote(std::string(service)) +
+                                " account " + shellQuote(std::string(account));
+    std::string output;
+    if (!runCapturing(command, output, error)) {
+        return std::nullopt;
+    }
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
+    }
+    if (output.empty()) {
+        // Nothing stored is a first run, not a failure.
+        return std::nullopt;
+    }
+    auto bytes = fromHex(output);
+    if (!bytes.has_value()) {
+        error = "the keyring returned something that is not a sealed profile";
+        return std::nullopt;
+    }
+    return bytes;
+}
+
+void forgetViaTool(std::string_view account, std::string_view service) {
+    const std::string command = "secret-tool clear service " + shellQuote(std::string(service)) +
+                                " account " + shellQuote(std::string(account));
+    std::string ignored;
+    // secret-tool exits non-zero when there was nothing to clear, which is the
+    // state the caller asked for, so the result is not inspected.
+    runCapturing(command, ignored, ignored);
+}
+
 class LinuxSecretStore final : public SecretStore {
 public:
     std::string description() const override {
@@ -107,8 +172,7 @@ public:
     }
 
     bool available(std::string& unavailableReason) const override {
-        bool present = false;
-        if (!haveProgram("secret-tool", present)) {
+        if (!haveSecretTool()) {
             unavailableReason =
                 "no keyring service was found. Install libsecret (which provides secret-tool) "
                 "and unlock your keyring, or Kestrel will not save anything.";
@@ -118,69 +182,27 @@ public:
         // message when the keyring is locked or no keyring daemon is running,
         // which is the state a freshly rebooted machine is in.
         std::string error;
-        if (!seal("probe", "com.kestrel.probe", {'p', 'r', 'o', 'b', 'e'}, error)) {
+        if (!sealViaTool("probe", "com.kestrel.probe", {'p', 'r', 'o', 'b', 'e'}, error)) {
             unavailableReason = "the keyring did not accept a test value: " + error;
             return false;
         }
-        std::string ignored;
-        forget("probe", "com.kestrel.probe", ignored);
+        forgetViaTool("probe", "com.kestrel.probe");
         return true;
     }
 
     bool seal(std::string_view account, std::string_view service,
               const std::vector<std::uint8_t>& blob, std::string& error) override {
-        // The secret goes on standard input. Passing it as an argument would put
-        // the user's profile in the process list, where every other process on
-        // the machine can read it.
-        const std::string command = "secret-tool store --label='Kestrel profile' service " +
-                                    shellQuote(std::string(service)) + " account " +
-                                    shellQuote(std::string(account));
-        std::FILE* pipe = ::popen(command.c_str(), "w");
-        if (pipe == nullptr) {
-            error = "could not run secret-tool";
-            return false;
-        }
-        const std::string hex = toHex(blob);
-        std::fwrite(hex.data(), 1, hex.size(), pipe);
-        std::fputc('\n', pipe);
-        if (std::pclose(pipe) != 0) {
-            error = "secret-tool would not store the profile; is the keyring unlocked?";
-            return false;
-        }
-        return true;
+        return sealViaTool(account, service, blob, error);
     }
 
     std::optional<std::vector<std::uint8_t>> sealed(std::string_view account,
                                                     std::string_view service,
                                                     std::string& error) override {
-        const std::string command = "secret-tool lookup service " + shellQuote(std::string(service)) +
-                                    " account " + shellQuote(std::string(account));
-        std::string output;
-        if (!runCapturing(command, output, error)) {
-            return std::nullopt;
-        }
-        while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-            output.pop_back();
-        }
-        if (output.empty()) {
-            // Nothing stored is a first run, not a failure.
-            return std::nullopt;
-        }
-        auto bytes = fromHex(output);
-        if (!bytes.has_value()) {
-            error = "the keyring returned something that is not a sealed profile";
-            return std::nullopt;
-        }
-        return bytes;
+        return readViaTool(account, service, error);
     }
 
-    bool forget(std::string_view account, std::string_view service, std::string& error) override {
-        const std::string command = "secret-tool clear service " + shellQuote(std::string(service)) +
-                                    " account " + shellQuote(std::string(account));
-        std::string ignored;
-        // secret-tool exits non-zero when there was nothing to clear, which is
-        // the state the caller asked for.
-        runCapturing(command, ignored, error);
+    bool forget(std::string_view account, std::string_view service, std::string&) override {
+        forgetViaTool(account, service);
         return true;
     }
 };
