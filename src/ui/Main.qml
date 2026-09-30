@@ -416,7 +416,7 @@ ApplicationWindow {
                                 required property string content
                                 required property string status
                                 required property string note
-                                width: messageList.width
+                                width: ListView.view.width
                                 height: entryColumn.implicitHeight + 30
                                 readonly property bool fromAssistant: author === "assistant"
                                 readonly property bool streaming: status === "streaming"

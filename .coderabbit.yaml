@@ -9,13 +9,47 @@ reviews:
   profile: assertive
 
   high_level_summary: true
+  # This is also what approves a pull request: once its comments are resolved,
+  # the latest commit has been reviewed, and no pre-merge check is in an error
+  # state, CodeRabbit approves. The branch requires one approving review, so
+  # this is what lets a clean PR be merged.
   request_changes_workflow: true
 
   auto_review:
     enabled: true
     # Draft PRs are work in progress; reviewing them wastes cycles and posts
     # findings that the author is about to invalidate.
-    include_drafts: false
+    #
+    # This was spelled `include_drafts`, which is not a key -- the setting is
+    # `drafts` -- so it had been doing nothing since it was written.
+    drafts: false
+    # Review pull requests whatever they target, not only main. Stacked feature
+    # branches are how this repo is built, and a review that only fires on main
+    # is a review that misses most of the work.
+    base_branches:
+      - ".*"
+    # Never stop reviewing. The default pauses after five reviewed commits,
+    # which on a branch of small commits is most of its life.
+    auto_pause_after_reviewed_commits: 0
+
+  # The parts that carry a pull request rather than describe one. The
+  # merge-conflict resolver already resolved a conflict on the previous PR, so
+  # this is stating existing behaviour rather than adding it.
+  #
+  # The key is singular. `resolve_merge_conflicts` was here and is not a key at
+  # all, which means the resolver had been silently off; CodeRabbit caught it in
+  # review. scripts/validate_coderabbit_config.py now fails the build on any key
+  # the schema does not name, because a misspelt setting is the one kind of
+  # configuration error that looks exactly like it is working.
+  finishing_touches:
+    autofix:
+      enabled: true
+    fix_ci:
+      enabled: true
+    resolve_merge_conflict:
+      enabled: true
+    simplify:
+      enabled: true
 
   # Exclude generated and vendored trees from review entirely.
   path_filters:

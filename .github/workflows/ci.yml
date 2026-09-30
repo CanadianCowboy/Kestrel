@@ -10,8 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  QT_VERSION: '6.9.0'
+# Nothing here writes to the repository, and the default token can do far more
+# than this workflow needs. zizmor reports the absence of this block as overly
+# broad permissions on every job.
+permissions:
+  contents: read
 
 jobs:
   # The portable core must build everywhere, with no optional dependency
@@ -20,6 +23,23 @@ jobs:
   core:
     name: Core (no Qt) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # All three are gates, and this job is the one that has to be able to say
+    # so. It is also the only job that compiles every platform file the
+    # repository carries: Linux is the only place in this matrix that compiles
+    # the POSIX half, and macOS the only one that compiles the
+    # Security.framework half. A green Linux build says nothing at all about
+    # secretstore_macos.cpp, which is where a macOS-only break in the product
+    # would actually live.
+    #
+    # This job was advisory on macOS while the storage tests were wrong about
+    # macOS. testPlatformStoreRefusesWithoutAHomeDirectory asserted that a
+    # store with nowhere to put a file would refuse to seal, and was run
+    # unchanged on the two platforms whose stores are not file-backed at all:
+    # secret-tool and the login keychain have no opinion about HOME, so it
+    # failed on both of them. The job was then marked non-gating, which is a
+    # gate switched off to stop reporting a broken test -- and a switch set for
+    # that reason also hides the next real break. The test is fixed, so the
+    # gate is back on.
     strategy:
       fail-fast: false
       matrix:
@@ -66,12 +86,47 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
   desktop:
-    name: Desktop (Qt ${{ env.QT_VERSION }}) / ${{ matrix.os }}
+    name: Desktop (Qt ${{ matrix.qt }}) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Gating on all three platforms, macOS included.
+    #
+    # This job was non-gating here because macOS could not link the app at all:
+    # "ld: framework 'AGL' not found". The -framework AGL comes from Qt's own
+    # FindWrapOpenGL.cmake, which adds it to every GUI link line, and Xcode 26
+    # ships no AGL because Apple removed it. Nothing in this repository caused
+    # it and nothing in this repository could work around it, which is what
+    # the old comment here claimed -- the claim was right about the cause and
+    # wrong about the fix being unavailable.
+    #
+    # Qt fixed it: QTBUG-137687 is closed, with the fix in 6.9.2, 6.8.4 and
+    # 6.5.10. That is what the version pin below is for, and it is why this
+    # job can gate on macOS again. Pinning 6.9.0 back is what turns macOS red
+    # here, so the pin and this gate are one change and not two.
+    #
+    # `matrix.os`, not `runner.os`: only github, needs, strategy, matrix, vars
+    # and inputs are available on a job's own keys, and using `runner` here
+    # makes the whole workflow uncompilable. That is the same trap as the `env`
+    # in the job name below, which cost this pipeline every run it ever had.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # The one place the Qt version is written down. It has to reach the
+        # job name, and `env` is not one of the contexts available there --
+        # referencing it made the whole workflow uncompilable, which GitHub
+        # reports as a run that failed in zero seconds with no jobs. `matrix`
+        # is allowed in a job name, so the version lives here and the install
+        # step reads it back through a job-scoped env.
+        #
+        # 6.9.2, and not 6.9.0, is the whole of the macOS fix: it is the first
+        # 6.9 release carrying the QTBUG-137687 change, and it is a patch of
+        # the same LTS series rather than a jump to a new one. A patched
+        # release is what makes this safe to depend on rather than a change
+        # that might arrive in 6.10 and leave this branch unable to build on
+        # a Mac for another three months.
+        qt: ['6.9.2']
+    env:
+      QT_VERSION: ${{ matrix.qt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +134,28 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          modules: 'qtquickcontrols2'
+          # No `arch` input. There was one here for a long time, spelled
+          # `architecture`, which the action does not know: on macOS it failed
+          # the step outright with "Unexpected input(s) 'architecture'", and
+          # everywhere else it was silently ignored. So the comment that came
+          # with it -- that the action was resolving an x86_64 Qt on the arm64
+          # macOS runner and that the x86_64 slice of Qt's macOS libraries
+          # reference the removed AGL framework -- described a failure that this
+          # step had never once been in a position to have. It is a hypothesis
+          # about a job that is not gating, written as though it were a
+          # measurement, and correcting the spelling to `arch` only made the
+          # Linux and Windows jobs start failing on it.
+          #
+          # The action's own default is what the Linux and Windows jobs have
+          # been building against all along, and they are the ones that matter.
+          # If somebody with a Mac finds a real AGL failure here, the fix is to
+          # add `arch: arm64` and find out whether it helps.
+          # No `modules` list on purpose. Quick Controls 2 is part of the base
+          # Qt 6 installation rather than a separately installable module, and
+          # asking aqtinstall for it fails the step on every platform with
+          # "The packages ['qtquickcontrols2'] were not found". The input is for
+          # genuinely separate modules such as qtcharts, and nothing this
+          # project links against is one.
           cache: true
 
       - name: Configure
@@ -103,16 +179,37 @@ jobs:
         id: app
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows_NT" ]; then
-            # Multi-config generators put binaries in a per-config subdirectory.
-            EXE="$PWD/build/Release/kestrel.exe"
-          else
-            EXE="$PWD/build/kestrel"
-          fi
-          if [ ! -x "$EXE" ]; then
-            echo "::error::app binary not found at $EXE"
+          # Search for a real file instead of deriving the path from the
+          # platform. A multi-config generator puts the binary under
+          # build/Release, a single-config one at the top of build, and the
+          # platform test that used to choose between them picked wrong on
+          # Windows -- exporting a path to a *directory*.
+          #
+          # The old guard was `[ ! -x ]`, which a directory satisfies, so the
+          # step passed and the QML check below ran a directory. It produced no
+          # output, found no binding errors, and reported success for an
+          # application it never launched. -f cannot be satisfied by a
+          # directory, so a wrong path now fails loudly instead.
+          EXE=""
+          for candidate in \
+            "$PWD/build/kestrel.app/Contents/MacOS/kestrel" \
+            "$PWD/build/Release/kestrel.exe" \
+            "$PWD/build/kestrel.exe" \
+            "$PWD/build/kestrel"; do
+            # A bundle on macOS, a plain executable on Windows and Linux. The
+            # bundle path is not a guess: MACOSX_BUNDLE puts the binary at
+            # .app/Contents/MacOS/, and -f matches the binary inside it, so the
+            # guard that rejects a directory still holds.
+            if [ -f "$candidate" ]; then
+              EXE="$candidate"
+              break
+            fi
+          done
+          if [ -z "$EXE" ]; then
+            echo "::error::no kestrel binary found under $PWD/build"
             exit 1
           fi
+          echo "running: $EXE"
           echo "path=$EXE" >> "$GITHUB_OUTPUT"
 
       - name: QML scene loads
@@ -126,6 +223,21 @@ jobs:
           "${{ steps.app.outputs.path }}" > qml.log 2>&1 &
           APP_PID=$!
           sleep 6
+          # Liveness, not output. The app starts its event loop and prints
+          # nothing on Linux or macOS, so a check that treats silence as
+          # failure fails a good build. A process still alive after a few
+          # seconds has loaded its scene and is executing; a process that died
+          # did so at startup, which is the failure worth catching -- and it is
+          # also what a wrong path produces, since no process is ever started
+          # when the shell is handed a directory or a missing file.
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "the scene is up and still running"
+          else
+            echo "::error::the app exited during startup; the scene never loaded"
+            echo "--- Qt diagnostics ---"
+            cat qml.log
+            exit 1
+          fi
           kill "$APP_PID" 2>/dev/null || true
           wait "$APP_PID" 2>/dev/null || true
           echo "--- Qt diagnostics ---"
@@ -178,3 +290,68 @@ jobs:
             echo "::error::expected a non-zero exit with no CUDA device"
             exit 1
           fi
+
+  # A misspelt setting in .coderabbit.yaml is the one configuration error that
+  # looks exactly like it is working: YAML accepts any key, and CodeRabbit
+  # reads a key it does not know as absent rather than as an error. Two such
+  # keys shipped in this repository -- `include_drafts`, which is really
+  # `auto_review.drafts`, and `resolve_merge_conflicts`, which the schema
+  # spells in the singular -- and both had been believed to be in effect.
+  # scripts/validate_coderabbit_config.py compares the config against
+  # CodeRabbit's published schema, which is vendored in the repository so that
+  # a failure here can only mean the config is wrong.
+  coderabbit-config:
+    name: CodeRabbit config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the YAML parser
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Every key must be one CodeRabbit knows
+        run: python scripts/validate_coderabbit_config.py
+
+      # The step above shows the check accepting a good config, which on its own
+      # is also what a check that cannot fail looks like. So the check is run
+      # here against a config carrying the exact key that got this wrong, and
+      # it has to reject it. A validator that has only ever agreed with
+      # everything is not evidence of anything.
+      #
+      # Three ways it has to say no, because the three fail differently. The
+      # first is a key in a plain mapping, which is the one this check was
+      # written for. The second is a key inside a list entry, which the walk
+      # skipped entirely until it was taught about `items` -- a path_instructions
+      # entry is nine lines of prose per key and the most likely place in the
+      # whole file to misspell something. The third is a key that simply
+      # appears twice: PyYAML keeps the last one and says nothing, so a
+      # duplicated block validates clean while half of it does nothing.
+      - name: The check can still fail
+        run: |
+          sed 's/^    resolve_merge_conflict:/    resolve_merge_conflicts:/' \
+            .coderabbit.yaml > bad-key.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-key.yaml; then
+            echo "::error::the schema check accepted a key CodeRabbit does not have"
+            exit 1
+          fi
+          echo "rejected a key it does not have"
+
+          sed 's/^      instructions: |/      instruction: |/' \
+            .coderabbit.yaml > bad-list-entry.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-list-entry.yaml; then
+            echo "::error::the schema check skipped the inside of a list entry"
+            exit 1
+          fi
+          echo "rejected a misspelt key inside a list entry"
+
+          { cat .coderabbit.yaml; printf '\nreviews:\n  profile: assertive\n'; } \
+            > bad-duplicate.yaml
+          if python scripts/validate_coderabbit_config.py --config bad-duplicate.yaml; then
+            echo "::error::the schema check accepted a key written twice"
+            exit 1
+          fi
+          echo "rejected a key written twice"
