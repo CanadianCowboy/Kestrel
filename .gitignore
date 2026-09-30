@@ -20,14 +20,6 @@
 # written to answer a single question, which measure nothing once the question
 # has been answered.
 /tools/*
-# Shared helpers recovered from the voice branch; other local experiments stay local.
-!/tools/generate-third-party-notices.py
-!/tools/kokoro_voice_server.py
-!/tools/msvcbuild.bat
-!/tools/package-desktop.bat
-!/tools/packagerelease.bat
-!/tools/pngrows.py
-!/tools/verify-desktop.sh
 
 # Third-party dependency caches (JunctionBox and friends). These are
 # machine-specific and must never be committed.

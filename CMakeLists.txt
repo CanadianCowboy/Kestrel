@@ -90,7 +90,17 @@ if(KESTREL_ENABLE_ORT_GENAI)
     # proves the tree has a native half rather than only managed assemblies --
     # a NuGet folder dropped in wholesale satisfies neither of these checks in
     # the place CMake looks.
-    if(KESTREL_ORT_GENAI_ROOT AND EXISTS "${KESTREL_ORT_GENAI_ROOT}/include/ort_genai.h")
+    if(WIN32)
+        set(_kestrel_genai_library "${KESTREL_ORT_GENAI_ROOT}/lib/onnxruntime-genai.lib")
+        set(_kestrel_ort_library "${KESTREL_ORT_GENAI_ROOT}/lib/onnxruntime.lib")
+    else()
+        set(_kestrel_genai_library "${KESTREL_ORT_GENAI_ROOT}/lib/libonnxruntime-genai.so")
+        set(_kestrel_ort_library "${KESTREL_ORT_GENAI_ROOT}/lib/libonnxruntime.so")
+    endif()
+    if(KESTREL_ORT_GENAI_ROOT
+       AND EXISTS "${KESTREL_ORT_GENAI_ROOT}/include/ort_genai.h"
+       AND EXISTS "${_kestrel_genai_library}"
+       AND EXISTS "${_kestrel_ort_library}")
         set(KESTREL_ORT_GENAI_ENABLED ON)
         message(STATUS
             "Kestrel: ONNX Runtime GenAI headers found at ${KESTREL_ORT_GENAI_ROOT}")

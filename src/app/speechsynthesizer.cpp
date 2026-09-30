@@ -235,8 +235,8 @@ SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
         const QVoice chosen = chooseVoice(voices, systemLocale);
         platform->voice().setVoice(chosen);
         platform->setAvailability(true, chosen.name());
-        connect(&platform->voice(), &QTextToSpeech::stateChanged, this, [this] {
-            static_cast<PlatformSpeechBackend*>(m_backend.get())->observeState();
+        connect(&platform->voice(), &QTextToSpeech::stateChanged, this, [platform] {
+            platform->observeState();
         });
     }
 #endif

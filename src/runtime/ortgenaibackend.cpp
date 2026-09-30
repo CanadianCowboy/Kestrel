@@ -439,6 +439,7 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
             // be built; generation is what will strain, and the status says so
             // rather than the load failing for a reason the user cannot act on.
             budgeted = 0;
+            chosen = 1024;
         }
     }
     if (m_requestedContextLength > 0) {
@@ -773,6 +774,10 @@ void OrtGenAiBackend::resetContextUsage() {
 void OrtGenAiBackend::setSystemPrompt(std::string_view text) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_systemPrompt = std::string(text);
+}
+
+void OrtGenAiBackend::clearSharedPrefix() {
+    setSystemPrompt({});
 }
 
 std::size_t OrtGenAiBackend::cachedPrefixTokens() const {

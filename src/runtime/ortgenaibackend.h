@@ -72,6 +72,7 @@ public:
     // resident between turns -- see the implementation for why, and for what
     // cachedPrefixTokens() consequently reports.
     void setSystemPrompt(std::string_view text) override;
+    void clearSharedPrefix() override;
     [[nodiscard]] std::size_t cachedPrefixTokens() const override;
 
     // Overrides the context length the VRAM budget chose. Zero restores the

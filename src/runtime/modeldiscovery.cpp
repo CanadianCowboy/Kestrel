@@ -44,7 +44,7 @@ bool genAiModelLooksLoadable(const std::filesystem::path& root) {
     if (error || bytes == 0 || !std::ifstream(config, std::ios::binary).good()) {
         return false;
     }
-    std::filesystem::directory_iterator it(
+    std::filesystem::recursive_directory_iterator it(
         root, std::filesystem::directory_options::skip_permission_denied, error), end;
     while (!error && it != end) {
         std::error_code entryError;

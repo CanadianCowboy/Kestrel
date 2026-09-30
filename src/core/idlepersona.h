@@ -52,23 +52,8 @@ struct IdlePolicy {
     bool allowCacheAudit = true;
     bool allowCreativeThoughts = true;
     bool allowGreetingPrep = true;
-    // On by default, and it used to be off. The reason it was off is that
-    // warmup is the one idle task that leaves pure computation: every other
-    // task produces a string the user might read, while this runs a tiny
-    // generation and throws the tokens away. That is a real difference, and it
-    // was treated as a capability to gate.
-    //
-    // The cost of gating it was that the feature simply never happened. A
-    // default of false means the GPU is cold for the first reply of every
-    // session, which is the entire problem warmup exists to remove -- so the
-    // "warming up" the user could observe was a policy that guaranteed no
-    // warming happened, reported as though it were running.
-    //
-    // It is bounded rather than open-ended: eight tokens, a fixed prompt, and
-    // the same worker and cancellation path as a real request, so it competes
-    // with nothing and is abandoned the moment the user types. Turning it on
-    // costs a few milliseconds of idle work and removes a cold start.
-    bool allowModelWarmup = true;
+    // Warmup runs a bounded model generation, so it requires an explicit opt-in.
+    bool allowModelWarmup = false;
 
     [[nodiscard]] bool permits(IdleTaskKind kind) const noexcept;
     [[nodiscard]] int permittedCount() const noexcept;

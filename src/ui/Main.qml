@@ -506,12 +506,12 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 // The dictation line sits above the shell and needs
                                 // its own room: its implicit height plus the shell
-                                // plus the 6 pixel gap between them. 84 is the
+                                // plus the 6 pixel gap and 6 pixel bottom margin. 84 is the
                                 // shell's height, and it is fixed rather than a
                                 // fill -- a shell that grows with the dock
                                 // swallows the line that the dock grew for.
                                 Layout.preferredHeight: dictationLine.visible
-                                                      ? dictationLine.implicitHeight + 90 : 84
+                                                      ? dictationLine.implicitHeight + 96 : 90
 
 
                             // The breathing glow. Slow, wide, and close to
@@ -546,7 +546,7 @@ ApplicationWindow {
                             // microphone nobody pressed.
                             Text {
                                 id: dictationLine
-                                anchors.bottom: composerDock.top
+                                anchors.bottom: composerShell.top
                                 anchors.bottomMargin: 6
                                 anchors.left: composerDock.left
                                 anchors.right: composerDock.right

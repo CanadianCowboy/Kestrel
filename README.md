@@ -298,7 +298,7 @@ from qt.io or install the same build the CI uses:
 
 ```bash
 pipx install aqtinstall
-aqt install-qt linux desktop 6.9.0 gcc_64 -O "$HOME/Qt"
+aqt install-qt linux desktop 6.9.2 gcc_64 -O "$HOME/Qt"
 ```
 
 `pipx`, not `pip install --user`: Ubuntu 23.10 and newer mark the system Python
@@ -317,7 +317,7 @@ which is the same degradation a contributor without Qt gets on any platform.
 ```bash
 cmake -S . -B build -G Ninja \
   -DKESTREL_BUILD_UI=ON \
-  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.0/gcc_64"
+  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.2/gcc_64"
 cmake --build build
 ctest --test-dir build --output-on-failure
 sudo cmake --install build
