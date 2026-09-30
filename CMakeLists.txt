@@ -184,8 +184,6 @@ add_library(kestrel_core
     src/core/persona.h
     src/core/presence.cpp
     src/core/presence.h
-    src/core/idlepersona.cpp
-    src/core/idlepersona.h
     src/core/idletool.cpp
     src/core/idletool.h
     src/core/voicesession.cpp
@@ -205,8 +203,9 @@ add_library(kestrel_core
     src/runtime/engineartifact.h
     src/runtime/backendregistry.cpp
     src/runtime/backendregistry.h
-    src/runtime/modelbackend.h
     src/runtime/mockbackend.cpp
+    src/runtime/chatformat.cpp
+    src/runtime/chatformat.h
     src/runtime/mockbackend.h
     src/runtime/llamacppbackend.cpp
     src/runtime/llamacppbackend.h
@@ -599,6 +598,9 @@ if(KESTREL_BUILD_UI)
         # it defines Qt6::TextToSpeech when -- and only when -- it is present.
         find_package(Qt6TextToSpeech QUIET)
         qt_standard_project_setup(REQUIRES 6.6)
+        if(Qt6_VERSION VERSION_GREATER_EQUAL 6.8)
+            qt_policy(SET QTP0004 NEW)
+        endif()
 
         # MACOSX_BUNDLE, which qt_add_executable does not turn on by itself --
         # WIN32 and MACOSX_BUNDLE are both opt-in arguments there, and without
@@ -640,12 +642,8 @@ if(KESTREL_BUILD_UI)
             src/app/generationworker.h
     src/app/speechsynthesizer.cpp
     src/app/speechsynthesizer.h
-    src/app/localmodelspeechbackend.cpp
-    src/app/localmodelspeechbackend.h
     src/app/localvoiceengines.cpp
     src/app/localvoiceengines.h
-    src/app/kokorospeechbackend.cpp
-    src/app/kokorospeechbackend.h
             src/app/listensession.cpp
             src/app/listensession.h
             src/app/conversationentry.h
@@ -684,6 +682,9 @@ if(KESTREL_BUILD_UI)
         # whatever the platform offers.
         find_package(Qt6Multimedia QUIET)
         if(TARGET Qt6::Multimedia)
+            target_sources(kestrel PRIVATE
+                src/app/localmodelspeechbackend.cpp src/app/localmodelspeechbackend.h
+                src/app/kokorospeechbackend.cpp src/app/kokorospeechbackend.h)
             target_link_libraries(kestrel PRIVATE Qt6::Multimedia)
             target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
             message(STATUS "Kestrel: Qt Multimedia found; a local neural voice can play")
@@ -721,12 +722,8 @@ if(KESTREL_BUILD_UI)
                 src/app/generationworker.h
                 src/app/speechsynthesizer.cpp
                 src/app/speechsynthesizer.h
-                src/app/localmodelspeechbackend.cpp
-                src/app/localmodelspeechbackend.h
                 src/app/localvoiceengines.cpp
                 src/app/localvoiceengines.h
-                src/app/kokorospeechbackend.cpp
-                src/app/kokorospeechbackend.h
                 src/app/listensession.cpp
                 src/app/listensession.h
                 src/app/appcontroller.cpp
@@ -745,6 +742,9 @@ if(KESTREL_BUILD_UI)
                 target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_TEXT_TO_SPEECH=1)
             endif()
             if(TARGET Qt6::Multimedia)
+                target_sources(kestrel_app_tests PRIVATE
+                    src/app/localmodelspeechbackend.cpp src/app/localmodelspeechbackend.h
+                    src/app/kokorospeechbackend.cpp src/app/kokorospeechbackend.h)
                 target_link_libraries(kestrel_app_tests PRIVATE Qt6::Multimedia)
                 target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
             endif()
@@ -865,6 +865,13 @@ if(KESTREL_TENSORRT_ENABLED)
 endif()
 
 if(KESTREL_BUILD_TESTS)
+    # Assertions in these suites also perform setup calls. Release must not
+    # compile them away and report success without exercising the behavior.
+    if(MSVC)
+        add_compile_options(/UNDEBUG)
+    else()
+        add_compile_options(-UNDEBUG)
+    endif()
     add_executable(kestrel_core_tests tests/core_tests.cpp)
     target_link_libraries(kestrel_core_tests PRIVATE kestrel_core)
     target_compile_options(kestrel_core_tests PRIVATE ${KESTREL_STRICT_FLAGS})

@@ -35,6 +35,7 @@ bool SapiSpeechRecognizer::start(ResultCallback, EndCallback, std::string& error
 }
 
 void SapiSpeechRecognizer::stop() {}
+void SapiSpeechRecognizer::stopAndWait() {}
 
 bool SapiSpeechRecognizer::listening() const {
     return false;

@@ -65,9 +65,11 @@ struct RecognitionResult {
 //   * onResult and onEnd are invoked on that thread, or at least never while
 //     holding a lock the caller could deadlock on. Callers marshal back to their
 //     own thread themselves.
-//   * stop() must be safe while recognition is running, and must make results
-//     stop arriving shortly afterwards. A result delivered after stop() is not
-//     an error, but a caller must be able to ignore it.
+//   * stop() is nonblocking and may be followed by a fresh start. Results from
+//     the stopped session must not be confused with the new session's results.
+//     Any callback already in flight is still safe for the consumer to ignore.
+//   * stopAndWait() is teardown-only and must return after all callbacks from
+//     the previous session have left the recognizer.
 //
 // The platform adapter is SapiSpeechRecognizer, declared in
 // runtime/sapirecognizer.h. It reports available() honestly, so the app keeps
@@ -94,6 +96,11 @@ public:
     // it returns unless the phrase was genuinely complete.
     virtual void stop() = 0;
 
+    // Lifetime boundary only: no callback may remain in flight on return.
+    // UI cancellation uses stop(); consumers call this before destroying the
+    // callback target. Implementations must provide a real join/wait boundary.
+    virtual void stopAndWait() = 0;
+
     [[nodiscard]] virtual bool listening() const = 0;
 };
 
@@ -115,6 +122,7 @@ public:
     [[nodiscard]] std::string detail() const override;
     bool start(ResultCallback onResult, EndCallback onEnd, std::string& error) override;
     void stop() override;
+    void stopAndWait() override { stop(); }
     [[nodiscard]] bool listening() const override { return m_listening; }
 
     // Emits the next partial result for the current phrase. Called by the

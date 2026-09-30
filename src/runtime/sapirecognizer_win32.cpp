@@ -57,6 +57,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -191,25 +192,11 @@ struct SessionState {
     std::string failure;
 };
 
-// The callbacks one session delivers through.
-//
-// Taken at the top of the session and held for its whole length, rather than
-// read from the members at the moment of delivery. The difference is what
-// happens when a stop is followed immediately by a start.
-//
-// stop() waits for the worker to leave the session, so in the ordinary case
-// there is nothing to get wrong. The wait is bounded, though, because a stop
-// that never returned would be worse than a late one, and an engine wedged
-// inside a COM call is exactly the case that outlives the bound. After a
-// timeout, start() is free to store a new session's callbacks -- and then the
-// old session finishes, finds the new callbacks in the members, delivers
-// Cancelled to them, and clears them on its way out. The new session never
-// runs, and the consumer is told its own fresh listen was cancelled.
-//
-// Holding the snapshot makes the outcome the same in both cases. A session can
-// only ever deliver to the callbacks it was started with, so the newest
-// session's are untouchable by the one it replaced, whether or not the
-// replacement waited for it.
+// The callbacks one session delivers through. They are paired with the session
+// generation under m_mutex before the worker enters runSession(), then held for
+// the whole pass. A stopped session can therefore never deliver through a
+// replacement session's callbacks, even when stop() is followed immediately
+// by start().
 struct SessionCallbacks {
     SpeechRecognizer::ResultCallback onResult;
     SpeechRecognizer::EndCallback onEnd;
@@ -225,30 +212,32 @@ struct SessionCallbacks {
 //   worker       everything COM: creating, the audio pipeline, the event pull,
 //                releasing, and every callback invocation
 //
-// start() and stop() do nothing but flip an atomic and set an event, so neither
-// can block the UI on a COM call or on the engine taking its time opening a
-// device. The destructor sets the shutdown flag, signals the same event, and
-// joins; that is the only place the UI waits, and by then it is shutting down.
+// start() and stop() only publish state under a short mutex and signal an
+// event; neither waits for COM or for the engine to open a device. stopAndWait()
+// is reserved for session teardown, while the recognizer destructor sets the
+// shutdown flag and joins the worker permanently.
 class SapiSpeechRecognizer::Impl {
 public:
     Impl() {
         m_devices = static_cast<unsigned>(waveInGetNumDevs());
         m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        // Manual reset and initially signalled: the worker is idle right now.
-        // stop() waits on this, so it has to mean "the worker is not inside a
-        // session" rather than "something happened".
-        m_idle = CreateEventW(nullptr, TRUE, TRUE, nullptr);
         // The wake handle is part of availability, not a detail. A recognizer
         // that cannot be stopped is worse than one that never started, so if
-        // either event could not be created this adapter reports itself
-        // unavailable rather than offering a listening state it cannot end --
-        // and without m_idle it cannot honour the promise that a returned stop()
-        // will be followed by no further callback.
-        m_available = m_devices > 0 && m_wake != nullptr && m_idle != nullptr;
+        // the event could not be created this adapter reports itself unavailable
+        // rather than offering a listening state it cannot end.
+        m_available = m_devices > 0 && m_wake != nullptr;
     }
 
     ~Impl() {
-        m_shuttingDown.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> apiLock(m_apiMutex);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_shuttingDown.store(true, std::memory_order_release);
+            m_listening.store(false, std::memory_order_release);
+            m_generation.fetch_add(1, std::memory_order_acq_rel);
+            m_onResult = {};
+            m_onEnd = {};
+        }
         if (m_wake != nullptr) {
             SetEvent(m_wake);
         }
@@ -257,9 +246,6 @@ public:
         }
         if (m_wake != nullptr) {
             CloseHandle(m_wake);
-        }
-        if (m_idle != nullptr) {
-            CloseHandle(m_idle);
         }
     }
 
@@ -275,12 +261,9 @@ public:
     }
 
     bool start(ResultCallback onResult, EndCallback onEnd, std::string& error) {
+        std::lock_guard<std::mutex> apiLock(m_apiMutex);
         if (!m_available) {
             error = detail();
-            return false;
-        }
-        if (m_listening.load(std::memory_order_acquire)) {
-            error = "already listening";
             return false;
         }
         if (!onResult || !onEnd) {
@@ -288,16 +271,24 @@ public:
             return false;
         }
         {
-            // The worker takes a copy before it invokes anything and clears the
-            // member first, so a consumer that stops the recognizer from inside
-            // its own callback cannot leave a second call through an empty
-            // std::function.
+            // Callbacks and generation are published together. The worker takes
+            // both under this same lock, so a stop/start between its readiness
+            // check and session entry cannot pair an old generation with new
+            // callbacks.
             std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_shuttingDown.load(std::memory_order_acquire)) {
+                error = "recognizer is shutting down";
+                return false;
+            }
+            if (m_listening.load(std::memory_order_acquire)) {
+                error = "already listening";
+                return false;
+            }
             m_onResult = std::move(onResult);
             m_onEnd = std::move(onEnd);
+            m_generation.fetch_add(1, std::memory_order_acq_rel);
+            m_listening.store(true, std::memory_order_release);
         }
-        m_listening.store(true, std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_acq_rel);
         if (m_thread.joinable()) {
             SetEvent(m_wake);
             return true;
@@ -314,51 +305,53 @@ public:
                 m_onResult = {};
                 m_onEnd = {};
             }
+            m_sessionFinished.notify_all();
             error = "the recognizer thread could not be started";
             return false;
         }
         return true;
     }
 
-    void stop() {
+    void requestStop() {
         // The generation bump is what actually ends a session: the worker's
         // wait loop compares against it, so a stop is noticed even if the
         // worker is between two events rather than sitting in the wait.
-        m_listening.store(false, std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_listening.store(false, std::memory_order_release);
+            m_generation.fetch_add(1, std::memory_order_acq_rel);
+            // If the worker has not claimed this session yet, there is nothing
+            // to wait for and its callbacks must not leak into a later start.
+            if (!m_sessionRunning) {
+                m_onResult = {};
+                m_onEnd = {};
+            }
+        }
         if (m_thread.joinable() && m_wake != nullptr) {
             SetEvent(m_wake);
         }
-        // Then wait for the worker to actually leave the session, which is the
-        // part that used to be missing and is what made this method unsafe.
-        //
-        // Bumping the generation says "stop"; it does not stop anything by
-        // itself. The worker is somewhere in runSession -- inside a COM call,
-        // inside a callback, about to call a callback -- and it gets to
-        // deliverResult and deliverEnd on its way out. Those call the
-        // consumer's lambdas, and the consumer's lambdas capture whatever the
-        // consumer is. If the consumer is a QObject that is being destroyed
-        // because the app is quitting, this thread is dereferencing a
-        // QMetaObject::invokeMethod on freed memory. No exception, no crash
-        // report pointing here, and the same window is what loses a new
-        // session's callbacks when a stop is immediately followed by a start.
-        //
-        // The interface already promised the safe version: "must not deliver a
-        // final result after it returns unless the phrase was genuinely
-        // complete". This is what honouring that costs.
-        //
-        // Not when called from the worker itself. A consumer is entitled to
-        // stop from inside its own callback, and waiting for the thread that is
-        // calling it would be a deadlock -- so the flag is set for the worker's
-        // whole lifetime and checked before waiting.
-        if (t_inWorker || m_idle == nullptr) {
+        m_sessionFinished.notify_all();
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> apiLock(m_apiMutex);
+        requestStop();
+    }
+
+    void stopAndWait() {
+        if (t_inWorker) {
+            requestStop();
             return;
         }
-        // Bounded, because the alternative to a timeout here is a shutdown
-        // that never finishes. It cannot normally expire: the worker's only
-        // long operations are the engine's, and the generation has already been
-        // bumped so it will take the cancelled path out of each of them.
-        WaitForSingleObject(m_idle, 2000);
+        std::lock_guard<std::mutex> apiLock(m_apiMutex);
+        requestStop();
+        // Keep starts excluded through this wait: a new session may not begin
+        // against the same borrowed callback target while its teardown is in
+        // progress. The worker needs only m_mutex, never m_apiMutex, to finish.
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_sessionFinished.wait(lock, [this] {
+            return !m_sessionRunning && !m_listening.load(std::memory_order_acquire);
+        });
     }
 
     [[nodiscard]] bool listening() const { return m_listening.load(std::memory_order_acquire); }
@@ -375,11 +368,10 @@ private:
         // release below is followed by CoUninitialize on this thread.
         const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(comInit)) {
-            m_listening.store(false, std::memory_order_release);
-            deliverEnd(takeCallbacks(), RecognitionEnd::Failed,
-                       "COM could not be initialised on the recognizer thread: "
-                           + formatHr(comInit));
-            return;
+            // Keep the worker alive to report the failure through each session's
+            // callbacks. start() remains asynchronous and the consumer receives
+            // the reason on the same callback path as other SAPI failures.
+            m_comFailure = formatHr(comInit);
         }
 
         for (;;) {
@@ -392,16 +384,38 @@ private:
                 }
                 continue;
             }
-            // Cleared for the whole of the session and set again after it, so
-            // that a stop() arriving at any moment either waits and is released
-            // the instant the worker leaves, or sees it already signalled. The
-            // window where a callback can be running is exactly the window
-            // where m_idle is clear, which is the whole point of it.
-            ResetEvent(m_idle);
-            runSession(m_generation.load(std::memory_order_acquire));
-            SetEvent(m_idle);
+
+            unsigned generation = 0;
+            SessionCallbacks callbacks;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_listening.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                generation = m_generation.load(std::memory_order_acquire);
+                callbacks.onResult = std::move(m_onResult);
+                callbacks.onEnd = std::move(m_onEnd);
+                m_onResult = {};
+                m_onEnd = {};
+                m_sessionRunning = true;
+            }
+            if (FAILED(comInit)) {
+                m_listening.store(false, std::memory_order_release);
+                deliverEnd(callbacks, RecognitionEnd::Failed,
+                           "COM could not be initialised on the recognizer thread: "
+                               + m_comFailure);
+            } else {
+                runSession(generation, callbacks);
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_sessionRunning = false;
+            }
+            m_sessionFinished.notify_all();
         }
-        CoUninitialize();
+        if (SUCCEEDED(comInit)) {
+            CoUninitialize();
+        }
     }
 
     // One pass of the wait loop with no session running. Returns false when the
@@ -423,11 +437,8 @@ private:
         return !m_shuttingDown.load(std::memory_order_acquire);
     }
 
-    void runSession(unsigned generation) {
+    void runSession(unsigned generation, const SessionCallbacks& callbacks) {
         SessionState state;
-        // Taken before anything else, so the callbacks belong to this session
-        // and to nothing that happens after it.
-        const SessionCallbacks callbacks = takeCallbacks();
 
         ISpRecognizer* recognizer = nullptr;
         ISpRecoContext* context = nullptr;
@@ -758,22 +769,6 @@ private:
         }
     }
 
-    // Moves the pending callbacks out of the members and leaves them empty.
-    // A consumer that stops the recognizer from inside its own callback can
-    // therefore never provoke a second invocation through a std::function that
-    // has just been called and destroyed.
-    SessionCallbacks takeCallbacks() {
-        SessionCallbacks callbacks;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            callbacks.onResult = std::move(m_onResult);
-            callbacks.onEnd = std::move(m_onEnd);
-            m_onResult = {};
-            m_onEnd = {};
-        }
-        return callbacks;
-    }
-
     // Invoked on the worker thread with this session's own callbacks, holding
     // no lock, so a consumer is free to call back into the recognizer -- and
     // free to stop it, which is the common way a listening session ends.
@@ -794,9 +789,6 @@ private:
     unsigned m_devices = 0;
     bool m_available = false;
     HANDLE m_wake = nullptr;
-    // Signalled whenever the worker is outside runSession, which is what makes
-    // a returned stop() a real boundary rather than a request.
-    HANDLE m_idle = nullptr;
     std::thread m_thread;
     // Bumped by both start() and stop(). A session runs against the value it
     // started with and ends the moment it no longer matches, which is what makes
@@ -804,7 +796,11 @@ private:
     std::atomic<unsigned> m_generation{0};
     std::atomic<bool> m_listening{false};
     std::atomic<bool> m_shuttingDown{false};
+    std::mutex m_apiMutex;
     std::mutex m_mutex;
+    std::condition_variable m_sessionFinished;
+    bool m_sessionRunning = false;
+    std::string m_comFailure;
     ResultCallback m_onResult;
     EndCallback m_onEnd;
 };
@@ -828,6 +824,10 @@ bool SapiSpeechRecognizer::start(ResultCallback onResult, EndCallback onEnd, std
 
 void SapiSpeechRecognizer::stop() {
     m_impl->stop();
+}
+
+void SapiSpeechRecognizer::stopAndWait() {
+    m_impl->stopAndWait();
 }
 
 bool SapiSpeechRecognizer::listening() const {

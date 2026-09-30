@@ -1,4 +1,5 @@
 #include "core/conversation.h"
+#include "core/pathtext.h"
 #include "core/idlepersona.h"
 #include "core/idletool.h"
 #include "core/persona.h"
@@ -7,6 +8,9 @@
 #include "runtime/mockbackend.h"
 
 #include <cassert>
+#include <filesystem>
+#include <string>
+#include <utility>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -52,8 +56,15 @@ void testConversationBasics() {
     assert(conversation.size() == 0);
 }
 
-// Exercises the mock backend's generation, context accounting, and the
-// (deliberate) absence of a fabricated throughput figure.
+// A one-turn request, which is what most of these tests want to say. Written as
+// a helper so the assertions below read as behaviour rather than as brace
+// nesting, and so a future change to the request shape touches one place.
+runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
+                               int maxTokens = 32) {
+    return runtime::GenerationRequest(
+        {runtime::ChatMessage{runtime::Role::User, std::move(text)}}, temperature, maxTokens);
+}
+
 void testMockBackend() {
     runtime::MockBackend backend;
     assert(backend.status().available);
@@ -61,7 +72,7 @@ void testMockBackend() {
 
     std::string streamed;
     bool completed = false;
-    backend.generate({"test", 0.7F, 32},
+    backend.generate(ask("test", 0.7F, 32),
                      [&streamed](std::string_view token) { streamed += token; },
                      [&completed](bool success, std::string_view) { completed = success; });
     assert(completed);
@@ -77,7 +88,7 @@ void testMockBackend() {
     assert(status.tokensPerSecond == 0.0);
 
     const std::size_t usedAfterFirst = status.contextUsed;
-    backend.generate({"again", 0.7F, 32}, [](std::string_view) {},
+    backend.generate(ask("again", 0.7F, 32), [](std::string_view) {},
                      [](bool, std::string_view) {});
     assert(backend.status().contextUsed > usedAfterFirst);
 }
@@ -1118,7 +1129,21 @@ void testSentenceStartBefore() {
 
 } // namespace
 
+void testPathTextRoundTrip() {
+    const std::string cyrillic = "\xd0\xbc\xd0\xbe\xd0\xb4\xd0\xb5\xd0\xbb\xd1\x8c.gguf";
+    const std::string cjk = "\xe6\xa8\xa1\xe5\x9e\x8b.gguf";
+    const std::string accented = "mod\xc3\xa8le.gguf";
+    for (const std::string& name : {cyrillic, cjk, accented, std::string("qwen2.5-coder.gguf")}) {
+        const auto path = core::pathFromUtf8(name);
+        assert(core::pathText(path) == name);
+        assert(core::pathText(path.filename()) == name);
+    }
+    const auto nested = core::pathFromUtf8("\xd0\x9f\xd1\x80\xd0\xb0\xd0\xbd\xd1\x8f/" + cjk);
+    assert(core::pathText(nested.filename()) == cjk);
+}
+
 int main() {
+    testPathTextRoundTrip();
     testConversationBasics();
     testMockBackend();
     testVoiceHappyPathAndEvents();

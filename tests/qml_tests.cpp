@@ -401,8 +401,10 @@ Item {
     property bool rowsHaveHeight: true
 
     component Switch: RowLayout {
+        id: switchRow
         required property string label
         Layout.fillWidth: true
+        Layout.maximumHeight: root.rowsHaveHeight ? 18 : 0
         implicitHeight: root.rowsHaveHeight ? 18 : 0
 
         // A hit target around the whole row, so the label is what you click.
@@ -416,7 +418,7 @@ Item {
             }
             Text {
                 objectName: "label"
-                text: parent.label
+                text: switchRow.label
                 anchors.verticalCenter: parent.verticalCenter
                 font.pixelSize: 11
             }
@@ -436,17 +438,7 @@ Item {
 }
 )QML");
 
-    const QString path = QStringLiteral(KESTREL_UI_DIR "/layoutprobe.qml");
-    {
-        QFile file(path);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            std::cout << "  FAIL cannot write the layout probe: " << file.errorString().toStdString()
-                      << "\n";
-            ++g_failures;
-            return;
-        }
-        file.write(probe.toUtf8());
-    }
+    const QUrl baseUrl = QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/layoutprobe.qml"));
 
     static QQuickWindow* window = new QQuickWindow();
     window->resize(420, 420);
@@ -454,10 +446,10 @@ Item {
     // Instantiated twice from the same file, so the two panels are the same
     // document differing only in the property under test.
     const auto problemsFor = [&](bool rowsHaveHeight) {
-        QQmlEngine probe;
-        probe.addImportPath(QStringLiteral(KESTREL_UI_DIR));
-        QQmlComponent component(&probe);
-        component.loadUrl(QUrl::fromLocalFile(path));
+        QQmlEngine probeEngine;
+        probeEngine.addImportPath(QStringLiteral(KESTREL_UI_DIR));
+        QQmlComponent component(&probeEngine);
+        component.setData(probe.toUtf8(), baseUrl);
         if (component.isError()) {
             std::cout << "  FAIL cannot load the layout probe: "
                       << component.errorString().toStdString() << "\n";

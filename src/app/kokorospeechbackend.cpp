@@ -36,11 +36,9 @@ KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript,
     // through the same path as a launch failure so the caller unwinds the same
     // way.
     connect(m_process, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
-        if (status == QProcess::NormalExit && exitCode == 0) {
-            // A clean exit after an explicit stop. The stop path has already
-            // settled the state, so there is nothing to report.
-            return;
-        }
+        // This persistent driver has no normal shutdown while owned. Even a
+        // zero exit is unexpected and must release any reply waiting for it.
+        static_cast<void>(status);
         noteEngineFailed(tr("the local voice stopped unexpectedly (exit %1)")
                              .arg(exitCode));
     });

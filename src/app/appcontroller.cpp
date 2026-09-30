@@ -32,12 +32,44 @@ constexpr int kTitleLimit = 42;
 
 // The shared prefix: every turn starts with this text, so it is the one part of
 // the prompt the backend can decode once and keep resident instead of resending
-// with each request. It is deliberately short, because a long persona prompt is
-// exactly the cost this avoids paying per turn.
+// with each request.
+//
+// It is written to make the *shape* of an answer good rather than to make the
+// model sound knowledgeable. Two deliberate constraints:
+//
+//   * Structure is asked for explicitly, because an instruct model left to
+//     itself drifts into a single undifferentiated paragraph. Clear sentences,
+//     logical connective tissue, and a direct answer before the elaboration
+//     are all things the model can actually be steered towards.
+//   * Calibre is asked for explicitly, and in the same breath as the request
+//     for confidence. A model told to be authoritative with no instruction
+//     about doubt will manufacture certainty, which is the one failure a user
+//     cannot detect. So the prompt makes an unverified claim worse than no
+//     answer, and names the cases where it should stop and say so.
+//
+// Note what this cannot do: it shapes how a model answers, not what it knows.
+// A small local model asked to reason carefully will still reason within its
+// capacity, and the prompt should not be mistaken for a way around that.
 const QString kDefaultSystemPrompt = QStringLiteral(
-    "You are Kestrel, a local desktop assistant running on the user's own "
-    "machine. Answer briefly and plainly, and say when you are unsure instead "
-    "of guessing.");
+    "You are Kestrel, a local desktop assistant running entirely on the user's "
+    "own machine.\n"
+    "\n"
+    "Write well. Answer in complete, well-structured sentences, using clear "
+    "paragraphs where the material warrants them. Lead with the direct answer, "
+    "then give the reasoning that supports it. Use concrete nouns and active "
+    "verbs, connect claims to the evidence for them, and avoid filler, "
+    "hedging padding, and restating the question back.\n"
+    "\n"
+    "Be as confident as your evidence actually supports, and no more. Before "
+    "asserting something specific -- a number, a date, a name, an API, a "
+    "quotation -- check it against what you actually know. If you are not "
+    "sure, say so plainly and say what would settle it. If a question needs "
+    "information you do not have, ask for that rather than inventing an "
+    "answer. A correct refusal is a better result than a confident invention, "
+    "and the user is relying on this to make decisions.\n"
+    "\n"
+    "If you can genuinely verify something, say how you verified it. If you "
+    "cannot, do not imply that you did.");
 
 // How many prior turns are replayed to the model. Bounded because the prompt
 // grows with it, and the whole point of the shared prefix is lost if the
@@ -161,11 +193,19 @@ AppController::AppController(QObject* parent)
     // fatal: asking for an engine that is not installed should leave the app
     // with the voice it can actually speak, not with no voice at all.
     const QString requested = qEnvironmentVariable("KESTREL_VOICE_ENGINE");
-    m_speechEngine = (!requested.isEmpty() && m_localVoices->create(requested) != nullptr)
-                         ? requested
-                         : m_localVoices->defaultEngineId();
-    if (!m_speechEngine.isEmpty()) {
-        m_speech->adoptBackend(m_localVoices->create(m_speechEngine));
+    const QString fallback = m_localVoices->defaultEngineId();
+    const QString selected = requested.isEmpty() ? fallback : requested;
+    std::unique_ptr<SpeechBackend> localBackend = m_localVoices->create(selected);
+    if (localBackend == nullptr && selected != fallback) {
+        localBackend = m_localVoices->create(fallback);
+        if (localBackend != nullptr) {
+            m_speechEngine = fallback;
+        }
+    } else if (localBackend != nullptr) {
+        m_speechEngine = selected;
+    }
+    if (localBackend != nullptr) {
+        m_speech->adoptBackend(std::move(localBackend));
     }
 #endif
     connect(m_speech.get(), &SpeechSynthesizer::segmentFinished,
@@ -174,9 +214,13 @@ AppController::AppController(QObject* parent)
             this, &AppController::onSpeechStopCompleted);
     connect(m_speech.get(), &SpeechSynthesizer::availabilityChanged,
             this, &AppController::onSpeechAvailabilityChanged);
+    connect(m_speech.get(), &SpeechSynthesizer::availabilityChanged,
+            this, [this](bool) { emit ttsChanged(); });
     connect(m_speech.get(), &SpeechSynthesizer::owedAudioReleased,
             this, &AppController::onOwedAudioReleased);
     connect(m_speech.get(), &SpeechSynthesizer::failed, this, [this](const QString& reason) {
+        m_waitingForSpeechBoundary = false;
+        m_deferredSpeechRestart = false;
         // A voice that dies mid-response must not take the reply with it: the
         // text is already on screen, so the failure is reported and the
         // remaining clauses are simply not spoken.
@@ -199,9 +243,11 @@ AppController::AppController(QObject* parent)
     // a user who wants the real adapter on a machine the probe says is deaf.
     const QString requestedInput = qEnvironmentVariable("KESTREL_SPEECH_INPUT");
     const runtime::SpeechInput preference =
-        requestedInput == QLatin1String("mock") ? runtime::SpeechInput::Mock
-        : requestedInput == QLatin1String("platform") ? runtime::SpeechInput::Platform
-                                                      : runtime::SpeechInput::Auto;
+        requestedInput.compare(QLatin1String("mock"), Qt::CaseInsensitive) == 0
+            ? runtime::SpeechInput::Mock
+        : requestedInput.compare(QLatin1String("platform"), Qt::CaseInsensitive) == 0
+            ? runtime::SpeechInput::Platform
+            : runtime::SpeechInput::Auto;
     m_recognizer = runtime::makeBestSpeechRecognizer(preference);
     m_listen = std::make_unique<ListenSession>(*m_recognizer, this);
     connect(m_listen.get(), &ListenSession::utteranceFinal,
@@ -304,16 +350,10 @@ AppController::~AppController() {
     // The listen session goes first, then the recognizer, and this is not a
     // style preference.
     //
-    // m_listen is declared after m_recognizer, so members are destroyed in
-    // reverse and the implicit order would already be right. It is spelled out
-    // anyway because the reason is not visible from the declarations: the
-    // session owns the callbacks the recognizer's worker thread invokes, and
-    // those lambdas address the session by raw pointer. ~ListenSession stops
-    // the recognizer, which is the boundary that makes the callbacks safe --
-    // and it can only do that while the recognizer it holds a reference to is
-    // still alive. Releasing the recognizer first would leave ~ListenSession
-    // calling stop() on a destroyed object, which is the same class of bug one
-    // step earlier in the same destructor.
+    // m_listen borrows m_recognizer, so it must be released first. Its
+    // destructor invalidates queued callbacks and calls stopAndWait() before
+    // destroying the QObject receiver; the recognizer remains alive for that
+    // boundary. Ordinary cancellation remains nonblocking.
     m_listen.reset();
     m_recognizer.reset();
 
@@ -458,7 +498,8 @@ bool AppController::canPause() const noexcept {
 
 bool AppController::canResume() const noexcept {
     const core::VoiceResponse* response = m_voice.find(m_activeResponse);
-    return response != nullptr && response->state() == core::ResponseState::Paused;
+    return !m_generating && response != nullptr
+        && response->state() == core::ResponseState::Paused;
 }
 
 bool AppController::canBargeIn() const noexcept {
@@ -562,11 +603,12 @@ QVariantList AppController::speechEngines() const {
 }
 
 bool AppController::setSpeechEngine(const QString& engineId) {
-    if (m_localVoices == nullptr || engineId == m_speechEngine) {
+    if (m_localVoices == nullptr || engineId == m_speechEngine || m_speaking
+        || m_waitingForSpeechBoundary || (m_speech != nullptr && m_speech->audioOwed())) {
         return false;
     }
     std::unique_ptr<SpeechBackend> backend = m_localVoices->create(engineId);
-    if (backend == nullptr || !backend->usable()) {
+    if (backend == nullptr || (!backend->usable() && !backend->present())) {
         // Refused rather than swapped in and failed later: an engine that cannot
         // start would leave the app with no voice at all, which is worse than
         // staying on the one that works.
@@ -735,6 +777,8 @@ void AppController::finishPlayback() {
     m_speaking = false;
     m_hasPendingSegment = false;
     m_openingPauseMs = 0;
+    m_waitingForSpeechBoundary = false;
+    m_deferredSpeechRestart = false;
     // The response is delivered once it has been spoken, not once it has been
     // generated. That is the whole point of the text-only fallback having been
     // a fallback: with audio, completion follows the audio.
@@ -766,7 +810,7 @@ void AppController::onSpeechAvailabilityChanged(bool available) {
         return;
     }
     m_speechError.clear();
-    if (m_speech->audioOwed()) {
+    if (m_speech->audioOwed() && !m_waitingForSpeechBoundary) {
         // The engine turned up, so the response it was holding is spoken
         // now, from the same untouched text: the pump reads that response's
         // own unspoken remainder, so nothing is re-sent and nothing stale is
@@ -797,6 +841,19 @@ void AppController::onOwedAudioReleased(bool voiceGaveUp) {
 }
 
 void AppController::onSpeechStopCompleted() {
+    if (m_waitingForSpeechBoundary) {
+        m_waitingForSpeechBoundary = false;
+        m_speaking = false;
+        m_hasPendingSegment = false;
+        m_openingPauseMs = 0;
+        emit ttsChanged();
+        emit presenceChanged();
+        if (m_deferredSpeechRestart) {
+            m_deferredSpeechRestart = false;
+            startPlayback();
+        }
+        return;
+    }
     if (!m_speaking) {
         return;
     }
@@ -808,6 +865,13 @@ void AppController::onSpeechStopCompleted() {
 }
 
 void AppController::startPlayback() {
+    if (m_waitingForSpeechBoundary) {
+        // The previous response still owns the speaker until its active clause
+        // ends. startGeneration() may already be collecting the replacement's
+        // text, so remember to start the new response when stopCompleted arrives.
+        m_deferredSpeechRestart = true;
+        return;
+    }
     // Whether the response is owed audio or handed over to text is decided
     // here, once, and it is the decision that used to be made too early: a
     // local model is installed and running before it can answer, so checking
@@ -1006,7 +1070,8 @@ bool AppController::canLoadModel() const {
     // Ask a throwaway instance rather than caching a flag: whether a real model
     // can be loaded is a build-time fact, but a cached copy would go stale the
     // moment the answer is refactored into a runtime check.
-    return runtime::LlamaCppBackend{}.status().available;
+    return runtime::LlamaCppBackend{}.status().available
+        || runtime::OrtGenAiBackend{}.status().available;
 }
 
 /// Returns the loaded model's local path, or an empty string in preview mode.
@@ -1022,6 +1087,9 @@ QString AppController::modelError() const {
 /// Loads a candidate off the UI thread, then installs it through a queued signal.
 /// Keeps the current backend on validation/load failure or if generation remains active.
 void AppController::loadModelFromUrls(const QStringList& urls) {
+    if (m_modelLoadThread) {
+        return;
+    }
     m_modelQueue = urls;
     m_modelAttempts.clear();
     if (m_modelQueue.isEmpty()) {
@@ -1138,7 +1206,7 @@ void AppController::loadModelFromUrl(const QString& url) {
         // --print-runtime or a smoke test already waiting on that signal ran,
         // concluded, and exited before the retry was ever delivered. The
         // fallback was in the code and had never run.
-        if (!m_modelError.isEmpty() && !m_modelQueue.isEmpty()) {
+        if (!m_discardModelLoad && !m_modelError.isEmpty() && !m_modelQueue.isEmpty()) {
             m_modelError.clear();
             loadModelFromUrl(m_modelQueue.takeFirst());
             return;
@@ -1149,6 +1217,8 @@ void AppController::loadModelFromUrl(const QString& url) {
                               nullptr, static_cast<int>(m_modelAttempts.size()))
                                .arg(m_modelError);
         }
+        m_modelQueue.clear();
+        emit modelErrorChanged();
         emit modelLoadFinished();
     }, Qt::QueuedConnection);
     m_modelLoadThread->start();
@@ -1158,6 +1228,7 @@ void AppController::loadModelFromUrl(const QString& url) {
 /// Preserves the declared system prompt and reports a timeout through modelError().
 void AppController::usePreviewBackend() {
     m_discardModelLoad = true;
+    m_modelQueue.clear();
     waitForIdleGeneration(kBackendSwapTimeoutMs);
     if (workerBusy()) {
         m_modelError = tr("A response is still running. Stop it and try again.");
@@ -1201,11 +1272,17 @@ void AppController::drainBackgroundRequests() {
     disconnect(done);
 }
 
-void AppController::waitForIdleGeneration(int timeoutMs) {
+void AppController::waitForIdleGeneration(int timeoutMs, bool stopAudio) {
     if (!workerBusy()) {
         return;
     }
-    stopGeneration();
+    if (stopAudio) {
+        stopGeneration();
+    } else if (m_generating) {
+        // Replacing a prompt cancels text but lets the speaking clause land.
+        m_userStopped = true;
+        m_worker->cancel();
+    }
     // The prewarm and the tool run are not a conversation, so stopGeneration()
     // does not speak for them and they keep going unless they are cancelled
     // here. Without this the wait below is a wait for a request that will not
@@ -1288,6 +1365,10 @@ void AppController::noteActivity() {
 }
 
 void AppController::runIdleToolIfPermitted() {
+    if (workerBusy()) {
+        m_idleToolNotice = tr("The model worker is busy; the idle tool was skipped.");
+        return;
+    }
     const ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
         return;
@@ -1568,7 +1649,7 @@ void AppController::onGenerationFinished(quint64 requestId,
         // The pump can have gone idle earlier, waiting for answer text that had
         // not been generated yet. Now that the response is whole, let it speak
         // the remainder and deliver the turn properly.
-        if (m_speaking) {
+        if (m_speaking && !m_waitingForSpeechBoundary) {
             pumpNextSegment();
         }
         return;
@@ -1597,6 +1678,20 @@ void AppController::startGeneration(const QString& userText) {
     // The warmup has to be given the chance to finish, and only then may the
     // reply be queued.
     drainBackgroundRequests();
+    if (workerBusy()) {
+        m_modelError = tr("Background work is still stopping. Try again in a moment.");
+        emit modelErrorChanged();
+        return;
+    }
+
+    const ConversationEntry* current = activeEntry();
+    if (current == nullptr || current->conversation.messages().empty()
+        || current->conversation.messages().back().role != core::MessageRole::User
+        || current->conversation.messages().back().content != userText.toStdString()) {
+        // The bounded nested wait can process another UI turn or a conversation
+        // switch. Do not launch a reply built from a different active transcript.
+        return;
+    }
 
     m_messageModel->appendMessage(core::MessageRole::Assistant, {}, MessageStatus::Streaming);
     m_generating = true;
@@ -1627,48 +1722,54 @@ void AppController::startGeneration(const QString& userText) {
     // The voice timeline tracks the user's words; the model gets the assembled
     // conversation. The system prompt is not in it -- the backend holds that as
     // a cached prefix, and repeating it here would undo the caching.
-    m_worker->start(m_activeRequestId, buildPrompt(), 0.7F, 512);
+    m_worker->start(m_activeRequestId, buildMessages(), 0.7F, 512);
 }
 
-/// Formats nonempty user/assistant messages among the latest eight entries, then an assistant cue.
-/// Excludes the shared system prompt: it is the backend's cached prefix, and repeating it
-/// here would undo the caching.
-QString AppController::buildPrompt() const {
-    QString prompt;
+std::vector<runtime::ChatMessage> AppController::buildMessages() const {
+    std::vector<runtime::ChatMessage> messages;
     const ConversationEntry* entry = activeEntry();
     if (entry != nullptr) {
-        const auto& messages = entry->conversation.messages();
+        const auto& history = entry->conversation.messages();
         // Walk backwards so the limit keeps the most recent turns, which are
         // the ones the current question actually depends on.
         const std::size_t firstUsable =
-            messages.size() > kHistoryTurns ? messages.size() - kHistoryTurns : 0;
-        for (std::size_t i = firstUsable; i < messages.size(); ++i) {
-            const core::Message& message = messages[i];
+            history.size() > kHistoryTurns ? history.size() - kHistoryTurns : 0;
+        for (std::size_t i = firstUsable; i < history.size(); ++i) {
+            const core::Message& message = history[i];
             // The empty assistant placeholder for this turn is already in the
             // conversation and would only add a dangling label.
-            if (message.content.empty()
-                || (message.role != core::MessageRole::User
-                    && message.role != core::MessageRole::Assistant)) {
+            if (message.content.empty()) {
                 continue;
             }
-            if (!prompt.isEmpty()) {
-                prompt += QLatin1Char('\n');
+            runtime::Role role = runtime::Role::User;
+            switch (message.role) {
+                case core::MessageRole::User:
+                    role = runtime::Role::User;
+                    break;
+                case core::MessageRole::Assistant:
+                    role = runtime::Role::Assistant;
+                    break;
+                case core::MessageRole::System:
+                    role = runtime::Role::System;
+                    break;
+                case core::MessageRole::Tool:
+                    role = runtime::Role::Tool;
+                    break;
             }
-            prompt += message.role == core::MessageRole::User ? QStringLiteral("User: ")
-                                                               : QStringLiteral("Assistant: ");
-            prompt += QString::fromStdString(message.content);
+            messages.push_back(runtime::ChatMessage{role, message.content});
         }
     }
-    if (!prompt.isEmpty()) {
-        prompt += QLatin1Char('\n');
-    }
-    prompt += QStringLiteral("Assistant:");
-    return prompt;
+    // The shared system prompt is not added here. It is the backend's cached
+    // prefix, and repeating it in the conversation would both undo the caching
+    // and let the renderer place it somewhere the model was not trained to
+    // expect it.
+    return messages;
 }
 
 void AppController::finalizeStream(MessageStatus status, const QString& note) {
     m_messageModel->setLastMessageStatus(status, note);
     m_generating = false;
+    m_activeRequestId = 0;
     m_userPaused = false;
     m_userStopped = false;
     m_generationClock.invalidate();
@@ -1688,12 +1789,22 @@ void AppController::sendMessage(const QString& text) {
     if (trimmed.isEmpty() || !runtimeAvailable()) {
         return;
     }
+    if (workerBusy()) {
+        waitForIdleGeneration(kBackendSwapTimeoutMs, false);
+        if (workerBusy()) {
+            return;
+        }
+    }
+    // The nested wait may process conversation changes; borrow only afterwards.
     ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
         return;
     }
-
-    if (m_generating || m_speaking) {
+    if (canResume()) {
+        m_voice.cancel(m_activeResponse);
+        m_messageModel->setLastMessageStatus(MessageStatus::Stopped, {});
+    }
+    if (m_speaking) {
         // A new prompt mid-response is a barge-in: preserve what was already
         // delivered, invalidate the in-flight generation so late tokens are
         // rejected as stale, and hand the timeline to the new prompt.
@@ -1710,8 +1821,11 @@ void AppController::sendMessage(const QString& text) {
         }
         if (m_speaking) {
             // Clause boundary, not mid-word: the clause in flight is allowed to
-            // land, and no further segment is pulled. An explicit stop still
+            // land, and no further segment is pulled. Defer the replacing cue
+            // until that boundary arrives; otherwise its completion could be
+            // mistaken for a segment of the new response. An explicit stop still
             // cuts immediately, which is what stopGeneration() is for.
+            m_waitingForSpeechBoundary = true;
             m_speech->requestStop();
         }
         m_presence.noteUserAction(core::UserAction::Interrupted);
@@ -1745,13 +1859,24 @@ void AppController::sendMessage(const QString& text) {
 }
 
 void AppController::stopGeneration() {
+    m_waitingForSpeechBoundary = false;
+    m_deferredSpeechRestart = false;
     if (m_speech != nullptr) {
         // Stop means stop. A reply being held for a voice that has not arrived
         // yet is still audio the user is waiting on, and Escape did nothing at
         // all without this.
         m_speech->releaseOwedAudio();
     }
+    if (m_listen != nullptr && m_listen->listening()) {
+        m_listen->stopListening();
+        emit listeningChanged();
+    }
     if (!m_generating && !m_speaking) {
+        if (canResume()) {
+            m_voice.cancel(m_activeResponse);
+            m_messageModel->setLastMessageStatus(MessageStatus::Stopped, {});
+            emit voiceChanged();
+        }
         return;
     }
     if (m_generating) {
@@ -1831,14 +1956,10 @@ void AppController::resumeConversation() {
 
         // Continue from the text the response still owes rather than
         // regenerating from scratch.
-        const core::VoiceResponse* response = m_voice.find(m_activeResponse);
-        const std::string_view remainder =
-            response != nullptr ? response->unspokenText() : std::string_view{};
-        // Requests carry rendered text in this runtime. Leave the assistant
-        // turn open: no user label, turn terminator, or second generation cue.
-        const QString continuation = QStringLiteral("Assistant: ")
-            + QString::fromUtf8(remainder.data(), static_cast<int>(remainder.size()));
-        m_worker->start(m_activeRequestId, continuation, 0.7F, 512);
+        // Keep the full conversation and leave its final assistant turn open.
+        // Relabelling the suffix as a user message would answer it instead of
+        // continuing the response, and dropping history loses the question.
+        m_worker->start(m_activeRequestId, buildMessages(), 0.7F, 512, false);
         return;
     }
 
@@ -1856,8 +1977,12 @@ void AppController::resumeConversation() {
 
 void AppController::newConversation() {
     if (m_generating) {
-        stopGeneration();
+        waitForIdleGeneration(kBackendSwapTimeoutMs);
+        if (m_generating) {
+            return;
+        }
     }
+    stopGeneration();
     if (ConversationEntry* current = activeEntry();
         current != nullptr && current->conversation.size() == 0) {
         setSearchQuery({});
@@ -1875,8 +2000,12 @@ void AppController::selectConversation(int id) {
         return;
     }
     if (m_generating) {
-        stopGeneration();
+        waitForIdleGeneration(kBackendSwapTimeoutMs);
+        if (m_generating) {
+            return;
+        }
     }
+    stopGeneration();
     setActiveConversation(id);
 }
 
@@ -1895,17 +2024,24 @@ void AppController::renameConversation(int id, const QString& title) {
 }
 
 void AppController::deleteConversation(int id) {
-    const auto it = std::find_if(m_entries.begin(), m_entries.end(),
-                                 [id](const auto& entry) { return entry->id == id; });
-    if (it == m_entries.end()) {
+    if (findEntry(id) == nullptr) {
         return;
     }
 
     const bool wasActive = (id == m_activeId);
     if (wasActive && m_generating) {
-        stopGeneration();
+        waitForIdleGeneration(kBackendSwapTimeoutMs);
+        if (m_generating) {
+            return;
+        }
+    }
+    const auto it = std::find_if(m_entries.begin(), m_entries.end(),
+                                [id](const auto& entry) { return entry->id == id; });
+    if (it == m_entries.end() || wasActive != (id == m_activeId)) {
+        return; // A nested UI event already changed the selection or removed it.
     }
     if (wasActive) {
+        stopGeneration();
         m_messageModel->setEntry(nullptr);
     }
 
@@ -1950,6 +2086,8 @@ void AppController::regenerateLastResponse() {
         return;
     }
 
+    stopGeneration();
+    m_voice.cancel(m_activeResponse);
     m_messageModel->removeLastMessage();
     startGeneration(prompt);
 }
@@ -2011,6 +2149,8 @@ ConversationEntry* AppController::createConversation() {
 
 void AppController::setActiveConversation(int id) {
     if (id != m_activeId) {
+        m_waitingForSpeechBoundary = false;
+        m_deferredSpeechRestart = false;
         // Leaving the conversation a held reply belongs to abandons its audio,
         // the same way leaving abandons its generation. Without this the reply
         // went on being promised, and the engine arriving a moment later spoke
@@ -2032,6 +2172,11 @@ void AppController::setActiveConversation(int id) {
             m_acknowledgement.clear();
             emit ttsChanged();
         }
+    }
+    if (id != m_activeId) {
+        m_voice.cancel(m_activeResponse);
+        m_activeResponse = core::kInvalidResponseId;
+        m_activeGeneration = core::kInvalidGenerationId;
     }
     m_activeId = id;
     m_messageModel->setEntry(findEntry(id));

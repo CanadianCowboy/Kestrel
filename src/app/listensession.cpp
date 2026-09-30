@@ -9,11 +9,12 @@ ListenSession::ListenSession(runtime::SpeechRecognizer& recognizer, QObject* par
 }
 
 ListenSession::~ListenSession() {
-    // Unconditional, and before anything of this object is gone. stop() is
-    // cheap when the session already ended -- the callbacks have been taken
-    // and cleared, so there is nothing to wait for -- and it is the only thing
-    // that makes the recognizer's use of `this` safe from here on.
-    m_recognizer.stop();
+    // Invalidate queued deliveries first, then wait until a push recognizer has
+    // left its callback before this receiver is destroyed. stopAndWait() is a
+    // teardown-only boundary; ordinary UI cancellation stays nonblocking.
+    ++m_sessionId;
+    m_poll.stop();
+    m_recognizer.stopAndWait();
 }
 
 bool ListenSession::startListening(QString& error) {
@@ -28,6 +29,7 @@ bool ListenSession::startListening(QString& error) {
 
     m_partial.clear();
     m_submitted = false;
+    const quint64 sessionId = ++m_sessionId;
     std::string failure;
     // The recognizer's contract says its callbacks arrive on its own thread, so
     // they are handed straight back to this object's thread rather than acted
@@ -45,29 +47,30 @@ bool ListenSession::startListening(QString& error) {
     // worker thread executing this lambda, and calling invokeMethod on a `this`
     // that is being destroyed underneath it.
     //
-    // That is why the destructor stops the recognizer rather than relying on
-    // this, and why AppController releases the recognizer before the session.
-    // A returned stop() is the boundary; everything after it is arithmetic.
+    // The destructor waits for any callback invoking this lambda before it
+    // destroys the receiver, and the session id makes queued deliveries inert
+    // after cancellation or restart.
     if (!m_recognizer.start(
-            [this](const runtime::RecognitionResult& result) {
+            [this, sessionId](const runtime::RecognitionResult& result) {
                 QMetaObject::invokeMethod(
                     this,
-                    [this, result] {
-                        onResult(result);
+                    [this, sessionId, result] {
+                        onResult(sessionId, result);
                     },
                     Qt::QueuedConnection);
             },
-            [this](runtime::RecognitionEnd reason, std::string_view detail) {
+            [this, sessionId](runtime::RecognitionEnd reason, std::string_view detail) {
                 const std::string reason_text(detail);
                 QMetaObject::invokeMethod(
                     this,
-                    [this, reason, reason_text] {
-                        onEnd(reason, reason_text);
+                    [this, sessionId, reason, reason_text] {
+                        onEnd(sessionId, reason, reason_text);
                     },
                     Qt::QueuedConnection);
             },
             failure)) {
         error = QString::fromStdString(failure);
+        ++m_sessionId;
         return false;
     }
 
@@ -82,6 +85,7 @@ void ListenSession::stopListening() {
         return;
     }
     m_poll.stop();
+    ++m_sessionId;
     m_recognizer.stop();
     // stop() may or may not produce an end event depending on the recognizer, so
     // the state is settled here rather than waiting to be told.
@@ -123,8 +127,8 @@ void ListenSession::setPartialIntervalMs(int ms) {
     m_poll.setInterval(std::max(1, ms));
 }
 
-void ListenSession::onResult(const runtime::RecognitionResult& result) {
-    if (!m_listening) {
+void ListenSession::onResult(quint64 sessionId, const runtime::RecognitionResult& result) {
+    if (!m_listening || sessionId != m_sessionId) {
         return;
     }
     if (result.isFinal) {
@@ -149,8 +153,9 @@ void ListenSession::onResult(const runtime::RecognitionResult& result) {
     emit partialChanged();
 }
 
-void ListenSession::onEnd(runtime::RecognitionEnd reason, const std::string& detail) {
-    if (!m_listening) {
+void ListenSession::onEnd(quint64 sessionId, runtime::RecognitionEnd reason,
+                          const std::string& detail) {
+    if (!m_listening || sessionId != m_sessionId) {
         return;
     }
     m_poll.stop();

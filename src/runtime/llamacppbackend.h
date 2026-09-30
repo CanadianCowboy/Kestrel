@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace kestrel::runtime {
 
@@ -77,10 +78,23 @@ private:
     /// Caller must hold m_mutex.
     [[nodiscard]] std::size_t applySystemPrefix(bool& prefixFailed);
 
-    /// Bytes of KV cache this model holds for a full context. Computed from the
-    /// model's own shape and the KV types the context was created with, since
-    /// llama.cpp exposes no accessor for the resolved allocation. Returns 0 when
-    /// the model does not report enough to compute it honestly.
+    // Renders a conversation the way this model expects to be talked to.
+    //
+    // Uses the model's own chat template when it ships one, and the portable
+    // plain format when it does not. A model whose template llama.cpp does not
+    // recognise also falls back, because an unsupported template is not a
+    // reason to refuse to answer.
+    [[nodiscard]] std::string renderChat(const std::vector<ChatMessage>& messages,
+                                         bool addAssistantCue) const;
+
+    // True when this model has a chat template llama.cpp can actually apply,
+    // so the diagnostics can say which path is in use.
+    [[nodiscard]] bool hasChatTemplate() const;
+
+    // Bytes of KV cache this model holds for a full context. Computed from the
+    // model's own shape and the KV types the context was created with, since
+    // llama.cpp exposes no accessor for the resolved allocation. Returns 0 when
+    // the model does not report enough to compute it honestly.
     [[nodiscard]] std::size_t kvCacheBytes() const;
 
     mutable std::mutex m_mutex;

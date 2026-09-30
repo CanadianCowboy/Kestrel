@@ -2,8 +2,7 @@
 
 ## Project overview
 
-Kestrel is a Windows-first, local personal AI desktop agent. The portable core is
-C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time.
+Kestrel is a local-first personal AI desktop app, with Windows/NVIDIA as the primary optimization target. The portable core is C++20/CMake; the Qt 6/QML desktop shell is optional at configure time. Optional inference adapters include llama.cpp (GGUF) and ONNX Runtime GenAI; TensorRT engine tooling is not an interactive inference backend.
 
 ## Repository map
 
@@ -12,8 +11,7 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
   sandboxed idle loop (`idlepersona.*`), and the voice response timeline
   (`voicesession.*`); keep this layer portable and independent of Qt and
   inference SDKs.
-- `src/runtime/`: backend contracts and adapters. Keep native llama.cpp and
-  TensorRT integration contained in their respective adapters.
+- `src/runtime/`: portable contracts and adapters for llama.cpp, ONNX Runtime GenAI, CUDA discovery, and Windows SAPI. Keep native SDK headers inside their adapter translation units.
 - `src/app/`: Qt application startup and UI-facing controller.
 - `src/ui/`: QML desktop interface.
 - `tests/`: small, dependency-free tests for portable behavior.
@@ -21,17 +19,15 @@ C++20 and CMake; the desktop shell is Qt 6/QML and is optional at configure time
 ## Vendor SDK boundary
 
 `src/runtime/cudadiscovery_cuda.cpp` is the only translation unit that may
-include a CUDA header, `src/runtime/tensorrtbackend.cpp` is the only one that
-may include TensorRT headers, and `src/runtime/sapirecognizer_win32.cpp` is the
-only one that may include a SAPI header. All other code, including
-`cudadevice.h`, `sapirecognizer.h`, `AppController`, and QML, reads platform
-facts through the portable structs and interfaces.
+include a CUDA header, and `src/runtime/sapirecognizer_win32.cpp` is the only one
+that may include a SAPI header. All other code, including portable runtime
+interfaces, `AppController`, and QML, uses project-owned types. CMake selects
+portable stubs when optional CUDA or SAPI support is not available. Do not widen
+vendor headers into common code; extend an existing adapter instead.
 
-CMake picks `cudadiscovery_cuda.cpp` or `cudadiscovery_stub.cpp` based on
-`KESTREL_ENABLE_CUDA` and toolkit detection, and `sapirecognizer_win32.cpp` or
-`sapirecognizer_stub.cpp` based on the Windows SDK. Do not add a second
-CUDA-including or SAPI-including file; extend the portable header and the
-existing implementation instead.
+The current model inference adapters are llama.cpp for GGUF and optional ONNX
+Runtime GenAI for compatible model folders. Do not describe the TensorRT engine
+metadata tool as model conversion or interactive inference.
 
 ## Implementation conventions
 
@@ -72,7 +68,10 @@ ctest --test-dir build -C Debug --output-on-failure
 ```
 
 For UI changes, configure with `-DKESTREL_BUILD_UI=ON`. Qt 6.6+ is required for
-the desktop target; CMake will skip that target when Qt is unavailable.
+the desktop target; CMake will skip that target when Qt is unavailable. Qt
+Multimedia, Qt Text-to-Speech, CUDA, llama.cpp, and ONNX Runtime GenAI are
+optional; missing integrations must leave a working fallback and an honest
+diagnostic.
 
 CUDA device discovery compiles in automatically when a CUDA Toolkit is present
 and falls back to a stub that explains itself when it is not, so no extra flag is
@@ -82,6 +81,12 @@ needed for normal work. To verify or disable it explicitly:
 cmake -S . -B build-nocuda -DKESTREL_BUILD_UI=OFF -DKESTREL_ENABLE_CUDA=OFF
 ```
 
-`kestrel.exe --print-runtime` reports the detected device and every backend's
-availability without opening a window. Use it in development notes instead of
-recalling GPU, driver, and CUDA versions from memory.
+`kestrel.exe --print-runtime` reports the selected model backend, GPU probe,
+and voice/dictation availability without opening a window. Use it in development
+notes instead of recalling GPU, driver, and CUDA versions from memory.
+
+Speech input uses a `SpeechRecognizer` adapter; current Windows SAPI supplies
+completed phrases, while the mock recognizer is only for tests/preview. Speech
+output uses a separate `SpeechBackend`; current playback is clause-based and
+has no VAD/AEC full-duplex pipeline. Keep these seams replaceable until the
+advanced voice runtime is selected from measured requirements.

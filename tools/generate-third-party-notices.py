@@ -84,8 +84,8 @@ NATIVE_COMPONENTS = [
     },
     {
         "name": "TensorRT",
-        "what": "optional engine tooling (kestrel-engine-build); not linked into "
-                "kestrel.exe and not shipped",
+        "what": "optional engine-metadata compatibility tooling only; not linked "
+                "into kestrel.exe and not shipped",
         "licence": "LicenseRef-NVIDIA-TensorRT",
         "from": "",
     },
@@ -97,13 +97,12 @@ NATIVE_COMPONENTS = [
 MODEL_COMPONENTS = [
     {
         "name": "Kokoro v1.0 (kokoro-v1.0.onnx)",
-        "what": "neural voice, in .kestrel-voice/models and shipped in the desktop package",
+        "what": "optional neural voice model; developer-installed and not included in the desktop package",
         "licence": "Apache-2.0",
     },
     {
         "name": "Piper voices",
-        "what": "alternative voices in .kestrel-voice/piper; NOT shipped, see the "
-                "note below on piper-tts",
+        "what": "optional developer-installed alternative voice data; not wired into this baseline or shipped",
         "licence": "per-voice; MIT for most, some carry their own",
     },
 ]
@@ -443,9 +442,10 @@ def main():
     )
     lines.append("")
     lines.append(
-        "Kestrel is distributed as a desktop application and carries the "
-        "components below inside it. Each is used unmodified and remains the "
-        "property of its authors; the licence named here governs it."
+        "This inventory covers project dependencies and optional components. "
+        "A row explicitly marked developer-installed is not included in the "
+        "desktop package; see its `Used for` description and the package "
+        "script for the exact contents."
     )
     lines.append("")
     if any(r["name"] in NOT_SHIPPED for r in rows):
@@ -475,8 +475,9 @@ def main():
     lines.append("## Python packages")
     lines.append("")
     lines.append(
-        f"From `.kestrel-voice`, the virtual environment that runs the local "
-        f"voice. {len(rows)} distributions."
+        f"From `.kestrel-voice`, the development virtual environment used to "
+        f"run optional local voice tools. {len(rows)} distributions; the "
+        "desktop package may exclude unused components."
     )
     lines.append("")
     lines.append("| Package | Version | Licence |")

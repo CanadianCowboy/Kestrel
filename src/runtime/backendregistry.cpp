@@ -117,6 +117,9 @@ std::vector<RuntimeDiagnostic> runtimeDiagnostics(const CudaProbe& probe) {
 }
 
 std::unique_ptr<ModelBackend> selectBackend(BackendKind preferred) {
+    if (preferred == BackendKind::Mock) {
+        return makeBackend(BackendKind::Mock);
+    }
     if (preferred != BackendKind::Mock) {
         auto requested = makeBackend(preferred);
         if (requested->status().available) {

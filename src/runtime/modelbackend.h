@@ -4,6 +4,8 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace kestrel::runtime {
 
@@ -13,10 +15,55 @@ enum class BackendKind {
     OrtGenAI,
 };
 
+// Who produced a turn. Mirrors core::MessageRole closely enough to cross the
+// runtime boundary without dragging the core layer in, and adds nothing the
+// runtime needs beyond it.
+enum class Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+};
+
+struct ChatMessage {
+    Role role = Role::User;
+    std::string content;
+
+    // Explicit rather than relying on aggregate brace deduction: nesting a
+    // bare {Role, std::string} inside a vector inside a request does not
+    // deduce on every compiler, and a build that fails only at the call sites
+    // is a worse trade than naming the type once here.
+    ChatMessage() = default;
+    ChatMessage(Role roleValue, std::string contentValue)
+        : role(roleValue), content(std::move(contentValue)) {}
+};
+
 struct GenerationRequest {
-    std::string prompt;
+    // The conversation for this turn, oldest first.
+    //
+    // Structured rather than a pre-rendered string, deliberately. Rendering
+    // belongs to the backend, because only the backend knows the model's own
+    // chat template, and an instruct model handed a raw transcript behaves
+    // markedly worse than the same model in its trained format. The structure
+    // is also what makes the oldest turns droppable later: a rendered blob has
+    // no boundaries to evict at.
+    std::vector<ChatMessage> messages;
     float temperature = 0.7F;
     int maxTokens = 512;
+    // False continues the last assistant message rather than opening a new turn.
+    bool addAssistantCue = true;
+
+    GenerationRequest() = default;
+    GenerationRequest(std::vector<ChatMessage> turns, float temperatureValue,
+                      int maxTokensValue, bool cue = true)
+        : messages(std::move(turns)),
+          temperature(temperatureValue),
+          maxTokens(maxTokensValue), addAssistantCue(cue) {}
+
+    // The shared system prompt is NOT part of `messages`. It is the backend's
+    // cached prefix, set once with setSystemPrompt(); repeating it here would
+    // redo the work the cache exists to avoid.
+    [[nodiscard]] bool empty() const noexcept { return messages.empty(); }
 };
 
 struct RuntimeStatus {

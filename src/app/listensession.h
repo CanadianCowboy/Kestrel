@@ -28,18 +28,9 @@ public:
     // `recognizer` is borrowed. The mock is used by tests and by the preview
     // build; a platform adapter can be supplied without changing anything here.
     explicit ListenSession(runtime::SpeechRecognizer& recognizer, QObject* parent = nullptr);
-    // Stops the recognizer before this object finishes dying.
-    //
-    // The recognizer outlives the session -- it is borrowed, not owned -- and
-    // it holds the two callbacks this object handed it, each of which addresses
-    // this object by raw pointer and posts to it. So a session destroyed while
-    // listening leaves a recognizer that will call into freed memory.
-    //
-    // stop() is the boundary that prevents it: the SAPI adapter waits for its
-    // worker to leave the session before returning, so once this destructor
-    // completes no callback can still be in flight. Anything the worker posted
-    // before then is discarded with this object, because Qt drops a destroyed
-    // receiver's posted events.
+    // Stops the borrowed recognizer and waits for any callback already in
+    // flight before this QObject receiver is destroyed. A session token also
+    // makes already-queued Qt deliveries inert after stop/restart.
     ~ListenSession() override;
 
     // Begins listening. Refuses when the recognizer is unavailable, and says
@@ -83,9 +74,11 @@ signals:
 
 private:
     // Both run on this object's thread, whatever thread the recognizer
-    // delivers on. See startListening().
-    void onResult(const runtime::RecognitionResult& result);
-    void onEnd(runtime::RecognitionEnd reason, const std::string& detail);
+    // delivers on. See startListening(). Stale queued callbacks are discarded
+    // by their session id.
+    void onResult(quint64 sessionId, const runtime::RecognitionResult& result);
+    void onEnd(quint64 sessionId, runtime::RecognitionEnd reason,
+               const std::string& detail);
 
     runtime::SpeechRecognizer& m_recognizer;
     QTimer m_poll;
@@ -95,6 +88,7 @@ private:
     // recognizer that reports both a final result and an end event: the phrase
     // is submitted once, not twice.
     bool m_submitted = false;
+    quint64 m_sessionId = 0;
 };
 
 } // namespace kestrel::app

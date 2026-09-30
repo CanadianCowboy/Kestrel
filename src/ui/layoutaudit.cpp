@@ -58,19 +58,21 @@ bool contentOverflows(const QQuickItem* cell, double& tallestBelow) {
     // Breadth-first over the subtree, skipping the cell itself. Deep enough for
     // a switch inside a hit target inside a row inside a panel, which is four
     // levels for the shape that actually broke.
-    QVector<QQuickItem*> pending{cell->childItems().begin(), cell->childItems().end()};
+    QVector<QQuickItem*> pending = cell->childItems();
     while (!pending.isEmpty()) {
         const QQuickItem* node = pending.takeFirst();
-        if (!node->isVisible() || node->width() <= 0.0 || node->height() <= 0.0) {
+        if (!node->isVisible()) {
             continue;
         }
         const QRectF rect = inScene(node);
-        if (rect.top() < bounds.top() - kCollapsed || rect.bottom() > bounds.bottom() + kCollapsed) {
+        if (node->width() > 0.0 && node->height() > 0.0
+            && (rect.top() < bounds.top() - kCollapsed
+                || rect.bottom() > bounds.bottom() + kCollapsed)) {
             tallestBelow = std::max(tallestBelow, rect.bottom() - bounds.bottom());
             found = true;
         }
         const auto& children = node->childItems();
-        pending.append(children.begin(), children.end());
+        pending.append(children);
     }
     return found;
 }
@@ -88,8 +90,8 @@ void auditNode(QQuickItem* node, QVector<LayoutProblem>& out) {
                 double spill = 0.0;
                 if (contentOverflows(cell, spill)) {
                     out.append({pathTo(cell),
-                                QStringLiteral("a layout cell is %.2fpx tall and holds content "
-                                               "reaching %.0fpx past it, so the next cell is drawn over it")
+                                QStringLiteral("a layout cell is %1px tall and holds content "
+                                               "reaching %2px past it, so the next cell is drawn over it")
                                     .arg(cell->height())
                                     .arg(spill)});
                 }
@@ -115,7 +117,7 @@ void auditNode(QQuickItem* node, QVector<LayoutProblem>& out) {
                                         - std::max(first.top(), second.top());
                 if (overlapX > kCollapsed && overlapY > kCollapsed) {
                     out.append({pathTo(node),
-                                QStringLiteral("two cells overlap by %.0fx%.0fpx")
+                                QStringLiteral("two cells overlap by %1x%2px")
                                     .arg(overlapX)
                                     .arg(overlapY)});
                 }

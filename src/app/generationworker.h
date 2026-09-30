@@ -4,6 +4,7 @@
 #include <QString>
 
 #include <atomic>
+#include <vector>
 
 #include "runtime/modelbackend.h"
 
@@ -40,7 +41,14 @@ public:
     // `backend` is borrowed, not owned. It must outlive the worker.
     explicit GenerationWorker(runtime::ModelBackend* backend, QObject* parent = nullptr);
 
-    // Schedules generation and returns immediately.
+    // Schedules generation and returns immediately. The conversation is passed
+    // as structured messages because the backend owns the rendering: only it
+    // knows the model's chat template.
+    void start(quint64 requestId,
+               const std::vector<runtime::ChatMessage>& messages,
+               float temperature,
+               int maxTokens, bool addAssistantCue = true);
+    // Background tasks still supply a single plain user prompt.
     void start(quint64 requestId, const QString& prompt, float temperature, int maxTokens);
 
     // Safe to call from any thread, including while generation is in flight.

@@ -1,4 +1,7 @@
 #include "runtime/backendregistry.h"
+#include "runtime/modeldiscovery.h"
+#include "core/pathtext.h"
+#include "runtime/chatformat.h"
 #include "runtime/cudadevice.h"
 #include "runtime/engineartifact.h"
 #include "runtime/llamacppbackend.h"
@@ -10,6 +13,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <string>
+#include <utility>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -44,6 +49,42 @@ runtime::CudaProbe makeProbe(bool runtimeAvailable, std::vector<runtime::CudaDev
     probe.selectedDeviceIndex =
         runtime::resolveSelectedDeviceIndex(probe.devices, -1);
     return probe;
+}
+
+// A one-turn request, which is what most of these tests want to say. Written as
+// a helper so the assertions below read as behaviour rather than as brace
+// nesting, and so a future change to the request shape touches one place.
+runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
+                               int maxTokens = 32) {
+    return runtime::GenerationRequest(
+        {runtime::ChatMessage{runtime::Role::User, std::move(text)}}, temperature, maxTokens);
+}
+
+void testModelDiscoveryAndPlainContinuation() {
+    const auto root = std::filesystem::temp_directory_path() / "kestrel_discovery_regression";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "onnx");
+    std::filesystem::create_directories(root / "empty");
+    const auto unicodeName = core::pathFromUtf8("\xe6\xa8\xa1\xe5\x9e\x8b.GGUF");
+    { std::ofstream(root / unicodeName, std::ios::binary) << "gguf"; }
+    { std::ofstream(root / "zero.gguf", std::ios::binary); }
+    { std::ofstream(root / "onnx/genai_config.json") << "{}"; }
+    { std::ofstream(root / "onnx/model.ONNX", std::ios::binary) << "graph"; }
+    { std::ofstream(root / "empty/genai_config.json"); }
+    { std::ofstream(root / "empty/model.onnx") << "graph"; }
+    const auto candidates = runtime::discoverModels(root);
+    assert(candidates.size() == 2);
+    assert(candidates.front().path == core::pathText(root / "onnx"));
+    assert(candidates.back().path == core::pathText(root / unicodeName));
+    assert(runtime::discoverModels(root / "missing").empty());
+    std::filesystem::remove_all(root);
+
+    const std::vector<runtime::ChatMessage> history{
+        {runtime::Role::System, "Instruction"}, {runtime::Role::User, "Question"},
+        {runtime::Role::Assistant, "Partial"}};
+    assert(runtime::renderPlainChat(history, false) == "Instruction\n\nuser: Question\nassistant: Partial");
+    assert(runtime::renderPlainChat(history, true).ends_with("Partial\nassistant:"));
+    assert(runtime::selectBackend(runtime::BackendKind::Mock)->kind() == runtime::BackendKind::Mock);
 }
 
 void testVersionAndByteFormatting() {
@@ -367,7 +408,7 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
 
     bool completed = false;
     bool refused = false;
-    backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
+    backend.generate(ask("hi", 0.7F, 16), nullptr,
                      [&completed, &refused](bool success, std::string_view) {
                          // Without a loaded model every build must refuse. Note
                          // the callback runs while the backend holds its own
@@ -425,10 +466,9 @@ void testSharedSystemPromptPrefix() {
     mock.resetContextUsage();
     const std::size_t afterPrefixOnly = mock.status().contextUsed;
     assert(afterPrefixOnly == 0);
-    // The reply has to be collected to be charged for, so the exact figure can
-    // be stated: prefix, the turn's own prompt, and what came back.
+    // Account for the rendered request, the shared prefix, and delivered text.
     std::string reply;
-    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32},
+    mock.generate(ask("hello", 0.7F, 32),
                   [&reply](std::string_view token) { reply.append(token); },
                   [](bool, std::string_view) {});
     assert(!reply.empty());
@@ -436,7 +476,9 @@ void testSharedSystemPromptPrefix() {
     // Exact, not a lower bound. A duplicate charge of the prefix is precisely
     // the bug worth catching here, and ">=" would sail straight past it.
     assert(mock.status().contextUsed
-           == mock.countTokens(prefix) + mock.countTokens("hello") + mock.countTokens(reply));
+           == mock.countTokens(prefix)
+              + mock.countTokens(runtime::renderPlainChat(ask("hello").messages, true))
+              + mock.countTokens(reply));
 }
 
 /// One environment variable, as a string the caller owns.
@@ -520,7 +562,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string generated;
     bool completed = false;
     bool success = false;
-    backend.generate(runtime::GenerationRequest{"Continue this sentence in one short paragraph:\n\n\"The Kestrel flew", 0.7F, 32},
+    backend.generate(ask("Continue this sentence in one short paragraph: The Kestrel flew", 0.7F, 32),
                      [&generated](std::string_view token) { generated.append(token); },
                      [&](bool ok, std::string_view) {
                          success = ok;
@@ -570,7 +612,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string firstTurn;
     std::string firstError;
     bool firstOk = false;
-    backend.generate(runtime::GenerationRequest{"Name one bird.", 0.7F, 16},
+    backend.generate(ask("Name one bird.", 0.7F, 16),
                      [&firstTurn](std::string_view token) { firstTurn.append(token); },
                      [&firstOk, &firstError](bool ok, std::string_view error) {
                          firstOk = ok;
@@ -594,7 +636,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string secondTurn;
     std::string secondError;
     bool secondOk = false;
-    backend.generate(runtime::GenerationRequest{"Name a different bird.", 0.7F, 16},
+    backend.generate(ask("Name a different bird.", 0.7F, 16),
                      [&secondTurn](std::string_view token) { secondTurn.append(token); },
                      [&secondOk, &secondError](bool ok, std::string_view error) {
                          secondOk = ok;
@@ -614,6 +656,15 @@ void testLlamaCppGeneratesFromRealModel() {
     backend.clearSharedPrefix();
     assert(backend.systemPrompt().empty());
     assert(backend.cachedPrefixTokens() == 0);
+    bool continued = false;
+    std::string continuation;
+    backend.generate(runtime::GenerationRequest({
+        {runtime::Role::User, "Count from one to ten, separated by commas."},
+        {runtime::Role::Assistant, "1, 2,"}}, 0.0F, 16, false),
+        [&](std::string_view token) { continuation.append(token); },
+        [&](bool ok, std::string_view) { continued = ok; });
+    assert(continued && !continuation.empty());
+    std::printf("  assistant continuation: %.60s\n", continuation.c_str());
 }
 
 // Real generation through ONNX Runtime GenAI, on a real model, on this machine's
@@ -699,8 +750,7 @@ void testOrtGenAiGeneratesFromRealModel() {
     bool success = false;
     std::string failure;
     backend.setSystemPrompt("You are Kestrel, a local desktop assistant. Answer briefly.");
-    backend.generate(runtime::GenerationRequest{
-                         "In one short sentence, what does a hawk do?", 0.7F, 48},
+    backend.generate(ask("In one short sentence, what does a hawk do?", 0.7F, 48),
                      [&generated](std::string_view token) { generated.append(token); },
                      [&](bool ok, std::string_view errorText) {
                          success = ok;
@@ -752,8 +802,7 @@ void testOrtGenAiGeneratesFromRealModel() {
 
         std::thread worker([&] {
             backend.generate(
-                runtime::GenerationRequest{
-                    "Count slowly from one to two hundred.", 0.7F, 256},
+                ask("Count slowly from one to two hundred.", 0.7F, 256),
                 [&](std::string_view token) {
                     {
                         std::lock_guard<std::mutex> lock(mutex);
@@ -865,12 +914,13 @@ void testMockRecognizerStillStreamsPartials() {
     // A stop mid-phrase is a cancellation, and reports no phrase. A recognizer
     // that handed back a half-sentence on cancel would submit words the user
     // did not finish saying.
-    assert(recognizer->start(
+    const bool restarted = recognizer->start(
         [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
         [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
             end_reason = runtime::toString(reason);
         },
-        failure));
+        failure);
+    assert(restarted);
     mock->emitNextPartial();
     const std::size_t before_stop = seen.size();
     recognizer->stop();
@@ -1000,6 +1050,7 @@ int main() {
         test();                                  \
     } while (false)
 
+    KESTREL_RUN(testModelDiscoveryAndPlainContinuation);
     KESTREL_RUN(testVersionAndByteFormatting);
     KESTREL_RUN(testDeviceFormatting);
     KESTREL_RUN(testDeviceSelection);

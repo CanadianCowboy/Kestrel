@@ -437,17 +437,18 @@ private:
     /// Uses userText for the voice response timeline and resets per-response metrics.
     void startGeneration(const QString& userText);
 
-    /// Assembles the text actually sent to the model: the recent conversation
-    /// followed by an assistant cue. The shared system prompt is excluded on
-    /// purpose, because the backend keeps it as a cached prefix.
-    [[nodiscard]] QString buildPrompt() const;
+    // The conversation for this turn, as structured messages. The backend
+    // renders it, because only the backend knows the model's chat template --
+    // and a rendered string here would have to be thrown away by anything that
+    // later needs to address individual turns.
+    [[nodiscard]] std::vector<runtime::ChatMessage> buildMessages() const;
 
-    /// Spins the UI event loop until the in-flight generation reports back, or
-    /// the timeout expires. Needed before swapping or destroying a backend,
-    /// because the worker is inside the old backend's generate() right now and
-    /// that backend is about to go away. Bounded, so a wedged backend cannot
-    /// freeze the window.
-    void waitForIdleGeneration(int timeoutMs);
+    // Spins the UI event loop until the in-flight generation reports back, or
+    // the timeout expires. Needed before swapping or destroying a backend,
+    // because the worker is inside the old backend's generate() right now and
+    // that backend is about to go away. Bounded, so a wedged backend cannot
+    // freeze the window.
+    void waitForIdleGeneration(int timeoutMs, bool stopAudio = true);
 
     /// True while the worker is running anything at all: a reply, the idle
     /// prewarm, or a permissioned tool. Every check that needs the worker free
@@ -597,6 +598,8 @@ private:
     bool m_hasPendingSegment = false;
     std::size_t m_pendingSegmentEnd = 0;
     int m_openingPauseMs = 0;
+    bool m_waitingForSpeechBoundary = false;
+    bool m_deferredSpeechRestart = false;
     QElapsedTimer m_clock;
     QTimer m_idleTimer;
     // In-flight GPU prewarm from the idle loop, or 0 when none is running. The

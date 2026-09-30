@@ -117,12 +117,12 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
 // second-guessed. A choice the user made is not a guess to be improved on.
 QStringList modelCandidatesFor(const QString& explicitPath) {
     if (!explicitPath.isEmpty()) {
-        return {explicitPath};
+        return {QUrl::fromLocalFile(QFileInfo(explicitPath).absoluteFilePath()).toString()};
     }
 
     const QString fromEnvironment = qEnvironmentVariable("KESTREL_MODEL", QString());
-    if (!fromEnvironment.isEmpty() && QFileInfo::exists(fromEnvironment)) {
-        return {fromEnvironment};
+    if (!fromEnvironment.isEmpty()) {
+        return {QUrl::fromLocalFile(QFileInfo(fromEnvironment).absoluteFilePath()).toString()};
     }
 
     const QString modelDirectory =

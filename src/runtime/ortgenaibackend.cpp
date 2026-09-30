@@ -1,6 +1,9 @@
 #include "runtime/ortgenaibackend.h"
+#include "runtime/chatformat.h"
 
 #include "core/pathtext.h"
+#include "storage/json.h"
+#include <limits>
 #include "runtime/cudadevice.h"
 
 #include <algorithm>
@@ -53,7 +56,8 @@ constexpr std::size_t kFixedOverheadBytes = 512ULL * 1024ULL * 1024ULL;
 //
 // Deliberately not a JSON parser. Three integers are needed -- layer count,
 // KV head count, head size -- and every general-purpose JSON library is a
-// dependency this project does not otherwise have, for a file that GenAI
+// dependency; the profile JSON parser intentionally rejects floating-point
+// search options, so it cannot parse arbitrary GenAI configs. This file GenAI
 // itself writes and whose shape is fixed. The scan is strict about finding the
 // key and about the value being digits, and reports failure rather than
 // guessing, so a future format change surfaces as a fallback to the documented
@@ -81,8 +85,16 @@ bool readJsonInteger(const std::string& text, const std::string& key, std::int64
     if (at == start) {
         return false;
     }
-    out = std::stoll(text.substr(start, at - start));
-    return true;
+    if (at < text.size() && text[at] != ',' && text[at] != '}'
+        && text[at] != ' ' && text[at] != '\t' && text[at] != '\r' && text[at] != '\n') {
+        return false;
+    }
+    try {
+        out = std::stoll(text.substr(start, at - start));
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 // Reads one string field out of genai_config.json, for the same reason and with
@@ -298,6 +310,11 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
     m_kvCacheBytesUsed = 0;
     m_contextLength = 0;
     m_kvCacheBytes = 0;
+    m_impl->totalDeviceBytes = 0;
+    m_impl->resolvedDecoder.clear();
+    m_impl->tokenizer.reset();
+    m_impl->model.reset();
+    refreshStatus();
 
     std::error_code fileError;
     const std::filesystem::path root = core::pathFromUtf8(modelPath);
@@ -378,7 +395,8 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
     readJsonInteger(configText, "num_hidden_layers", layers);
     readJsonInteger(configText, "num_key_value_heads", kvHeads);
     readJsonInteger(configText, "head_size", headSize);
-    m_impl->declaredContextLength = declaredContext > 0 ? static_cast<int>(declaredContext) : 0;
+    m_impl->declaredContextLength = declaredContext > 0 && declaredContext <= std::numeric_limits<int>::max()
+                                       ? static_cast<int>(declaredContext) : 0;
     m_impl->kvBytesPerTokenValue = kvBytesPerToken(layers, kvHeads, headSize);
 
     // Read once, outside the try, because the status line below reports any
@@ -469,13 +487,16 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
         // with one, is a configuration the user did not choose, and the status
         // line below then reports whichever provider actually ran.
         config->ClearProviders();
-        config->AppendProvider(m_impl->provider.c_str());
+        if (useCuda) {
+            config->AppendProvider("cuda");
+        } // An empty provider list selects the default CPU execution provider.
 
         // Redirect the decoder to the file that is actually on disk. The
         // overlay is the supported way to change a loaded config, so the
         // package's own genai_config.json is left exactly as published and the
         // correction lives only in this process.
-        const std::string resolved = resolveDecoderFilename(root, decoderName);        if (!resolved.empty() && resolved != decoderName) {
+        const std::string resolved = resolveDecoderFilename(root, decoderName);
+        if (!resolved.empty() && resolved != decoderName) {
             config->Overlay(("{\"model\":{\"decoder\":{\"filename\":\""
                              + resolved + "\"}}}").c_str());
             m_impl->resolvedDecoder = resolved;
@@ -534,7 +555,8 @@ bool OrtGenAiBackend::loadModel(const std::string& modelPath, std::string& error
         detail << "; loaded " << m_impl->resolvedDecoder << " in place of the "
                << decoderName << " the config names";
     }
-    m_status.detail = detail.str();    error.clear();
+    m_status.detail = detail.str();
+    error.clear();
     return true;
 }
 
@@ -548,20 +570,37 @@ void OrtGenAiBackend::generate(const GenerationRequest& request,
         onComplete(false, "No ONNX Runtime GenAI model is loaded. Call loadModel() first.");
         return;
     }
-    if (request.prompt.empty()) {
+    if (request.messages.empty()) {
         onComplete(false, "The request carried no prompt.");
         return;
     }
 
-    // The system prompt is prepended here rather than by the caller, so the
-    // ModelBackend contract holds: callers pass the per-turn prompt only.
-    std::string text = m_systemPrompt;
-    if (!text.empty()) {
-        text += "\n\n";
-    }
-    text += request.prompt;
-
     try {
+        // Let the tokenizer apply the model's own configured template. Reuse
+        // the repository's JSON serializer for correct content escaping.
+        auto messages = storage::json::Value::makeArray();
+        auto append = [&](const ChatMessage& message) {
+            auto value = storage::json::Value::makeObject();
+            value.set("role", storage::json::Value::makeString(toString(message.role)));
+            value.set("content", storage::json::Value::makeString(message.content));
+            messages.push(std::move(value));
+        };
+        if (!m_systemPrompt.empty()) {
+            append({Role::System, m_systemPrompt});
+        }
+        const bool continuing = !request.addAssistantCue
+            && request.messages.back().role == Role::Assistant;
+        const auto count = request.messages.size() - (continuing ? 1 : 0);
+        for (std::size_t i = 0; i < count; ++i) {
+            append(request.messages[i]);
+        }
+        const auto encoded = messages.serialize();
+        const auto rendered = m_impl->tokenizer->ApplyChatTemplate(
+            nullptr, encoded.c_str(), nullptr, request.addAssistantCue || continuing);
+        std::string text = static_cast<const char*>(rendered);
+        if (continuing) {
+            text += request.messages.back().content;
+        }
         auto sequences = OgaSequences::Create();
         m_impl->tokenizer->Encode(text.c_str(), *sequences);
         const std::size_t inputCount = sequences->SequenceCount(0);

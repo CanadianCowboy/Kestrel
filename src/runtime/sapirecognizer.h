@@ -78,6 +78,7 @@ public:
     // synchronous error here.
     bool start(ResultCallback onResult, EndCallback onEnd, std::string& error) override;
     void stop() override;
+    void stopAndWait() override;
     [[nodiscard]] bool listening() const override;
 
 private:

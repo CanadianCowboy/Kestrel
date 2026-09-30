@@ -26,6 +26,7 @@
 #include "app/appcontroller.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
+#include "app/listensession.h"
 #include "app/speechsynthesizer.h"
 #include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
@@ -55,6 +56,8 @@ public:
 
     bool loadModel(const std::string&, std::string&) override { return true; }
 
+    void setTokenPieces(std::vector<std::string> pieces) { m_pieces = std::move(pieces); }
+
     void generate(const GenerationRequest& request,
                   kestrel::runtime::TokenCallback onToken,
                   kestrel::runtime::CompletionCallback onComplete) override {
@@ -69,7 +72,8 @@ public:
                 onComplete(false, "Generation stopped");
                 return;
             }
-            onToken("tok");
+            onToken(m_pieces.empty() ? std::string_view("tok")
+                                    : std::string_view(m_pieces[static_cast<std::size_t>(i) % m_pieces.size()]));
             m_tokensEmitted.fetch_add(1, std::memory_order_release);
             if (m_delayMs > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(m_delayMs));
@@ -93,11 +97,40 @@ public:
 private:
     mutable std::mutex m_requestsMutex;
     std::vector<GenerationRequest> m_requests;
+    std::vector<std::string> m_pieces;
     int m_tokenCount;
     int m_delayMs;
     std::atomic<bool> m_cancelled{false};
     std::atomic<int> m_tokensEmitted{0};
     std::thread::id m_generateThread{};
+};
+
+// A queued fake recognizer that lets the test deliver callbacks from a stopped
+// session after a replacement session has started.
+class QueuedFakeRecognizer final : public kestrel::runtime::SpeechRecognizer {
+public:
+    bool available() const override { return true; }
+    std::string detail() const override { return "queued callback test recognizer"; }
+    bool start(ResultCallback onResult, EndCallback onEnd, std::string&) override {
+        m_results.push_back(std::move(onResult));
+        m_ends.push_back(std::move(onEnd));
+        m_listening = true;
+        return true;
+    }
+    void stop() override { m_listening = false; }
+    void stopAndWait() override { stop(); }
+    bool listening() const override { return m_listening; }
+
+    void emitQueuedResult(std::size_t session, std::string text) {
+        kestrel::runtime::RecognitionResult result;
+        result.text = std::move(text);
+        m_results.at(session)(result);
+    }
+
+private:
+    bool m_listening = false;
+    std::vector<ResultCallback> m_results;
+    std::vector<EndCallback> m_ends;
 };
 
 // Receives worker signals on the thread that owns this object, which is the
@@ -324,6 +357,21 @@ bool pumpUntilFinished(Collector& collector, int timeoutMs) {
     return collector.finished;
 }
 
+void testListenSessionIgnoresQueuedCallbacksFromPreviousSession() {
+    std::cout << "listen session ignores stale queued callbacks after restart\n";
+    QueuedFakeRecognizer recognizer;
+    kestrel::app::ListenSession session(recognizer);
+    QString error;
+    check(session.startListening(error), "first listening session starts");
+    recognizer.emitQueuedResult(0, "stale words");
+    session.stopListening();
+    check(session.startListening(error), "replacement listening session starts");
+    recognizer.emitQueuedResult(1, "current words");
+    QCoreApplication::processEvents();
+    check(session.partialText() == QStringLiteral("current words"),
+          "queued results from an earlier session cannot overwrite the current transcript");
+}
+
 void testGenerationRunsOffCallingThread() {
     std::cout << "generation runs off the calling thread\n";
 
@@ -349,7 +397,7 @@ void testGenerationRunsOffCallingThread() {
                      });
 
     const std::thread::id callerThread = std::this_thread::get_id();
-    worker.start(1, QStringLiteral("hello"), 0.7F, 512);
+    worker.start(1, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
 
     check(pumpUntilFinished(collector, 10000), "completion signal is delivered");
 
@@ -360,6 +408,63 @@ void testGenerationRunsOffCallingThread() {
     check(collector.success, "generation reports success");
     check(collector.error.isEmpty(), "no error is reported on success");
 
+    thread.quit();
+    thread.wait();
+}
+
+void testTokensStreamBeforeCompletionAndPreserveUtf8() {
+    std::cout << "tokens stream before completion and preserve split UTF-8\n";
+    SlowBackend backend(3, 30);
+    backend.setTokenPieces({"live ", "\xe6\xa8", "\xa1"});
+    QThread thread;
+    GenerationWorker worker(&backend);
+    worker.moveToThread(&thread);
+    thread.start();
+    Collector collector;
+    bool sawLiveToken = false;
+    QObject::connect(&worker, &GenerationWorker::tokenReady, &collector,
+                     [&](quint64, const QString& token) {
+                         collector.tokens.append(token);
+                         sawLiveToken = sawLiveToken || (!collector.finished && backend.tokensEmitted() < 3);
+                     });
+    // The ASCII token must reach the UI before generation has emitted all
+    // pieces. A callback queued back onto the worker fails this check.
+    QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                     [&](quint64, bool success, const QString&) {
+                         collector.success = success;
+                         collector.finished = true;
+                         emit collector.finishedSignal();
+                     });
+    worker.start(3, QStringLiteral("hello"), 0.7F, 16);
+    check(pumpUntilFinished(collector, 5000), "streaming test completes");
+    check(sawLiveToken,
+          "tokens are received while generation is still running");
+    check(collector.tokens.join(QString()) == QString::fromUtf8("live \xe6\xa8\xa1"),
+          "UTF-8 bytes split across native tokens form one intact character");
+    check(collector.success, "streamed generation succeeds");
+    thread.quit();
+    thread.wait();
+}
+
+void testCancelBeforeWorkerStarts() {
+    std::cout << "cancel before queued generation starts\n";
+    SlowBackend backend(4, 0);
+    QThread thread;
+    GenerationWorker worker(&backend);
+    worker.moveToThread(&thread);
+    Collector collector;
+    QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                     [&](quint64, bool success, const QString&) {
+                         collector.success = success;
+                         collector.finished = true;
+                         emit collector.finishedSignal();
+                     });
+    worker.start(4, QStringLiteral("hello"), 0.7F, 16);
+    worker.cancel();
+    thread.start();
+    check(pumpUntilFinished(collector, 5000), "pre-start cancellation completes");
+    check(!collector.success && backend.requests().empty(),
+          "cancelled queued request never enters the backend");
     thread.quit();
     thread.wait();
 }
@@ -389,7 +494,7 @@ void testCancelStopsInFlightGeneration() {
                          emit collector.finishedSignal();
                      });
 
-    worker.start(2, QStringLiteral("long prompt"), 0.7F, 512);
+    worker.start(2, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
 
     // Let a few tokens through so cancellation lands mid-generation rather
     // than before the backend even started.
@@ -481,7 +586,7 @@ void testWorkerFollowsTheSwappedBackend() {
                      });
 
     worker.setBackend(&replacement);
-    worker.start(1, QStringLiteral("hello"), 0.7F, 512);
+    worker.start(1, {kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "hello"}}, 0.7F, 512);
     check(pumpUntilFinished(collector, 10000), "the swapped backend completes");
 
     check(replacement.tokensEmitted() == 4, "the replacement backend generated");
@@ -588,10 +693,15 @@ void testResumeUsesPartialAssistantPrompt() {
     const auto requests = observed->requests();
     check(requests.size() == 2, "resume starts a second generation");
     if (requests.size() == 2) {
-        check(requests[0].prompt == "User: unique current turn\nAssistant:",
+        check(requests[0].messages.size() == 1
+                  && requests[0].messages[0].role == kestrel::runtime::Role::User
+                  && requests[0].messages[0].content == "unique current turn",
               "history contains the current user turn exactly once");
-        check(requests[1].prompt == "Assistant: " + suffix.toStdString(),
-              "suffix stays in an open assistant turn without another cue");
+        check(requests[1].messages.size() == 2
+                  && requests[1].messages.back().role == kestrel::runtime::Role::Assistant
+                  && requests[1].messages.back().content == suffix.toStdString()
+                  && !requests[1].addAssistantCue,
+              "resume preserves history and leaves the partial assistant turn open");
     }
 }
 
@@ -1309,6 +1419,10 @@ void testAReplySentMidSpeechTakesItsOwnWarmth() {
     QEventLoop second;
     QTimer::singleShot(600, &second, &QEventLoop::quit);
     second.exec();
+    if (controller.speaking() && observed->speakingNow()) {
+        observed->finishUtterance();
+        QCoreApplication::processEvents();
+    }
 
     check(qAbs(observed->lastWarmth - 0.2F) < 0.001F,
           "the new response reads the dials for itself, not the interrupted one's");
@@ -1490,7 +1604,10 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     controller.sendMessage(QStringLiteral("actually, second question"));
     check(observed->boundaryStops == 1, "a barge-in asks for a boundary stop");
     check(observed->immediateStops == 0, "a barge-in does not cut the clause in flight");
-    check(observed->spoken.size() >= 2, "the cue and at least part of the answer were spoken");
+    check(observed->spoken.size() >= 1, "the acknowledgement cue was spoken");
+    check(controller.speaking(), "the replacement response waits for the old clause boundary");
+    check(observed->boundaryStops == 1,
+          "the replacement does not mistake the old clause completion for its own");
 
     // The abandoned response is replaced, not resumed: the spoken text is kept
     // for the record and the new turn owns the timeline.
@@ -1616,7 +1733,10 @@ int main(int argc, char** argv) {
     // a microphone would change what the suite means.
     qputenv("KESTREL_SPEECH_INPUT", "mock");
 
+    testListenSessionIgnoresQueuedCallbacksFromPreviousSession();
     testGenerationRunsOffCallingThread();
+    testTokensStreamBeforeCompletionAndPreserveUtf8();
+    testCancelBeforeWorkerStarts();
     testCancelStopsInFlightGeneration();
     testFileDialogUrlBecomesALocalPath();
     testWorkerFollowsTheSwappedBackend();

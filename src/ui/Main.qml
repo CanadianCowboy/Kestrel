@@ -868,8 +868,9 @@ ApplicationWindow {
                                     model: appController.speechVoices
                                     delegate: Rectangle {
                                         required property string modelData
+                                        readonly property string voiceName: modelData
                                         readonly property bool selected:
-                                            modelData === appController.currentVoice
+                                            voiceName === appController.currentVoice
                                         width: profileText.implicitWidth + 16
                                         height: 22
                                         radius: 11
@@ -880,7 +881,7 @@ ApplicationWindow {
                                         Text {
                                             id: profileText
                                             anchors.centerIn: parent
-                                            text: parent.modelData
+                                            text: parent.voiceName
                                             color: parent.selected ? "#0d1015" : window.muted
                                             font.pixelSize: 11
                                         }
@@ -890,7 +891,7 @@ ApplicationWindow {
                                             anchors.fill: parent
                                             hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: appController.setSpeechVoice(parent.modelData)
+                                            onClicked: appController.setSpeechVoice(parent.voiceName)
                                         }
                                     }
                                 }
@@ -967,7 +968,6 @@ ApplicationWindow {
                                         model: tool.required
                                         delegate: IdleToggle {
                                             required property string modelData
-                                            required property var model
                                             readonly property string capability: modelData
                                             readonly property bool granted: !tool.missing.includes(capability)
                                             label: capability
