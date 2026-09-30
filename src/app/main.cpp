@@ -319,6 +319,17 @@ int main(int argc, char* argv[]) {
     // them, and it must be selected before the QML is loaded.
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
+#ifdef KESTREL_DESKTOP_FILE_ID
+    // A freedesktop desktop environment has to be told which .desktop file
+    // describes this window. Without it the taskbar entry falls back to the
+    // executable name, the window carries a generic icon, and the window menu
+    // has no application name to offer "Quit" and "About" under.
+    //
+    // fromLatin1, not QStringLiteral: QStringLiteral token-pastes its argument
+    // onto u"", so it cannot be handed a macro that expands to a string literal.
+    QGuiApplication::setDesktopFileName(QString::fromLatin1(KESTREL_DESKTOP_FILE_ID));
+#endif
+
     kestrel::app::AppController controller;
 
     const QStringList arguments = QGuiApplication::arguments();

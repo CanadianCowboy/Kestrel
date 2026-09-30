@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Kestrel
+GenericName=Local AI Workspace
+Comment=Chat privately with local models on your own machine
+Exec=kestrel
+TryExec=kestrel
+Icon=io.github.canadiancowboy.kestrel
+Terminal=false
+StartupNotify=true
+Categories=Development;Utility;
+Keywords=AI;LLM;Local;Offline;Chat;Privacy;

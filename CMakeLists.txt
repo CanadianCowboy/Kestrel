@@ -317,10 +317,37 @@ if(KESTREL_LLAMA_CPP_ENABLED)
                 "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.dylib"
             )
         else()
-            target_link_libraries(kestrel_core PRIVATE
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.so"
-                "${KESTREL_LLAMA_CPP_ROOT}/lib/libggml.so"
-            )
+            # llama.cpp splits ggml across several shared objects -- libggml.so
+            # plus libggml-base.so and libggml-cpu.so, one more per enabled
+            # backend -- and recent releases add libllama-impl.so. Naming two of
+            # them by hand links on a tree that happens to match that pair and
+            # fails to resolve the rest everywhere else, so link what is
+            # actually installed. Both the unversioned development symlinks and
+            # the versioned objects are collected, because a prefix can have
+            # one form for llama and the other for ggml; a name that matches
+            # both patterns appears twice and is linked once.
+            # GLOB is evaluated once per configure, which matches how the rest
+            # of this file resolves optional dependencies.
+            set(_kestrel_llama_libdir "${KESTREL_LLAMA_CPP_ROOT}/lib")
+            file(GLOB _kestrel_llama_libs
+                "${_kestrel_llama_libdir}/libllama.so"
+                "${_kestrel_llama_libdir}/libllama-impl.so"
+                "${_kestrel_llama_libdir}/libggml*.so"
+                "${_kestrel_llama_libdir}/libllama*.so.*"
+                "${_kestrel_llama_libdir}/libggml*.so.*")
+            list(REMOVE_DUPLICATES _kestrel_llama_libs)
+            if(NOT _kestrel_llama_libs)
+                message(WARNING
+                    "Kestrel: ${KESTREL_LLAMA_CPP_ROOT} has headers but no llama.cpp "
+                    "shared libraries in ${_kestrel_llama_libdir}, so the link will fail. "
+                    "Point KESTREL_LLAMA_CPP_ROOT at a llama.cpp install or build tree, "
+                    "or set KESTREL_ENABLE_LLAMA_CPP=OFF to build without GGUF inference.")
+            else()
+                list(SORT _kestrel_llama_libs)
+                message(STATUS "Kestrel: linking llama.cpp from ${_kestrel_llama_libdir}: "
+                               "${_kestrel_llama_libs}")
+            endif()
+            target_link_libraries(kestrel_core PRIVATE ${_kestrel_llama_libs})
         endif()
     endif()
 
@@ -550,6 +577,12 @@ if(WIN32)
     endif()
 endif()
 
+# Explicit llama.cpp roots need an installed Linux search path as well as
+# Windows runtime staging. Keep these independent so neither platform loses it.
+if(KESTREL_LLAMA_CPP_ENABLED AND UNIX AND NOT APPLE AND KESTREL_LLAMA_CPP_ROOT)
+    set(_kestrel_llama_rpath "${KESTREL_LLAMA_CPP_ROOT}/lib")
+endif()
+
 if(KESTREL_BUILD_UI)
     find_package(Qt6 6.6 COMPONENTS Core Quick QuickControls2 QUIET)
     if(Qt6_FOUND)
@@ -664,6 +697,15 @@ if(KESTREL_BUILD_UI)
         # on: the staging directory is assembled from build outputs.
         kestrel_stage_llama_runtime(kestrel)
         kestrel_stage_ort_genai_runtime(kestrel)
+
+        if(UNIX AND NOT APPLE)
+            # One identifier for the desktop entry, the icon, and the window
+            # association. A binary named kestrel that never names its own
+            # .desktop file gets a generic icon and an unlisted window menu.
+            set(KESTREL_DESKTOP_ID "io.github.canadiancowboy.kestrel")
+            target_compile_definitions(kestrel PRIVATE
+                KESTREL_DESKTOP_FILE_ID="${KESTREL_DESKTOP_ID}")
+        endif()
 
         # Threading tests for the async generation path. They need a real
         # event loop, so they exist only in a Qt-enabled build.
@@ -916,4 +958,51 @@ if(KESTREL_BUILD_TESTS)
         kestrel_stage_llama_runtime(${_kestrel_llama_test})
         kestrel_stage_ort_genai_runtime(${_kestrel_llama_test})
     endforeach()
+endif()
+
+# --- Linux install rules ------------------------------------------------------
+# Windows and macOS ship through their own platform tooling. Linux is the only
+# place where CMake has to assemble the installed application itself, and
+# without these rules `cmake --install` copies nothing at all: the app still
+# runs from the build tree, so the omission is invisible until someone tries to
+# install it.
+if(UNIX AND NOT APPLE)
+    include(GNUInstallDirs)
+
+    if(_kestrel_llama_rpath)
+        foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
+            if(TARGET ${_kestrel_rpath_target})
+                # Qt's setup gives an installed binary "$ORIGIN:$ORIGIN/../lib"
+                # so it can find the Qt libraries installed beside it. Append
+                # rather than replace: a binary that resolves llama.cpp but not
+                # Qt6Core is no more useful than one that resolves neither.
+                get_target_property(_kestrel_target_rpath
+                    ${_kestrel_rpath_target} INSTALL_RPATH)
+                if(_kestrel_target_rpath AND
+                   NOT _kestrel_target_rpath MATCHES "-NOTFOUND$")
+                    set(_kestrel_merged_rpath
+                        "${_kestrel_target_rpath}:${_kestrel_llama_rpath}")
+                else()
+                    set(_kestrel_merged_rpath
+                        "$ORIGIN:$ORIGIN/../lib:${_kestrel_llama_rpath}")
+                endif()
+                set_target_properties(${_kestrel_rpath_target} PROPERTIES
+                    INSTALL_RPATH "${_kestrel_merged_rpath}")
+            endif()
+        endforeach()
+    endif()
+
+    # Only the desktop app is installed. kestrel-engine-build writes engine
+    # records beside an engine and is a maintainer tool, so it stays in the
+    # build tree rather than on an end user's PATH.
+    if(TARGET kestrel)
+        install(TARGETS kestrel
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.desktop"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.svg"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
+        install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.metainfo.xml"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/metainfo")
+    endif()
 endif()
