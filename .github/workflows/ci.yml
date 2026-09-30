@@ -366,7 +366,7 @@ jobs:
           # characters "$RUNNER_TEMP" and the screenshot lands nowhere.
           KESTREL_SCREENSHOT: ${{ runner.temp }}/kestrel.png
         run: |
-          if ! "$RUNNER_TEMP/kestrel/bin/kestrel" > install.log 2>&1; then
+          if ! timeout --kill-after=5s 30s "$RUNNER_TEMP/kestrel/bin/kestrel" > install.log 2>&1; then
             cat install.log
             echo "::error::the installed app exited non-zero"
             exit 1
