@@ -121,6 +121,7 @@ std::string toUtf8(const wchar_t* text) {
     return out;
 }
 
+/// Formats an HRESULT as a hexadecimal diagnostic code.
 std::string formatHr(HRESULT hr) {
     char buffer[32] = {};
     std::snprintf(buffer, sizeof(buffer), "0x%08lX", static_cast<unsigned long>(hr));
@@ -159,6 +160,7 @@ struct SessionState {
 // joins; that is the only place the UI waits, and by then it is shutting down.
 class SapiSpeechRecognizer::Impl {
 public:
+    /// Counts capture devices and creates the event used to wake the recognition worker.
     Impl() {
         m_devices = static_cast<unsigned>(waveInGetNumDevs());
         m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -169,6 +171,7 @@ public:
         m_available = m_devices > 0 && m_wake != nullptr;
     }
 
+    /// Signals shutdown, joins the recognition worker, and closes its wake handle.
     ~Impl() {
         m_shuttingDown.store(true, std::memory_order_release);
         if (m_wake != nullptr) {
@@ -182,8 +185,10 @@ public:
         }
     }
 
+    /// Returns whether capture devices and a worker wake handle were found during setup.
     [[nodiscard]] bool available() const { return m_available; }
 
+    /// Describes capture-device availability and the adapter's final-phrase-only output.
     [[nodiscard]] std::string detail() const {
         if (!m_available) {
             return "Windows SAPI 5 is present but this machine reports no capture "
@@ -193,6 +198,7 @@ public:
              + " capture device(s), finished phrases only";
     }
 
+    /// Stores callbacks and starts or wakes the worker; reports invalid state or startup failure.
     bool start(ResultCallback onResult, EndCallback onEnd, std::string& error) {
         if (!m_available) {
             error = detail();
@@ -239,6 +245,7 @@ public:
         return true;
     }
 
+    /// Invalidates the active session and wakes the worker without waiting for COM cleanup.
     void stop() {
         // The generation bump is what actually ends a session: the worker's
         // wait loop compares against it, so a stop is noticed even if the
@@ -250,9 +257,11 @@ public:
         }
     }
 
+    /// Returns the atomic listening flag for the current recognition request.
     [[nodiscard]] bool listening() const { return m_listening.load(std::memory_order_acquire); }
 
 private:
+    /// Owns COM initialization and repeatedly runs requested sessions until shutdown.
     void workerMain() {
         // SAPI's objects are apartment threaded, so the thread that creates
         // them has to own an apartment for their whole life. That is why
@@ -301,6 +310,7 @@ private:
         return !m_shuttingDown.load(std::memory_order_acquire);
     }
 
+    /// Runs one SAPI session on the worker and reports its phrase, cancellation, or failure.
     void runSession(unsigned generation) {
         SessionState state;
 
@@ -502,6 +512,7 @@ private:
         }
     }
 
+    /// Dispatches all queued Windows messages on the calling worker thread.
     static void drainMessages() {
         MSG message;
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -525,6 +536,7 @@ private:
         }
     }
 
+    /// Clears the stored end callback under lock and invokes its copy outside the lock.
     void deliverEnd(RecognitionEnd reason, const std::string& detail) {
         EndCallback callback;
         {
@@ -552,39 +564,49 @@ private:
     EndCallback m_onEnd;
 };
 
+/// Creates the Windows recognition implementation and probes initial availability.
 SapiSpeechRecognizer::SapiSpeechRecognizer()
     : m_impl(std::make_unique<Impl>()) {}
 
+/// Destroys the implementation, joining its worker and releasing the wake handle.
 SapiSpeechRecognizer::~SapiSpeechRecognizer() = default;
 
+/// Returns the implementation's capture-device and wake-handle availability.
 bool SapiSpeechRecognizer::available() const {
     return m_impl->available();
 }
 
+/// Returns the Windows adapter's capture-device diagnostic detail.
 std::string SapiSpeechRecognizer::detail() const {
     return m_impl->detail();
 }
 
+/// Transfers callbacks to the worker implementation and reports whether listening was accepted.
 bool SapiSpeechRecognizer::start(ResultCallback onResult, EndCallback onEnd, std::string& error) {
     return m_impl->start(std::move(onResult), std::move(onEnd), error);
 }
 
+/// Requests cancellation through the worker implementation without waiting for completion.
 void SapiSpeechRecognizer::stop() {
     m_impl->stop();
 }
 
+/// Returns whether the implementation currently reports a listening request.
 bool SapiSpeechRecognizer::listening() const {
     return m_impl->listening();
 }
 
+/// Returns the Windows wave-input capture-device count without opening a device.
 unsigned microphoneDeviceCount() {
     return static_cast<unsigned>(waveInGetNumDevs());
 }
 
+/// Reports microphone presence from the Windows capture-device count.
 Microphone probeMicrophone() {
     return microphoneDeviceCount() > 0 ? Microphone::Present : Microphone::Absent;
 }
 
+/// Creates the Windows SAPI speech recognizer adapter.
 std::unique_ptr<SpeechRecognizer> makePlatformSpeechRecognizer() {
     return std::make_unique<SapiSpeechRecognizer>();
 }

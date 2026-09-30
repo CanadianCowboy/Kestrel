@@ -77,6 +77,7 @@ public:
     using ResultCallback = std::function<void(const RecognitionResult&)>;
     using EndCallback = std::function<void(RecognitionEnd, std::string_view)>;
 
+    /// Allows recognizers to be destroyed through the shared interface.
     virtual ~SpeechRecognizer() = default;
 
     [[nodiscard]] virtual bool available() const = 0;
@@ -109,10 +110,12 @@ public:
     // the same shape of event it would from a live engine.
     explicit MockSpeechRecognizer(std::vector<std::string> phrases = {});
 
+    /// Returns true because scripted recognition needs no external device.
     [[nodiscard]] bool available() const override { return true; }
     [[nodiscard]] std::string detail() const override;
     bool start(ResultCallback onResult, EndCallback onEnd, std::string& error) override;
     void stop() override;
+    /// Returns whether the mock is currently accepting requests to advance its script.
     [[nodiscard]] bool listening() const override { return m_listening; }
 
     // Emits the next partial result for the current phrase. Called by the

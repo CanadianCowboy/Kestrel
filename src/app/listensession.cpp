@@ -2,12 +2,14 @@
 
 namespace kestrel::app {
 
+/// Borrows a recognizer and configures an 80 ms timer for scripted partial results.
 ListenSession::ListenSession(runtime::SpeechRecognizer& recognizer, QObject* parent)
     : QObject(parent), m_recognizer(recognizer) {
     m_poll.setInterval(80);
     connect(&m_poll, &QTimer::timeout, this, &ListenSession::poll);
 }
 
+/// Starts recognition with callbacks queued to this object's thread; reports rejection in error.
 bool ListenSession::startListening(QString& error) {
     if (m_listening) {
         error = tr("Already listening.");
@@ -61,6 +63,7 @@ bool ListenSession::startListening(QString& error) {
     return true;
 }
 
+/// Stops polling and recognition, clearing the partial transcript and submission state.
 void ListenSession::stopListening() {
     if (!m_listening) {
         return;
@@ -75,6 +78,7 @@ void ListenSession::stopListening() {
     emit partialChanged();
 }
 
+/// Stops listening and discards the unfinished phrase without submitting it.
 void ListenSession::abandon() {
     // The phrase is discarded, not submitted: a user who starts typing has
     // already said what they wanted, and submitting a half-spoken sentence on
@@ -82,10 +86,12 @@ void ListenSession::abandon() {
     stopListening();
 }
 
+/// Returns whether this session is accepting recognition results.
 bool ListenSession::listening() const noexcept {
     return m_listening;
 }
 
+/// Advances a scripted recognizer by one partial result while listening.
 void ListenSession::poll() {
     if (!m_listening) {
         return;
@@ -99,14 +105,17 @@ void ListenSession::poll() {
     }
 }
 
+/// Returns the latest nonfinal transcript.
 QString ListenSession::partialText() const {
     return m_partial;
 }
 
+/// Sets the scripted recognizer's poll interval, clamped to at least one millisecond.
 void ListenSession::setPartialIntervalMs(int ms) {
     m_poll.setInterval(std::max(1, ms));
 }
 
+/// Publishes changed partial text or one nonempty final utterance while listening.
 void ListenSession::onResult(const runtime::RecognitionResult& result) {
     if (!m_listening) {
         return;
@@ -133,6 +142,7 @@ void ListenSession::onResult(const runtime::RecognitionResult& result) {
     emit partialChanged();
 }
 
+/// Clears listening state and reports the end detail, except for deliberate cancellation.
 void ListenSession::onEnd(runtime::RecognitionEnd reason, const std::string& detail) {
     if (!m_listening) {
         return;

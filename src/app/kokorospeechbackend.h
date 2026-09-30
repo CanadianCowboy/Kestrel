@@ -40,6 +40,7 @@ public:
 protected:
     void startEngine() override;
     void synthesise(const QString& text, const QString& path) override;
+    /// Returns the display name of the Kokoro engine.
     [[nodiscard]] QString engineName() const override { return QStringLiteral("Kokoro"); }
 
 private:

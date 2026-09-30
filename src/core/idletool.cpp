@@ -19,6 +19,7 @@ auto findByName(std::vector<IdleToolDeclaration>& declarations, std::string_view
                         });
 }
 
+/// Returns whether the permission list contains the requested capability.
 bool holds(const std::vector<ToolPermission>& permissions, ToolPermission permission) {
     return std::find(permissions.begin(), permissions.end(), permission) != permissions.end();
 }
@@ -34,6 +35,7 @@ constexpr ToolPermission kAllPermissions[] = {
 
 } // namespace
 
+/// Returns a readable permission name, or unknown for an unrecognized value.
 const char* toString(ToolPermission permission) noexcept {
     switch (permission) {
     case ToolPermission::ReadConversations: return "read conversations";
@@ -44,6 +46,7 @@ const char* toString(ToolPermission permission) noexcept {
     return "unknown";
 }
 
+/// Adds a tool declaration or replaces a matching declaration and disables it again.
 void IdleToolRegistry::declare(IdleToolDeclaration declaration) {
     const auto match = findByName(m_declarations, declaration.name);
     if (match == m_declarations.end()) {
@@ -58,6 +61,7 @@ void IdleToolRegistry::declare(IdleToolDeclaration declaration) {
     *match = std::move(declaration);
 }
 
+/// Returns the named declaration, or null if no such tool is registered.
 const IdleToolDeclaration* IdleToolRegistry::find(std::string_view name) const {
     const auto match = std::find_if(
         m_declarations.begin(), m_declarations.end(),
@@ -65,10 +69,12 @@ const IdleToolDeclaration* IdleToolRegistry::find(std::string_view name) const {
     return match == m_declarations.end() ? nullptr : &*match;
 }
 
+/// Returns a copy of all registered tool declarations and their enabled states.
 std::vector<IdleToolDeclaration> IdleToolRegistry::tools() const {
     return m_declarations;
 }
 
+/// Changes a registered tool's enabled state; undeclared names are ignored.
 void IdleToolRegistry::setEnabled(std::string_view name, bool enabled) {
     // An undeclared tool is not an error. The interface lists what is declared,
     // and a request about something that is not there has nothing to act on;
@@ -79,11 +85,13 @@ void IdleToolRegistry::setEnabled(std::string_view name, bool enabled) {
     }
 }
 
+/// Returns whether the named tool is both declared and enabled.
 bool IdleToolRegistry::enabled(std::string_view name) const {
     const IdleToolDeclaration* declaration = find(name);
     return declaration != nullptr && declaration->enabledByDefault;
 }
 
+/// Adds or removes a granted capability without duplicating grants.
 void IdleToolRegistry::grant(ToolPermission permission, bool granted) {
     const auto match = std::find(m_granted.begin(), m_granted.end(), permission);
     if (granted) {
@@ -97,10 +105,12 @@ void IdleToolRegistry::grant(ToolPermission permission, bool granted) {
     }
 }
 
+/// Returns whether the capability has been explicitly granted.
 bool IdleToolRegistry::granted(ToolPermission permission) const {
     return holds(m_granted, permission);
 }
 
+/// Requires the tool to be declared, enabled, and granted every declared permission.
 bool IdleToolRegistry::permits(std::string_view name) const {
     const IdleToolDeclaration* declaration = find(name);
     // Three separate reasons to refuse, and all three are checked: a tool that
@@ -112,6 +122,7 @@ bool IdleToolRegistry::permits(std::string_view name) const {
         && missing(name).empty();
 }
 
+/// Returns outstanding permissions; undeclared tools report every known capability missing.
 std::vector<ToolPermission> IdleToolRegistry::missing(std::string_view name) const {
     const IdleToolDeclaration* declaration = find(name);
     if (declaration == nullptr) {
@@ -130,6 +141,7 @@ std::vector<ToolPermission> IdleToolRegistry::missing(std::string_view name) con
     return outstanding;
 }
 
+/// Declares the opt-in topic indexer with conversation-read permission.
 IdleToolDeclaration indexThreadsDeclaration() {
     IdleToolDeclaration declaration;
     declaration.name = std::string(kIndexThreadsTool);
@@ -141,6 +153,7 @@ IdleToolDeclaration indexThreadsDeclaration() {
     return declaration;
 }
 
+/// Declares the opt-in summarizer with conversation-read and generation permissions.
 IdleToolDeclaration summariseSessionDeclaration() {
     IdleToolDeclaration declaration;
     declaration.name = std::string(kSummariseSessionTool);
@@ -177,6 +190,7 @@ bool isNoise(std::string_view word) {
     return word.size() < 4;
 }
 
+/// Returns a lowercase copy using unsigned bytes for character classification.
 std::string lowercase(std::string_view text) {
     std::string result;
     result.reserve(text.size());
@@ -209,6 +223,7 @@ std::vector<std::string> words(std::string_view text) {
     return result;
 }
 
+/// Counts distinct user-message terms and summarizes the three most frequent topics.
 ToolRunResult indexThreads(const std::vector<Message>& messages) {
     ToolRunResult result;
     std::map<std::string, std::size_t> counts;
@@ -257,6 +272,7 @@ ToolRunResult indexThreads(const std::vector<Message>& messages) {
 
 } // namespace
 
+/// Checks declaration, enablement, and permissions before indexing; reports refusals in the result.
 ToolRunResult runIdleTool(const IdleToolRegistry& registry, std::string_view name,
                           const std::vector<Message>& messages) {
     ToolRunResult result;

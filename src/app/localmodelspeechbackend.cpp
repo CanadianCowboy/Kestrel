@@ -9,6 +9,7 @@
 
 namespace kestrel::app {
 
+/// Creates temporary audio storage and connects the media player's completion signal.
 LocalModelSpeechBackend::LocalModelSpeechBackend(QObject* parent)
     : QObject(parent) {
     m_scratch = std::make_unique<QTemporaryDir>();
@@ -19,6 +20,7 @@ LocalModelSpeechBackend::LocalModelSpeechBackend(QObject* parent)
             &LocalModelSpeechBackend::onMediaStatusChanged);
 }
 
+/// Chooses the first engine voice and starts the engine if temporary storage is valid.
 void LocalModelSpeechBackend::completeSetup() {
     if (!m_scratch->isValid()) {
         // No scratch directory means no audio files, so the engine can never
@@ -33,6 +35,7 @@ void LocalModelSpeechBackend::completeSetup() {
     startEngine();
 }
 
+/// Releases the media file and audio device before temporary audio storage is destroyed.
 LocalModelSpeechBackend::~LocalModelSpeechBackend() {
     // Release the audio before the scratch directory goes. A player still
     // holding the last clause keeps a handle on it, and a temporary directory
@@ -46,6 +49,7 @@ LocalModelSpeechBackend::~LocalModelSpeechBackend() {
     }
 }
 
+/// Returns whether the engine has announced readiness to produce audio.
 bool LocalModelSpeechBackend::usable() const {
     // Usable as soon as the engine is up, not as soon as a model has finished
     // loading. An engine that is still warming up can still be handed work, and
@@ -54,6 +58,7 @@ bool LocalModelSpeechBackend::usable() const {
     return m_started;
 }
 
+/// Describes the current voice, loading state, or missing local engine.
 QString LocalModelSpeechBackend::description() const {
     if (m_started) {
         return QStringLiteral("%1 (%2, local)").arg(m_voice, engineName());
@@ -67,6 +72,7 @@ QString LocalModelSpeechBackend::description() const {
     return tr("no %1 voice is installed").arg(engineName());
 }
 
+/// Clears launch/readiness state and reports unavailability if the engine was ready.
 void LocalModelSpeechBackend::markGivenUp() {
     m_launched = false;
     if (!m_started) {
@@ -76,10 +82,12 @@ void LocalModelSpeechBackend::markGivenUp() {
     reportUnavailable();
 }
 
+/// Returns an empty executable path unless a concrete engine overrides it.
 QString LocalModelSpeechBackend::engineExecutable() const {
     return {};
 }
 
+/// Updates synthesis speed from persona rate and warmth; pitch is not applied.
 void LocalModelSpeechBackend::applyVoice(const core::VoicePersona& persona) {
     // The persona's rate and warmth are speaking decisions, not playback ones, so
     // they are handed to the model rather than applied to finished audio. Pitch
@@ -89,10 +97,12 @@ void LocalModelSpeechBackend::applyVoice(const core::VoicePersona& persona) {
     m_speed = core::paceFor(persona);
 }
 
+/// Allocates the next numbered WAV path in the temporary directory.
 QString LocalModelSpeechBackend::nextScratchPath() {
     return m_scratch->filePath(QStringLiteral("clause-%1.wav").arg(m_clause++));
 }
 
+/// Plays cached audio or requests synthesis for a nonempty clause when ready and idle.
 void LocalModelSpeechBackend::speak(const QString& text) {
     if (!m_started || m_speaking || text.trimmed().isEmpty()) {
         return;
@@ -112,6 +122,7 @@ void LocalModelSpeechBackend::speak(const QString& text) {
     synthesise(text, nextScratchPath());
 }
 
+/// Requests audio for a future clause unless it is already cached or pending.
 void LocalModelSpeechBackend::prefetch(const QString& text) {
     if (!m_started || text.trimmed().isEmpty() || m_prefetched.contains(text)) {
         return;
@@ -125,6 +136,7 @@ void LocalModelSpeechBackend::prefetch(const QString& text) {
     synthesise(text, nextScratchPath());
 }
 
+/// Removes and returns cached audio for the text, or an empty path when absent.
 QString LocalModelSpeechBackend::takePrefetched(const QString& text) {
     const auto match = m_prefetched.find(text);
     if (match == m_prefetched.end()) {
@@ -135,6 +147,7 @@ QString LocalModelSpeechBackend::takePrefetched(const QString& text) {
     return path;
 }
 
+/// Matches an audio file to the oldest pending request and plays or caches it.
 void LocalModelSpeechBackend::noteSynthesised(const QString& path) {
     if (m_pending.isEmpty()) {
         // Nothing asked for this. Playing it anyway would speak a clause the
@@ -154,6 +167,7 @@ void LocalModelSpeechBackend::noteSynthesised(const QString& path) {
     }
 }
 
+/// Drops the oldest pending clause and reports its synthesis failure.
 void LocalModelSpeechBackend::noteClauseFailed(const QString& reason) {
     if (m_pending.isEmpty()) {
         return;
@@ -163,6 +177,7 @@ void LocalModelSpeechBackend::noteClauseFailed(const QString& reason) {
     reportFailed(reason);
 }
 
+/// Clears pending synthesis, marks the engine unavailable, and reports the failure.
 void LocalModelSpeechBackend::noteEngineFailed(const QString& reason) {
     m_speaking = false;
     m_pending.clear();
@@ -170,6 +185,7 @@ void LocalModelSpeechBackend::noteEngineFailed(const QString& reason) {
     reportFailed(reason.isEmpty() ? tr("the local voice failed") : reason);
 }
 
+/// Stops the media player; synthesis requests already sent remain pending.
 void LocalModelSpeechBackend::stop() {
     // A clause already handed to the model is not recalled; it finishes, which is
     // the same bargain the platform voice makes and the reason a barge-in lands
@@ -177,15 +193,18 @@ void LocalModelSpeechBackend::stop() {
     m_player->stop();
 }
 
+/// Stops the media player immediately and clears the speaking flag.
 void LocalModelSpeechBackend::stopImmediately() {
     m_player->stop();
     m_speaking = false;
 }
 
+/// Returns whether a clause is being synthesized for playback or spoken.
 bool LocalModelSpeechBackend::speakingNow() const {
     return m_speaking;
 }
 
+/// Selects a supported voice and clears old prefetched audio; rejects unknown voices.
 bool LocalModelSpeechBackend::setVoice(const QString& voice) {
     if (!engineVoices().contains(voice)) {
         // Refused rather than accepted and hoped for: a name the model does not
@@ -204,6 +223,7 @@ bool LocalModelSpeechBackend::setVoice(const QString& voice) {
     return true;
 }
 
+/// Clears the speaking flag and reports completion when the player reaches end of media.
 void LocalModelSpeechBackend::onMediaStatusChanged() {
     if (m_player->mediaStatus() != QMediaPlayer::EndOfMedia) {
         return;

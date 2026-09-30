@@ -13,6 +13,7 @@ namespace kestrel::app {
 
 #if KESTREL_HAS_QT_MULTIMEDIA
 
+/// Finds local Kokoro installations near the executable without launching their drivers.
 LocalVoiceEngines LocalVoiceEngines::discover() {
     LocalVoiceEngines result;
     // One level up from the binary, which is where the models and the driver
@@ -60,6 +61,7 @@ LocalVoiceEngines LocalVoiceEngines::discover() {
     return result;
 }
 
+/// Returns the first discovered engine with voices, or an empty identifier.
 QString LocalVoiceEngines::defaultEngineId() const {
     for (const Engine& engine : m_engines) {
         if (!engine.voices.isEmpty()) {
@@ -69,6 +71,7 @@ QString LocalVoiceEngines::defaultEngineId() const {
     return {};
 }
 
+/// Creates the requested discovered backend, or null when the identifier is unsupported.
 std::unique_ptr<SpeechBackend> LocalVoiceEngines::create(const QString& id) const {
     for (const Engine& engine : m_engines) {
         if (engine.id != id) {
@@ -82,6 +85,7 @@ std::unique_ptr<SpeechBackend> LocalVoiceEngines::create(const QString& id) cons
     return nullptr;
 }
 
+/// Projects engine identifiers, names, and voices into Qt values for the picker.
 QVariantList LocalVoiceEngines::describe() const {
     QVariantList result;
     for (const Engine& engine : m_engines) {
@@ -96,9 +100,13 @@ QVariantList LocalVoiceEngines::describe() const {
 
 #else
 
+/// Returns an empty engine catalog when Qt Multimedia support is absent.
 LocalVoiceEngines LocalVoiceEngines::discover() { return {}; }
+/// Returns no default engine when Qt Multimedia support is absent.
 QString LocalVoiceEngines::defaultEngineId() const { return {}; }
+/// Returns null because this build cannot create local audio backends.
 std::unique_ptr<SpeechBackend> LocalVoiceEngines::create(const QString&) const { return nullptr; }
+/// Returns an empty picker model when Qt Multimedia support is absent.
 QVariantList LocalVoiceEngines::describe() const { return {}; }
 
 #endif

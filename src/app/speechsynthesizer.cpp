@@ -71,6 +71,7 @@ bool soundsStrained(const QVoice& voice) {
         || name.contains(QStringLiteral("babble"));
 }
 
+/// Ranks neural-sounding voices first, then language matches and unstrained voices.
 int scoreVoice(const QVoice& voice, const QLocale& preferred) {
     if (soundsLikeNeuralVoice(voice.name())) {
         return 100;
@@ -113,7 +114,9 @@ QVoice chooseVoice(const QList<QVoice>& voices, const QLocale& preferred) {
 // without it.
 class PlatformSpeechBackend final : public SpeechBackend {
 public:
+    /// Returns the platform voice availability recorded during synthesizer setup.
     bool usable() const override { return m_usable; }
+    /// Returns the selected platform voice name or its availability explanation.
     QString description() const override { return m_description; }
 
     // The synthesizer decides once whether an engine answered and records the
@@ -124,6 +127,7 @@ public:
         m_description = description;
     }
 
+    /// Applies persona rate and pitch to a usable platform voice, leaving volume unchanged.
     void applyVoice(const core::VoicePersona& persona) override {
         if (!m_usable) {
             return;
@@ -140,6 +144,7 @@ public:
         m_voice.setPitch(static_cast<double>(persona.pitch) * kPitchPerSemitone);
     }
 
+    /// Hands an utterance to Qt's platform text-to-speech engine.
     void speak(const QString& text) override { m_voice.say(text); }
 
     // finishCurrent() is the clause-boundary stop: Qt's Utterance hint lets the
@@ -148,8 +153,10 @@ public:
     // how long a word takes.
     void stop() override { m_voice.stop(QTextToSpeech::BoundaryHint::Utterance); }
 
+    /// Requests an immediate stop from the platform text-to-speech engine.
     void stopImmediately() override { m_voice.stop(QTextToSpeech::BoundaryHint::Immediate); }
 
+    /// Returns whether the platform voice is speaking or synthesizing audio.
     bool speakingNow() const override {
         return m_voice.state() == QTextToSpeech::Speaking
             || m_voice.state() == QTextToSpeech::Synthesizing;
@@ -173,6 +180,7 @@ public:
         reportFinished();
     }
 
+    /// Returns the Qt voice engine for initial selection and signal wiring.
     QTextToSpeech& voice() { return m_voice; }
 
 private:
@@ -185,14 +193,21 @@ private:
 // everywhere at the call site, and it says plainly why there is no voice.
 class PlatformSpeechBackend final : public SpeechBackend {
 public:
+    /// Reports that platform speech is unavailable in builds without Qt TextToSpeech.
     bool usable() const override { return false; }
+    /// Explains why this build has no platform speech output.
     QString description() const override {
         return QStringLiteral("Qt text-to-speech not compiled in");
     }
+    /// Ignores voice settings because this build has no speech engine.
     void applyVoice(const core::VoicePersona&) override {}
+    /// Ignores speech requests because this build has no speech engine.
     void speak(const QString&) override {}
+    /// Does nothing because this build cannot have an active utterance.
     void stop() override {}
+    /// Does nothing because this build cannot have audio to stop immediately.
     void stopImmediately() override {}
+    /// Returns false because this build cannot speak through the platform backend.
     bool speakingNow() const override { return false; }
 
 private:
@@ -204,6 +219,7 @@ private:
 // incomplete type without every user of it including a platform header.
 class SpeechSynthesizerPrivate {};
 
+/// Configures pause/load timers and selects the best available platform voice.
 SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
     : QObject(parent), d(std::make_unique<SpeechSynthesizerPrivate>()) {
     m_pauseTimer.setSingleShot(true);
@@ -242,12 +258,15 @@ SpeechSynthesizer::SpeechSynthesizer(QObject* parent)
 #endif
 }
 
+/// Releases the owned speech backend and private implementation state.
 SpeechSynthesizer::~SpeechSynthesizer() = default;
 
+/// Transfers ownership of a speech backend and wires its callbacks.
 void SpeechSynthesizer::adoptBackend(std::unique_ptr<SpeechBackend> backend) {
     setBackendForTesting(std::move(backend));
 }
 
+/// Prefetches a future clause, deferring it until any paused clause has reached the engine.
 void SpeechSynthesizer::prefetch(const QString& text) {
     if (m_backend == nullptr || text.trimmed().isEmpty()) {
         return;
@@ -268,18 +287,22 @@ void SpeechSynthesizer::prefetch(const QString& text) {
     m_backend->prefetch(text);
 }
 
+/// Returns the active backend's voice choices, or an empty list without a backend.
 QStringList SpeechSynthesizer::voiceChoices() const {
     return m_backend != nullptr ? m_backend->voiceChoices() : QStringList();
 }
 
+/// Returns the selected backend voice, or an empty string without a backend.
 QString SpeechSynthesizer::currentVoice() const {
     return m_backend != nullptr ? m_backend->currentVoice() : QString();
 }
 
+/// Asks the backend to select a voice and returns whether it accepted the choice.
 bool SpeechSynthesizer::setVoice(const QString& voice) {
     return m_backend != nullptr && m_backend->setVoice(voice);
 }
 
+/// Replaces a nonnull backend, clearing queued clauses and installing callbacks.
 void SpeechSynthesizer::setBackendForTesting(std::unique_ptr<SpeechBackend> backend) {
     if (backend == nullptr) {
         return;
@@ -297,6 +320,7 @@ void SpeechSynthesizer::setBackendForTesting(std::unique_ptr<SpeechBackend> back
         [this] { onBackendUnavailable(); });
 }
 
+/// Clears the loading timeout state and announces that speech is available.
 void SpeechSynthesizer::onBackendAvailable() {
     // A voice that turns up is a voice worth waiting for again, and the reason
     // it was given up on no longer describes anything.
@@ -305,12 +329,14 @@ void SpeechSynthesizer::onBackendAvailable() {
     emit availabilityChanged(true);
 }
 
+/// Releases any audio hold and announces that the backend is unavailable.
 void SpeechSynthesizer::onBackendUnavailable() {
     // The engine will never answer, so waiting longer cannot produce audio.
     releaseOwedAudio();
     emit availabilityChanged(false);
 }
 
+/// Marks voice loading as timed out and releases any response waiting for audio.
 void SpeechSynthesizer::onVoiceLoadDeadline() {
     // The engine is not going to say it is ready. Half-synced weights, a wedged
     // interpreter and a load that ran out of memory are indistinguishable from
@@ -319,10 +345,12 @@ void SpeechSynthesizer::onVoiceLoadDeadline() {
     releaseOwedAudio();
 }
 
+/// Returns whether a response is being held for a loading voice.
 bool SpeechSynthesizer::audioOwed() const {
     return m_audioOwed;
 }
 
+/// Holds a response for a present but unready voice and starts its loading deadline.
 void SpeechSynthesizer::oweAudio() {
     m_voiceLoadDeadline.stop();
     // Holding every reply for the same voice that already failed would give the
@@ -333,6 +361,7 @@ void SpeechSynthesizer::oweAudio() {
     }
 }
 
+/// Clears an audio hold and emits its release once, including whether loading timed out.
 void SpeechSynthesizer::releaseOwedAudio() {
     m_voiceLoadDeadline.stop();
     if (!m_audioOwed) {
@@ -344,22 +373,27 @@ void SpeechSynthesizer::releaseOwedAudio() {
     emit owedAudioReleased(m_voiceGaveUp);
 }
 
+/// Sets the deadline duration in milliseconds for future voice loading holds.
 void SpeechSynthesizer::setVoiceLoadTimeout(int ms) {
     m_voiceLoadTimeoutMs = ms;
 }
 
+/// Returns whether the current backend can produce audio.
 bool SpeechSynthesizer::available() const {
     return m_backend != nullptr && m_backend->usable();
 }
 
+/// Returns whether a backend is present, including an installed voice still loading.
 bool SpeechSynthesizer::present() const {
     return m_backend != nullptr && m_backend->present();
 }
 
+/// Returns the backend's voice description, or an unavailable label.
 QString SpeechSynthesizer::voiceDescription() const {
     return m_backend != nullptr ? m_backend->description() : QStringLiteral("unavailable");
 }
 
+/// Applies a voice persona only when the current backend is usable.
 void SpeechSynthesizer::applyVoice(const core::VoicePersona& persona) {
     if (!available()) {
         return;
@@ -367,6 +401,7 @@ void SpeechSynthesizer::applyVoice(const core::VoicePersona& persona) {
     m_backend->applyVoice(persona);
 }
 
+/// Schedules a clause after a pause capped at 1200 ms, or skips unavailable/empty speech.
 void SpeechSynthesizer::speak(const QString& text, int leadingPauseMs) {
     if (!available() || text.trimmed().isEmpty()) {
         // Nothing to say is not a failure. An empty clause is skipped and the
@@ -383,6 +418,7 @@ void SpeechSynthesizer::speak(const QString& text, int leadingPauseMs) {
     speakNow();
 }
 
+/// Cancels a pending pause or asks the engine to stop at the current utterance boundary.
 void SpeechSynthesizer::requestStop() {
     if (!available() || (!speaking() && !waiting())) {
         emit stopCompleted();
@@ -405,6 +441,7 @@ void SpeechSynthesizer::requestStop() {
     m_backend->stop();
 }
 
+/// Clears queued speech, requests an immediate backend stop, and reports stop completion.
 void SpeechSynthesizer::stopNow() {
     m_pauseTimer.stop();
     m_pending.clear();
@@ -417,14 +454,17 @@ void SpeechSynthesizer::stopNow() {
     emit stopCompleted();
 }
 
+/// Returns whether the backend reports speech in progress.
 bool SpeechSynthesizer::speaking() const noexcept {
     return m_backend != nullptr && m_backend->speakingNow();
 }
 
+/// Returns whether a leading pause is delaying the next clause.
 bool SpeechSynthesizer::waiting() const noexcept {
     return m_pauseTimer.isActive();
 }
 
+/// Submits the pending clause, then its queued lookahead, in that order.
 void SpeechSynthesizer::speakNow() {
     if (!available() || m_pending.trimmed().isEmpty()) {
         emit segmentFinished();
@@ -443,6 +483,7 @@ void SpeechSynthesizer::speakNow() {
     }
 }
 
+/// Reports either clause completion or completion of a requested boundary stop.
 void SpeechSynthesizer::onBackendFinished() {
     m_pendingText.clear();
     if (m_stoppingAtBoundary) {
@@ -455,6 +496,7 @@ void SpeechSynthesizer::onBackendFinished() {
     emit segmentFinished();
 }
 
+/// Clears queued speech and reports the backend failure followed by stop completion.
 void SpeechSynthesizer::onBackendFailed(const QString& reason) {
     m_pauseTimer.stop();
     m_pending.clear();

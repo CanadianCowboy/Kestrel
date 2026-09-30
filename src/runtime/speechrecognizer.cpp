@@ -17,6 +17,7 @@ constexpr std::size_t kWordsPerPartial = 2;
 
 } // namespace
 
+/// Returns a recognition end-reason label, or unknown for an unrecognized value.
 const char* toString(RecognitionEnd reason) noexcept {
     switch (reason) {
     case RecognitionEnd::Silence: return "silence";
@@ -27,6 +28,7 @@ const char* toString(RecognitionEnd reason) noexcept {
     return "unknown";
 }
 
+/// Stores scripted phrases, supplying a default preview phrase if the list is empty.
 MockSpeechRecognizer::MockSpeechRecognizer(std::vector<std::string> phrases)
     : m_phrases(std::move(phrases)) {
     if (m_phrases.empty()) {
@@ -34,10 +36,12 @@ MockSpeechRecognizer::MockSpeechRecognizer(std::vector<std::string> phrases)
     }
 }
 
+/// Identifies this recognizer as a microphone-free preview implementation.
 std::string MockSpeechRecognizer::detail() const {
     return "preview recognizer (no microphone)";
 }
 
+/// Starts the script from its first phrase; requires both callbacks and an idle recognizer.
 bool MockSpeechRecognizer::start(ResultCallback onResult, EndCallback onEnd, std::string& error) {
     if (m_listening) {
         error = "already listening";
@@ -55,6 +59,7 @@ bool MockSpeechRecognizer::start(ResultCallback onResult, EndCallback onEnd, std
     return true;
 }
 
+/// Ends active recognition with cancellation callbacks and never submits partial text as final.
 void MockSpeechRecognizer::stop() {
     if (!m_listening) {
         return;
@@ -84,6 +89,7 @@ void MockSpeechRecognizer::stop() {
     onEnd(RecognitionEnd::Cancelled, {});
 }
 
+/// Emits up to two more scripted words, then final/end callbacks when a phrase is complete.
 void MockSpeechRecognizer::emitNextPartial() {
     if (!m_listening || m_phrase >= m_phrases.size()) {
         return;
@@ -145,6 +151,7 @@ void MockSpeechRecognizer::emitNextPartial() {
     }
 }
 
+/// Returns whether the microphone probe favors trying a platform recognizer.
 bool preferPlatformRecognizer(Microphone microphone) noexcept {
     // One rule, and it is the obvious one: a real engine is for a machine that
     // has a microphone to feed it. Everywhere else the mock is not a
@@ -153,6 +160,7 @@ bool preferPlatformRecognizer(Microphone microphone) noexcept {
     return microphone == Microphone::Present;
 }
 
+/// Uses an available platform recognizer for a present microphone, otherwise a scripted mock.
 std::unique_ptr<SpeechRecognizer> makeRecognizerFor(Microphone microphone) {
     if (preferPlatformRecognizer(microphone)) {
         // The probe counts devices, which is not the same as being able to
@@ -169,6 +177,7 @@ std::unique_ptr<SpeechRecognizer> makeRecognizerFor(Microphone microphone) {
     return std::make_unique<MockSpeechRecognizer>();
 }
 
+/// Honors explicit recognizer preferences; automatic mode probes the microphone and may fall back.
 std::unique_ptr<SpeechRecognizer> makeBestSpeechRecognizer(SpeechInput preference) {
     // The override exists for two callers that would otherwise be at the mercy
     // of the machine. The test suite asserts on partial results, which only the

@@ -37,6 +37,7 @@ constexpr int kVoiceLoadDeadlineMs = 15000;
 // implementation that reports utterance boundaries on demand.
 class SpeechBackend {
 public:
+    /// Allows concrete speech backends to be destroyed through the interface.
     virtual ~SpeechBackend() = default;
 
     [[nodiscard]] virtual bool usable() const = 0;
@@ -69,6 +70,7 @@ public:
     // a platform voice is whatever the operating system registered, and there
     // is nothing useful to offer a list of.
     [[nodiscard]] virtual QStringList voiceChoices() const { return {}; }
+    /// Returns no selected voice by default; concrete engines may expose one.
     [[nodiscard]] virtual QString currentVoice() const { return {}; }
     // Returns false when the name is not one this backend has, so a stale
     // setting cannot quietly leave the app speaking with something else.
@@ -93,11 +95,13 @@ public:
     }
 
 protected:
+    /// Invokes the completion callback if one has been installed.
     void reportFinished() const {
         if (m_onFinished) {
             m_onFinished();
         }
     }
+    /// Passes a failure reason to the installed callback, if any.
     void reportFailed(const QString& reason) const {
         if (m_onFailed) {
             m_onFailed(reason);
@@ -112,6 +116,7 @@ protected:
             m_onAvailable();
         }
     }
+    /// Invokes the unavailable callback if one has been installed.
     void reportUnavailable() const {
         if (m_onUnavailable) {
             m_onUnavailable();

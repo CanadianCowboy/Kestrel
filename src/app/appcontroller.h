@@ -309,6 +309,7 @@ public:
     // Switches between the local engines. Rebuilds the backend, which is the
     // only way to change which model is in charge of the voice.
     Q_INVOKABLE bool setSpeechEngine(const QString& engineId);
+    /// Returns the identifier of the selected local speech engine.
     [[nodiscard]] QString speechEngine() const { return m_speechEngine; }
     // Speech input. A completed phrase is submitted exactly as if it had been
     // typed, which is what makes a spoken request interrupt a reply the same way

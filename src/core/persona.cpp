@@ -20,18 +20,22 @@ constexpr float kInitiativeForPrompt = 0.45F;
 constexpr std::size_t kTopicWindow = 4;
 constexpr std::size_t kTopicWords = 3;
 
+/// Clamps a persona dial to [0, 1].
 float clampUnit(float value) noexcept {
     return std::clamp(value, kClampLow, kClampHigh);
 }
 
+/// Lowercases a character using an unsigned byte for safe character classification.
 char lowerAscii(char c) noexcept {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 }
 
+/// Returns whether the byte is alphabetic according to the current C locale.
 bool isAsciiLetter(char c) noexcept {
     return std::isalpha(static_cast<unsigned char>(c)) != 0;
 }
 
+/// Returns a view without leading or trailing spaces, tabs, or line breaks.
 std::string_view trim(std::string_view text) noexcept {
     const auto isBlank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
     while (!text.empty() && isBlank(text.front())) {
@@ -45,6 +49,7 @@ std::string_view trim(std::string_view text) noexcept {
 
 } // namespace
 
+/// Returns a mood label, or unknown for an unrecognized value.
 const char* toString(PersonaMood mood) noexcept {
     switch (mood) {
     case PersonaMood::Calm: return "calm";
@@ -55,6 +60,7 @@ const char* toString(PersonaMood mood) noexcept {
     return "unknown";
 }
 
+/// Returns an activity label, or unknown for an unrecognized value.
 const char* toString(PersonaActivity activity) noexcept {
     switch (activity) {
     case PersonaActivity::StandingBy: return "standing by";
@@ -67,6 +73,7 @@ const char* toString(PersonaActivity activity) noexcept {
     return "unknown";
 }
 
+/// Returns a trigger label, or unknown for an unrecognized value.
 const char* toString(PersonaTrigger trigger) noexcept {
     switch (trigger) {
     case PersonaTrigger::TurnCompleted: return "turn completed";
@@ -81,6 +88,7 @@ const char* toString(PersonaTrigger trigger) noexcept {
     return "unknown";
 }
 
+/// Returns an anticipation label, or unknown for an unrecognized value.
 const char* toString(AnticipationKind kind) noexcept {
     switch (kind) {
     case AnticipationKind::OfferContinue: return "offer continue";
@@ -92,6 +100,7 @@ const char* toString(AnticipationKind kind) noexcept {
     return "unknown";
 }
 
+/// Clamps all six persona dials to [0, 1].
 void PersonaState::clamp() noexcept {
     focus = clampUnit(focus);
     curiosity = clampUnit(curiosity);
@@ -101,25 +110,31 @@ void PersonaState::clamp() noexcept {
     warmth = clampUnit(warmth);
 }
 
+/// Initializes the default tone and dials with empty session continuity.
 Persona::Persona() = default;
 
+/// Replaces the fixed tone profile used for prompt text and anticipatory behavior.
 void Persona::setTone(ToneProfile tone) noexcept {
     m_tone = tone;
 }
 
+/// Returns the current tone profile by reference.
 const ToneProfile& Persona::tone() const noexcept {
     return m_tone;
 }
 
+/// Replaces the persona dials after clamping them to [0, 1].
 void Persona::setState(PersonaState state) noexcept {
     state.clamp();
     m_state = state;
 }
 
+/// Returns the current persona dials by reference.
 const PersonaState& Persona::state() const noexcept {
     return m_state;
 }
 
+/// Adds each supplied delta to its corresponding dial, then clamps all dials.
 void Persona::drift(float focus, float curiosity, float initiative,
                      float calmness, float presenceIntensity, float warmth) noexcept {
     m_state.focus += focus;
@@ -131,6 +146,7 @@ void Persona::drift(float focus, float curiosity, float initiative,
     m_state.clamp();
 }
 
+/// Classifies the dials as alert, focused, contemplative, or calm in priority order.
 PersonaMood moodFor(const PersonaState& state) noexcept {
     // Ordered from most to least unusual, so an agitated assistant is labelled
     // agitated rather than calm-but-also-a-bit-alert.
@@ -146,10 +162,12 @@ PersonaMood moodFor(const PersonaState& state) noexcept {
     return PersonaMood::Calm;
 }
 
+/// Returns the mood derived from the current persona dials.
 PersonaMood Persona::mood() const noexcept {
     return moodFor(m_state);
 }
 
+/// Builds the assistant-presence prompt from the fixed tone profile only.
 std::string Persona::presenceLine() const {
     // The one string that defines the character. It is built from the tone
     // profile and nothing else, so it stays identical on every turn and the
@@ -175,10 +193,12 @@ std::string Persona::presenceLine() const {
     return line;
 }
 
+/// Returns the presence line as the persona's system-prompt contribution.
 std::string Persona::systemPromptFragment() const {
     return presenceLine();
 }
 
+/// Returns the next deterministic acknowledgement cue and advances its sequence.
 std::string Persona::acknowledgement() {
     // Said the instant a request is accepted, before there is anything to
     // answer with. Rotation rather than a random draw keeps a session
@@ -194,12 +214,14 @@ std::string Persona::acknowledgement() {
     return kCues[static_cast<std::size_t>(index)];
 }
 
+/// Returns the 220 ms pause between the acknowledgement cue and the answer.
 int Persona::acknowledgementPauseMs() const noexcept {
     // Long enough to read as a separate utterance, short enough that the answer
     // still feels like it started immediately.
     return 220;
 }
 
+/// Returns a permitted anticipatory reaction, or no line; detail is currently unused.
 std::optional<Anticipation> Persona::react(PersonaTrigger trigger, std::string_view detail) {
     static_cast<void>(detail);
     if (!m_tone.anticipatory) {
@@ -247,6 +269,7 @@ std::optional<Anticipation> Persona::react(PersonaTrigger trigger, std::string_v
     return line;
 }
 
+/// Returns a short status line for the activity, defaulting to standing by.
 std::string Persona::statusWhisper(PersonaActivity activity) const {
     switch (activity) {
     case PersonaActivity::StandingBy: return "Standing by\u2026";
@@ -259,6 +282,7 @@ std::string Persona::statusWhisper(PersonaActivity activity) const {
     return "Standing by\u2026";
 }
 
+/// Counts a user turn and retains nonblank trimmed text in a four-message topic window.
 void Persona::noteUserMessage(std::string_view text) {
     ++m_turnCount;
     const std::string_view trimmed = trim(text);
@@ -271,14 +295,17 @@ void Persona::noteUserMessage(std::string_view text) {
     }
 }
 
+/// Returns the number of user messages noted, including blank messages.
 std::size_t Persona::turnCount() const noexcept {
     return m_turnCount;
 }
 
+/// Returns the number of acknowledgement choices made so far.
 std::uint64_t Persona::sequence() const noexcept {
     return m_sequence;
 }
 
+/// Joins up to three distinct topic words, scanning recent user messages first.
 std::string Persona::sessionTopic() const {
     // Most recent first, so the topic tracks what the user is working on now
     // rather than what they opened the app with.
@@ -316,6 +343,7 @@ std::string Persona::sessionTopic() const {
     return topic;
 }
 
+/// Returns whether a word belongs to the sorted stop-word table.
 bool Persona::isStopWord(std::string_view word) noexcept {
     // Function words carry no topic. Kept as a sorted table so the lookup is a
     // binary search rather than a scan of a list on every message.

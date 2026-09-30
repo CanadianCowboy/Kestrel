@@ -51,7 +51,9 @@ public:
     void stopImmediately() override;
     [[nodiscard]] bool speakingNow() const override;
 
+    /// Returns the concrete engine's supported voice identifiers.
     [[nodiscard]] QStringList voiceChoices() const override { return engineVoices(); }
+    /// Returns the selected voice identifier.
     [[nodiscard]] QString currentVoice() const override { return m_voice; }
     bool setVoice(const QString& voice) override;
 

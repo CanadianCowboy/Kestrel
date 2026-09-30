@@ -16,34 +16,43 @@ namespace kestrel::runtime {
 
 class SapiSpeechRecognizer::Impl {};
 
+/// Constructs the inert platform implementation used when SAPI is unavailable.
 SapiSpeechRecognizer::SapiSpeechRecognizer()
     : m_impl(std::make_unique<Impl>()) {}
 
+/// Releases the inert platform implementation.
 SapiSpeechRecognizer::~SapiSpeechRecognizer() = default;
 
+/// Returns false because this build has no SAPI recognizer.
 bool SapiSpeechRecognizer::available() const {
     return false;
 }
 
+/// Explains that SAPI speech recognition was not compiled into this build.
 std::string SapiSpeechRecognizer::detail() const {
     return "this build has no SAPI speech recognition";
 }
 
+/// Rejects recognition and writes the unavailable-build reason to error.
 bool SapiSpeechRecognizer::start(ResultCallback, EndCallback, std::string& error) {
     error = detail();
     return false;
 }
 
+/// Does nothing because the portable stub never starts recognition.
 void SapiSpeechRecognizer::stop() {}
 
+/// Returns false because the portable stub never listens.
 bool SapiSpeechRecognizer::listening() const {
     return false;
 }
 
+/// Returns zero because this build cannot enumerate Windows capture devices.
 unsigned microphoneDeviceCount() {
     return 0;
 }
 
+/// Reports no usable microphone through the unsupported platform adapter.
 Microphone probeMicrophone() {
     // Not "absent" because it was checked: on a platform with no SAPI there is
     // nothing to check with, and saying so is more useful than a device count
@@ -51,6 +60,7 @@ Microphone probeMicrophone() {
     return Microphone::Absent;
 }
 
+/// Creates the unavailable SAPI stub so callers can inspect its diagnostic detail.
 std::unique_ptr<SpeechRecognizer> makePlatformSpeechRecognizer() {
     return std::make_unique<SapiSpeechRecognizer>();
 }

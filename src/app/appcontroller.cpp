@@ -212,6 +212,7 @@ AppController::AppController(QObject* parent)
     });
 }
 
+/// Starts dictation and updates presence; returns false and publishes a reason on failure.
 bool AppController::startListening() {
     if (m_listen == nullptr) {
         m_listenError = tr("Speech input is not available in this build.");
@@ -236,6 +237,7 @@ bool AppController::startListening() {
     return true;
 }
 
+/// Stops the listening session and notifies the interface.
 void AppController::stopListening() {
     if (m_listen != nullptr) {
         m_listen->stopListening();
@@ -243,6 +245,7 @@ void AppController::stopListening() {
     emit listeningChanged();
 }
 
+/// Discards the current spoken phrase without submitting a user turn.
 void AppController::abandonListening() {
     if (m_listen != nullptr) {
         m_listen->abandon();
@@ -250,26 +253,32 @@ void AppController::abandonListening() {
     emit listeningChanged();
 }
 
+/// Returns whether a listening session is active.
 bool AppController::listening() const noexcept {
     return m_listen != nullptr && m_listen->listening();
 }
 
+/// Returns whether the selected speech recognizer is available.
 bool AppController::sttAvailable() const noexcept {
     return m_recognizer != nullptr && m_recognizer->available();
 }
 
+/// Returns the recognizer's availability detail, or an empty string if absent.
 QString AppController::sttDetail() const {
     return m_recognizer != nullptr ? QString::fromStdString(m_recognizer->detail()) : QString();
 }
 
+/// Returns the current partial transcript, or an empty string without a session.
 QString AppController::partialTranscript() const {
     return m_listen != nullptr ? m_listen->partialText() : QString();
 }
 
+/// Returns the last reported listening error or end reason.
 QString AppController::listenError() const {
     return m_listenError;
 }
 
+/// Submits a final recognized phrase through the normal message path; confidence is unused.
 void AppController::onUtteranceFinal(const QString& text, double confidence) {
     static_cast<void>(confidence);
     emit listeningChanged();
@@ -280,11 +289,13 @@ void AppController::onUtteranceFinal(const QString& text, double confidence) {
     sendMessage(text);
 }
 
+/// Publishes the listening session's end reason to the interface.
 void AppController::onListeningEnded(const QString& reason) {
     m_listenError = reason;
     emit listeningChanged();
 }
 
+/// Stops idle ticks and joins loading and generation threads before deleting the worker.
 AppController::~AppController() {
     // The idle loop is a child of this object and its timer is stopped first:
     // a tick arriving during teardown would call into a half-destroyed
@@ -434,22 +445,27 @@ bool AppController::canBargeIn() const noexcept {
     return canPause();
 }
 
+/// Returns the presence activity label for the interface.
 QString AppController::presenceState() const {
     return QString::fromLatin1(core::toString(m_presence.activity()));
 }
 
+/// Returns the eased presence intensity used for interface animation.
 double AppController::presenceIntensity() const noexcept {
     return m_presence.intensity();
 }
 
+/// Returns whether the presence snapshot reports active speech.
 bool AppController::presenceSpeaking() const noexcept {
     return m_presence.speaking();
 }
 
+/// Returns the mood label from the current presence snapshot.
 QString AppController::personaMood() const {
     return QString::fromLatin1(core::toString(m_presence.snapshot().mood));
 }
 
+/// Returns a fresh anticipatory override, otherwise the current activity whisper.
 QString AppController::statusWhisper() const {
     // An anticipatory line outranks the activity whisper while it is fresh, and
     // then lets it back: the status line must return to saying what Kestrel is
@@ -461,14 +477,17 @@ QString AppController::statusWhisper() const {
     return QString::fromStdString(m_persona.statusWhisper(m_presence.activity()));
 }
 
+/// Returns the pending acknowledgement cue for the current turn.
 QString AppController::acknowledgement() const noexcept {
     return m_acknowledgement;
 }
 
+/// Returns the stored idle thought; callers apply the visibility preference.
 QString AppController::ambientThought() const {
     return m_ambientThought;
 }
 
+/// Projects tool declarations, enabled states, and missing permissions for the panel.
 QVariantList AppController::idleTools() const {
     QVariantList result;
     for (const core::IdleToolDeclaration& declaration : m_idleTools.tools()) {
@@ -494,11 +513,13 @@ QVariantList AppController::idleTools() const {
     return result;
 }
 
+/// Updates a declared idle tool's enabled state and refreshes the panel.
 void AppController::setIdleToolEnabled(const QString& name, bool enabled) {
     m_idleTools.setEnabled(name.toStdString(), enabled);
     emit idleToolsChanged();
 }
 
+/// Grants or revokes a named permission; unknown names are ignored.
 void AppController::setToolPermission(const QString& permission, bool granted) {
     // Matched by name so QML never has to know the enum, and so a name that
     // does not exist simply grants nothing.
@@ -518,18 +539,22 @@ void AppController::setToolPermission(const QString& permission, bool granted) {
     }
 }
 
+/// Returns the active speech backend's voice choices, or an empty list.
 QStringList AppController::speechVoices() const {
     return m_speech != nullptr ? m_speech->voiceChoices() : QStringList();
 }
 
+/// Returns the active speech backend's selected voice, or an empty string.
 QString AppController::currentVoice() const {
     return m_speech != nullptr ? m_speech->currentVoice() : QString();
 }
 
+/// Returns descriptions of discovered local speech engines for the picker.
 QVariantList AppController::speechEngines() const {
     return m_localVoices != nullptr ? m_localVoices->describe() : QVariantList();
 }
 
+/// Adopts a usable local engine; returns false for unchanged, unknown, or unusable choices.
 bool AppController::setSpeechEngine(const QString& engineId) {
     if (m_localVoices == nullptr || engineId == m_speechEngine) {
         return false;
@@ -549,6 +574,7 @@ bool AppController::setSpeechEngine(const QString& engineId) {
     return true;
 }
 
+/// Selects a backend voice and refreshes its description; returns false if rejected.
 bool AppController::setSpeechVoice(const QString& voice) {
     if (m_speech == nullptr || !m_speech->setVoice(voice)) {
         return false;
@@ -559,6 +585,7 @@ bool AppController::setSpeechVoice(const QString& voice) {
     return true;
 }
 
+/// Formats the last idle task, respecting thought visibility and tool refusal details.
 QString AppController::idleTaskLabel() const {
     if (m_idleTaskKind.isEmpty()) {
         return {};
@@ -581,30 +608,37 @@ QString AppController::idleTaskLabel() const {
     return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleTaskDetail);
 }
 
+/// Returns the persona's summary of recent user topics.
 QString AppController::sessionTopic() const {
     return QString::fromStdString(m_persona.sessionTopic());
 }
 
+/// Returns whether the sandboxed idle loop is enabled.
 bool AppController::idleLoopEnabled() const noexcept {
     return m_idle.enabled();
 }
 
+/// Returns whether idle model warmup is permitted.
 bool AppController::idlePrewarmEnabled() const noexcept {
     return m_idle.policy().allowModelWarmup;
 }
 
+/// Returns the user's preference for revealing idle thoughts.
 bool AppController::showIdleThoughts() const noexcept {
     return m_showIdleThoughts;
 }
 
+/// Returns whether the composer has unsent input.
 bool AppController::inputPending() const noexcept {
     return m_inputPending;
 }
 
+/// Returns whether the speech synthesizer currently has a usable backend.
 bool AppController::ttsAvailable() const noexcept {
     return m_speech != nullptr && m_speech->available();
 }
 
+/// Returns the voice description, or an unavailable label without a synthesizer.
 QString AppController::ttsVoice() const {
     if (m_speech == nullptr) {
         return tr("unavailable");
@@ -612,10 +646,12 @@ QString AppController::ttsVoice() const {
     return m_speech->voiceDescription();
 }
 
+/// Returns whether the controller is delivering spoken output.
 bool AppController::speaking() const noexcept {
     return m_speaking;
 }
 
+/// Returns the last speech failure, falling back to the unavailable voice's description.
 QString AppController::ttsError() const {
     if (!m_speechError.isEmpty()) {
         return m_speechError;
@@ -626,6 +662,7 @@ QString AppController::ttsError() const {
     return {};
 }
 
+/// Advances the spoken cursor after a clause, or clears the cue, then pumps more speech.
 void AppController::onSpeechSegmentFinished() {
     if (!m_speaking) {
         return;
@@ -646,6 +683,7 @@ void AppController::onSpeechSegmentFinished() {
     pumpNextSegment();
 }
 
+/// Captures the response's voice persona once and reapplies it before audio requests.
 void AppController::applyResponseVoice() {
     if (m_speech == nullptr) {
         return;
@@ -663,6 +701,7 @@ void AppController::applyResponseVoice() {
     m_speech->applyVoice(m_responseVoice);
 }
 
+/// Speaks the next available clause and prefetches one ahead; waits if generation is ongoing.
 void AppController::pumpNextSegment() {
     if (!m_speaking) {
         return;
@@ -700,6 +739,7 @@ void AppController::pumpNextSegment() {
     }
 }
 
+/// Marks spoken delivery complete and publishes the follow-up status line.
 void AppController::finishPlayback() {
     m_speaking = false;
     m_hasPendingSegment = false;
@@ -714,6 +754,7 @@ void AppController::finishPlayback() {
     emit ttsChanged();
 }
 
+/// Chooses a completion reaction from the delivered response's length.
 void AppController::anticipateForDelivery() {
     // Whether a long answer is offered to continue depends on how long it
     // actually turned out to be, so the judgement is made at delivery rather
@@ -727,6 +768,7 @@ void AppController::anticipateForDelivery() {
                                                      : core::PersonaTrigger::TurnCompleted);
 }
 
+/// Starts a response waiting for audio when the backend becomes available.
 void AppController::onSpeechAvailabilityChanged(bool available) {
     if (!available) {
         // The engine will never answer. The synthesizer has already ended the
@@ -744,12 +786,14 @@ void AppController::onSpeechAvailabilityChanged(bool available) {
     }
 }
 
+/// Overrides the voice loading deadline in milliseconds for deterministic tests.
 void AppController::setVoiceLoadTimeoutForTesting(int ms) {
     if (m_speech != nullptr) {
         m_speech->setVoiceLoadTimeout(ms);
     }
 }
 
+/// Completes a held response as text and reports when the voice gave up.
 void AppController::onOwedAudioReleased(bool voiceGaveUp) {
     if (voiceGaveUp) {
         m_speechError = tr("The local voice was still loading its model and has given up, "
@@ -765,6 +809,7 @@ void AppController::onOwedAudioReleased(bool voiceGaveUp) {
     emit voiceChanged();
 }
 
+/// Clears playback bookkeeping after a requested speech stop completes.
 void AppController::onSpeechStopCompleted() {
     if (!m_speaking) {
         return;
@@ -776,6 +821,7 @@ void AppController::onSpeechStopCompleted() {
     emit presenceChanged();
 }
 
+/// Holds delivery for a loading voice or starts the acknowledgement and clause pump.
 void AppController::startPlayback() {
     // Whether the response is owed audio or handed over to text is decided
     // here, once, and it is the decision that used to be made too early: a
@@ -816,6 +862,7 @@ void AppController::startPlayback() {
     emit ttsChanged();
 }
 
+/// Enables or disables idle processing, clearing displayed idle output when disabled.
 void AppController::setIdleLoopEnabled(bool enabled) {
     if (m_idle.enabled() == enabled) {
         return;
@@ -829,6 +876,7 @@ void AppController::setIdleLoopEnabled(bool enabled) {
     emit presenceChanged();
 }
 
+/// Updates the opt-in model warmup permission and notifies the interface.
 void AppController::setIdlePrewarmEnabled(bool enabled) {
     core::IdlePolicy policy = m_idle.policy();
     if (policy.allowModelWarmup == enabled) {
@@ -839,6 +887,7 @@ void AppController::setIdlePrewarmEnabled(bool enabled) {
     emit presenceChanged();
 }
 
+/// Updates the idle thought visibility preference.
 void AppController::setShowIdleThoughts(bool show) {
     if (m_showIdleThoughts == show) {
         return;
@@ -847,6 +896,7 @@ void AppController::setShowIdleThoughts(bool show) {
     emit presenceChanged();
 }
 
+/// Tracks unsent composer input and resets the idle clock when input becomes pending.
 void AppController::setInputPending(bool pending) {
     if (m_inputPending == pending) {
         return;
@@ -964,6 +1014,7 @@ void AppController::setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> ba
     emit ttsChanged();
 }
 
+/// Replaces the persona dials and refreshes presence for tests.
 void AppController::setPersonaStateForTesting(const core::PersonaState& state) {
     m_persona.setState(state);
     m_presence.applyPersona(m_persona.state());
@@ -1102,6 +1153,7 @@ void AppController::waitForIdleGeneration(int timeoutMs) {
     disconnect(done);
 }
 
+/// Returns elapsed monotonic milliseconds, or zero before the clock starts.
 std::uint64_t AppController::nowMs() const noexcept {
     // m_clock is only invalid between construction and start(), which no caller
     // can observe: the clock is started in the constructor and the tick timer
@@ -1109,6 +1161,7 @@ std::uint64_t AppController::nowMs() const noexcept {
     return static_cast<std::uint64_t>(m_clock.isValid() ? m_clock.elapsed() : 0);
 }
 
+/// Records assistant activity and projects the current voice, generation, and persona state.
 void AppController::noteAssistant(core::AssistantAction action) {
     m_presence.noteAssistantAction(action);
     if (const core::VoiceResponse* response = m_voice.find(m_activeResponse)) {
@@ -1119,6 +1172,7 @@ void AppController::noteAssistant(core::AssistantAction action) {
     emit presenceChanged();
 }
 
+/// Temporarily replaces the status whisper for the default duration plus holdMs.
 void AppController::setWhisperOverride(const QString& text, int holdMs) {
     if (text.isEmpty()) {
         return;
@@ -1129,12 +1183,14 @@ void AppController::setWhisperOverride(const QString& text, int holdMs) {
     emit presenceChanged();
 }
 
+/// Shows the persona's reaction to a trigger when one is produced.
 void AppController::anticipate(core::PersonaTrigger trigger) {
     if (const auto line = m_persona.react(trigger)) {
         setWhisperOverride(QString::fromStdString(line->text), line->microPauseMs);
     }
 }
 
+/// Consumes a prepared return greeting when due and resets the idle activity timestamp.
 void AppController::noteActivity() {
     const std::uint64_t now = nowMs();
     // A long absence earns one greeting when activity resumes, and only once
@@ -1148,6 +1204,7 @@ void AppController::noteActivity() {
     m_idle.noteActivity(now);
 }
 
+/// Runs permitted idle indexing and queues a permitted summary when the worker is free.
 void AppController::runIdleToolIfPermitted() {
     const ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
@@ -1185,6 +1242,7 @@ void AppController::runIdleToolIfPermitted() {
     emit presenceChanged();
 }
 
+/// Queues a token-limited summary of truncated conversation text; the caller checks permission.
 void AppController::startSessionSummary() {
     const ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
@@ -1211,6 +1269,7 @@ void AppController::startSessionSummary() {
                     0.3F, kSummaryMaxTokens);
 }
 
+/// Updates idle gates, handles produced tasks, and advances the presence animation.
 void AppController::onIdleTick() {
     const std::uint64_t now = nowMs();
 
@@ -1326,6 +1385,7 @@ void AppController::onGenerationToken(quint64 requestId, const QString& token) {
     }
 }
 
+/// Handles worker completion for warmup, summaries, and replies, ignoring stale reply IDs.
 void AppController::onGenerationFinished(quint64 requestId,
                                          bool success,
                                          const QString& error) {
@@ -1513,6 +1573,7 @@ void AppController::finalizeStream(MessageStatus status, const QString& note) {
     refreshCanRegenerate();
 }
 
+/// Accepts a nonempty request, interrupts an active reply, and starts a new turn.
 void AppController::sendMessage(const QString& text) {
     const QString trimmed = text.trimmed();
     if (trimmed.isEmpty() || !runtimeAvailable()) {
@@ -1574,6 +1635,7 @@ void AppController::sendMessage(const QString& text) {
     startGeneration(trimmed);
 }
 
+/// Releases held audio and cancels active generation or playback, updating interruption state.
 void AppController::stopGeneration() {
     if (m_speech != nullptr) {
         // Stop means stop. A reply being held for a voice that has not arrived
@@ -1610,6 +1672,7 @@ void AppController::stopGeneration() {
     emit voiceChanged();
 }
 
+/// Pauses a resumable response, cancelling generation and requesting a clause-boundary stop.
 void AppController::pauseConversation() {
     if (!canPause()) {
         return;
@@ -1634,6 +1697,7 @@ void AppController::pauseConversation() {
     emit voiceChanged();
 }
 
+/// Resumes a paused response through generation, playback, or text completion as needed.
 void AppController::resumeConversation() {
     if (!canResume()) {
         return;
@@ -1839,6 +1903,7 @@ ConversationEntry* AppController::createConversation() {
     return raw;
 }
 
+/// Switches the transcript's conversation, releasing held audio when leaving the previous one.
 void AppController::setActiveConversation(int id) {
     if (id != m_activeId) {
         // Leaving the conversation a held reply belongs to abandons its audio,

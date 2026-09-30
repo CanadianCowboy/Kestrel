@@ -66,7 +66,9 @@ public:
     SapiSpeechRecognizer();
     ~SapiSpeechRecognizer() override;
 
+    /// Disallows copying the recognizer's owned platform state.
     SapiSpeechRecognizer(const SapiSpeechRecognizer&) = delete;
+    /// Disallows assigning another recognizer's owned platform state.
     SapiSpeechRecognizer& operator=(const SapiSpeechRecognizer&) = delete;
 
     [[nodiscard]] bool available() const override;

@@ -6,6 +6,7 @@
 
 namespace kestrel::app {
 
+/// Stores the driver paths and optionally connects and starts the Kokoro process.
 KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript,
                                          bool startImmediately, QObject* parent)
     : LocalModelSpeechBackend(parent),
@@ -26,6 +27,7 @@ KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript,
     completeSetup();
 }
 
+/// Returns the supported Kokoro voice identifiers in preference order.
 QStringList KokoroSpeechBackend::engineVoices() const {
     // Listed rather than discovered at runtime: the voice table is a file on
     // disk, and parsing it to build a picker would be a second source of truth
@@ -54,6 +56,7 @@ QStringList KokoroSpeechBackend::engineVoices() const {
     return kVoices;
 }
 
+/// Launches the configured driver, waiting up to five seconds for process startup.
 void KokoroSpeechBackend::startEngine() {
     if (m_python.isEmpty() || m_serverScript.isEmpty()) {
         // Nothing to launch, so nothing will ever answer. Said out loud, because
@@ -74,6 +77,7 @@ void KokoroSpeechBackend::startEngine() {
     markLaunched();
 }
 
+/// Writes a JSON synthesis request containing the text, voice, speed, and output path.
 void KokoroSpeechBackend::synthesise(const QString& text, const QString& path) {
     QJsonObject request;
     request.insert(QStringLiteral("text"), text);
@@ -83,6 +87,7 @@ void KokoroSpeechBackend::synthesise(const QString& text, const QString& path) {
     m_process->write(QJsonDocument(request).toJson(QJsonDocument::Compact) + "\n");
 }
 
+/// Consumes complete driver replies, reporting readiness, synthesized files, or engine failure.
 void KokoroSpeechBackend::onReadyRead() {
     while (m_process->canReadLine()) {
         const QByteArray line = m_process->readLine().trimmed();

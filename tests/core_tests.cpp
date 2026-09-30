@@ -385,6 +385,7 @@ void testPersonaPresenceLineIsStable() {
     assert(persona.tone().wry);
 }
 
+/// Checks clamping through drift and direct assignment, plus shared mood classification.
 void testPersonaDialsStayInRange() {
     core::Persona persona;
     persona.drift(5.0F, 5.0F, 5.0F, 5.0F, 5.0F, 5.0F);
@@ -409,6 +410,7 @@ void testPersonaDialsStayInRange() {
     assert(core::toString(core::PersonaMood::Contemplative) == std::string("contemplative"));
 }
 
+/// Checks deterministic acknowledgement rotation and a positive pause after the cue.
 void testPersonaAcknowledgementRotates() {
     core::Persona persona;
     std::vector<std::string> cues;
@@ -427,6 +429,7 @@ void testPersonaAcknowledgementRotates() {
     assert(persona.acknowledgementPauseMs() > 0);
 }
 
+/// Checks trigger-specific reactions, initiative gating, and disabled anticipation.
 void testPersonaAnticipation() {
     core::Persona persona;
 
@@ -464,6 +467,7 @@ void testPersonaAnticipation() {
     assert(!persona.react(core::PersonaTrigger::LongResponse).has_value());
 }
 
+/// Checks that every persona activity has its expected status whisper.
 void testPersonaStatusWhispers() {
     core::Persona persona;
     assert(persona.statusWhisper(core::PersonaActivity::StandingBy) == "Standing by\u2026");
@@ -504,6 +508,7 @@ void testPersonaSessionTopic() {
 
 // --- Idle loop ---------------------------------------------------------------
 
+/// Checks that generation, voice activity, and pending input suppress idle output.
 void testIdleStaysSilentWhileTheUserIsPresent() {
     core::Persona persona;
     core::IdlePersona idle(persona);
@@ -529,6 +534,7 @@ void testIdleStaysSilentWhileTheUserIsPresent() {
     assert(idle.cycles() == 0);
 }
 
+/// Checks that default idle tasks stay local and a deny-all policy produces no work.
 void testIdleDefaultPolicyIsLocalOnly() {
     core::IdlePolicy policy;
     // Everything that is just a string is allowed; the one capability that
@@ -563,6 +569,7 @@ void testIdleDefaultPolicyIsLocalOnly() {
     assert(idle.cycles() == 0);
 }
 
+/// Checks task permission filtering, cycle accounting, and bounded history over repeated ticks.
 void testIdleOnlyProducesPermittedWork() {
     core::Persona persona;
     core::IdlePersona idle(persona);
@@ -602,6 +609,7 @@ void testIdleOnlyProducesPermittedWork() {
     assert(idle.nextTickAt() != 0);
 }
 
+/// Checks bounded dial drift and relaxation while the idle loop shares the persona's state.
 void testIdleDriftsDialsButNeverRamps() {
     core::Persona persona;
     core::IdlePersona idle(persona);
@@ -666,6 +674,7 @@ void testIdleWarmthTracksTheMood() {
     assert(driftWith(warming, 40) > resting);
 }
 
+/// Checks one greeting per qualifying absence and reset of greeting eligibility on activity.
 void testIdleGreetsOncePerAbsence() {
     core::Persona persona;
     core::IdlePersona idle(persona);
@@ -711,6 +720,7 @@ void testIdleGreetsOncePerAbsence() {
     assert(idle.idleForMs(70000) == 0);
 }
 
+/// Checks that disabling the idle loop suppresses tasks and return greetings.
 void testIdleStopsWhenDisabled() {
     core::Persona persona;
     core::IdlePersona idle(persona);
@@ -724,6 +734,7 @@ void testIdleStopsWhenDisabled() {
 
 // --- Idle tool registry ------------------------------------------------------
 
+/// Builds a disabled test tool requiring conversation-read and generation permissions.
 core::IdleToolDeclaration indexingTool() {
     core::IdleToolDeclaration declaration;
     declaration.name = "index recent threads";
@@ -733,6 +744,7 @@ core::IdleToolDeclaration indexingTool() {
     return declaration;
 }
 
+/// Checks that undeclared tools are refused and report all known permissions missing.
 void testUndeclaredToolIsRefused() {
     core::IdleToolRegistry registry;
     // Nothing is known about a tool that was never declared, so every
@@ -744,6 +756,7 @@ void testUndeclaredToolIsRefused() {
     assert(registry.tools().empty());
 }
 
+/// Checks that even fully granted or permission-free tools require explicit enablement.
 void testDeclaredToolIsRefusedUntilEnabled() {
     core::IdleToolRegistry registry;
     registry.declare(indexingTool());
@@ -767,6 +780,7 @@ void testDeclaredToolIsRefusedUntilEnabled() {
     assert(registry.permits("warm the cache"));
 }
 
+/// Checks missing-permission reporting and immediate effects of grants and revocation.
 void testMissingPermissionIsNamed() {
     core::IdleToolRegistry registry;
     registry.declare(indexingTool());
@@ -790,6 +804,7 @@ void testMissingPermissionIsNamed() {
     assert(registry.missing("index recent threads").size() == 1);
 }
 
+/// Checks that no tool capability is granted by default and permission labels are readable.
 void testNothingIsGrantedByDefault() {
     core::IdleToolRegistry registry;
     // Not even the capabilities that sound harmless. The user grants them, or
@@ -804,6 +819,7 @@ void testNothingIsGrantedByDefault() {
     assert(std::string(core::toString(core::ToolPermission::Network)) == "network");
 }
 
+/// Checks that replacing a declaration disables it while preserving existing grants.
 void testReplacedToolMustBeAgreedAgain() {
     core::IdleToolRegistry registry;
     registry.declare(indexingTool());
@@ -832,6 +848,7 @@ void testReplacedToolMustBeAgreedAgain() {
 
 // --- Presence engine ---------------------------------------------------------
 
+/// Checks presence timestamps, time-based easing, and separation of mood from generation state.
 void testPresenceTracksMeaning() {
     core::Presence presence;
     presence.setNow(1000);
@@ -886,6 +903,7 @@ void testPresenceTracksMeaning() {
 
 // --- Voice pacing ------------------------------------------------------------
 
+/// Checks clause offsets, punctuation pauses, closing quotes, and empty speech plans.
 void testSpeechPlanningClausesAndPauses() {
     const core::VoicePersona& persona = core::defaultVoicePersona();
     const std::string_view text = "Understood. I checked the cache and it is fine. All good!";
@@ -941,6 +959,7 @@ void testSpeechPlanningClausesAndPauses() {
     assert(core::planSpeech("   ", persona).empty());
 }
 
+/// Checks clause-start lookup at sentence breaks, eligible soft breaks, and bounded offsets.
 void testClauseStartBefore() {
     const std::string_view sentence = "Hi. There.";
     assert(core::clauseStartBefore(sentence, 0) == 0);
@@ -1066,6 +1085,7 @@ void testWarmthBecomesPace() {
     }
 }
 
+/// Checks replaceable voice pacing without changing the response timeline or event log.
 void testVoicePersonaIsReplaceable() {
     core::VoiceSession session;
     assert(session.voicePersona().voiceId == core::defaultVoicePersona().voiceId);
@@ -1105,6 +1125,7 @@ void testSentenceStartBefore() {
 
 } // namespace
 
+/// Runs the portable conversation, persona, idle, presence, and voice tests; assertions abort on failure.
 int main() {
     testConversationBasics();
     testMockBackend();

@@ -43,6 +43,7 @@ public:
     // at the root of the worktree.
     [[nodiscard]] static LocalVoiceEngines discover();
 
+    /// Returns a copy of the discovered local engine records.
     [[nodiscard]] std::vector<Engine> engines() const { return m_engines; }
     // The id of the engine that should speak by default: the first one found
     // that actually has voices, because an engine with no models is not a voice.

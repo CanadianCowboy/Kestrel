@@ -16,12 +16,14 @@ constexpr float kBusyIntensity = 1.0F;
 // independent of how often the owner happens to tick.
 constexpr float kEasePerSecond = 2.4F;
 
+/// Linearly interpolates between two values using the supplied, unclamped fraction.
 float lerp(float from, float to, float t) noexcept {
     return from + (to - from) * t;
 }
 
 } // namespace
 
+/// Returns a user-action label, or unknown for an unrecognized value.
 const char* toString(UserAction action) noexcept {
     switch (action) {
     case UserAction::Silent: return "silent";
@@ -36,6 +38,7 @@ const char* toString(UserAction action) noexcept {
     return "unknown";
 }
 
+/// Returns an assistant-action label, or unknown for an unrecognized value.
 const char* toString(AssistantAction action) noexcept {
     switch (action) {
     case AssistantAction::Idle: return "idle";
@@ -49,14 +52,17 @@ const char* toString(AssistantAction action) noexcept {
     return "unknown";
 }
 
+/// Sets the caller-provided monotonic millisecond time for subsequent updates.
 void Presence::setNow(std::uint64_t nowMs) noexcept {
     m_nowMs = nowMs;
 }
 
+/// Returns the last time supplied by the owner in milliseconds.
 std::uint64_t Presence::now() const noexcept {
     return m_nowMs;
 }
 
+/// Records a changed user action and stamps the snapshot with the supplied time.
 void Presence::noteUserAction(UserAction action) noexcept {
     if (m_snapshot.lastUserAction == action) {
         return;
@@ -65,6 +71,7 @@ void Presence::noteUserAction(UserAction action) noexcept {
     touch(m_nowMs);
 }
 
+/// Records a changed assistant action and stamps the snapshot with the supplied time.
 void Presence::noteAssistantAction(AssistantAction action) noexcept {
     if (m_snapshot.lastAssistantAction == action) {
         return;
@@ -73,6 +80,7 @@ void Presence::noteAssistantAction(AssistantAction action) noexcept {
     touch(m_nowMs);
 }
 
+/// Records a changed voice state and stamps the snapshot with the supplied time.
 void Presence::setVoiceState(ResponseState state) noexcept {
     if (m_snapshot.voiceState == state) {
         return;
@@ -81,6 +89,7 @@ void Presence::setVoiceState(ResponseState state) noexcept {
     touch(m_nowMs);
 }
 
+/// Updates generation and busy flags together and timestamps changes.
 void Presence::setGenerating(bool generating) noexcept {
     if (m_snapshot.generating == generating) {
         return;
@@ -90,6 +99,7 @@ void Presence::setGenerating(bool generating) noexcept {
     touch(m_nowMs);
 }
 
+/// Derives mood, calmness, curiosity, and initiative flags without altering generation state.
 void Presence::applyPersona(const PersonaState& state) noexcept {
     m_snapshot.mood = moodFor(state);
     m_snapshot.flags.calm = m_snapshot.mood != PersonaMood::Alert;
@@ -100,6 +110,7 @@ void Presence::applyPersona(const PersonaState& state) noexcept {
     // stutter whenever the personality drifted mid-answer.
 }
 
+/// Selects a target glow intensity from the last assistant action.
 float Presence::targetIntensity() const noexcept {
     switch (m_snapshot.lastAssistantAction) {
     case AssistantAction::Speaking:
@@ -118,6 +129,7 @@ float Presence::targetIntensity() const noexcept {
     return kIdleIntensity;
 }
 
+/// Eases intensity using elapsed injected time; nonadvancing time leaves the value unchanged.
 float Presence::advance() {
     const std::uint64_t previous = m_lastAdvanceMs;
     m_lastAdvanceMs = m_nowMs;
@@ -132,23 +144,28 @@ float Presence::advance() {
     return m_intensity;
 }
 
+/// Returns the current presence snapshot by reference.
 const PresenceSnapshot& Presence::snapshot() const noexcept {
     return m_snapshot;
 }
 
+/// Returns the current eased glow intensity.
 float Presence::intensity() const noexcept {
     return m_intensity;
 }
 
+/// Returns whether either voice state or assistant action indicates speaking.
 bool Presence::speaking() const noexcept {
     return m_snapshot.voiceState == ResponseState::Speaking ||
            m_snapshot.lastAssistantAction == AssistantAction::Speaking;
 }
 
+/// Returns whether response generation is active.
 bool Presence::busy() const noexcept {
     return m_snapshot.generating;
 }
 
+/// Projects the assistant action into a persona activity, defaulting to standing by.
 PersonaActivity Presence::activity() const noexcept {
     switch (m_snapshot.lastAssistantAction) {
     case AssistantAction::Acknowledging:
@@ -167,6 +184,7 @@ PersonaActivity Presence::activity() const noexcept {
     return PersonaActivity::StandingBy;
 }
 
+/// Stamps the snapshot's last-change time in milliseconds.
 void Presence::touch(std::uint64_t nowMs) noexcept {
     m_snapshot.lastChangeMs = nowMs;
 }

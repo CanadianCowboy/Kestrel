@@ -134,7 +134,9 @@ signals:
 // utterance ends, so the whole path is exercised on a machine with no voice.
 class FakeSpeechBackend final : public kestrel::app::SpeechBackend {
 public:
+    /// Returns the fake voice's test-controlled readiness flag.
     [[nodiscard]] bool usable() const override { return m_usable; }
+    /// Describes the fake voice as ready or still loading for availability assertions.
     [[nodiscard]] QString description() const override {
         // Truthful about the two states, as the real engines are: a voice that
         // is still coming up and a voice that is working are not the same
@@ -143,6 +145,7 @@ public:
                         : QStringLiteral("the fake voice is still loading");
     }
 
+    /// Records persona applications, warmth, and synthesis pace for later assertions.
     void applyVoice(const kestrel::core::VoicePersona& persona) override {
         ++voiceApplications;
         lastWarmth = persona.warmth;
@@ -157,6 +160,7 @@ public:
     // difference this fake has to be able to express.
     [[nodiscard]] bool present() const override { return m_present; }
 
+    /// Records an utterance and its pace, optionally scheduling asynchronous completion.
     void speak(const QString& text) override {
         spoken.append(text);
         // Everything the engine is asked for, in the order it is asked, whether
@@ -216,10 +220,13 @@ public:
         prefetchSpeeds.append(m_speed);
     }
 
+    /// Counts clause-boundary stop requests without completing the fake utterance.
     void stop() override { ++boundaryStops; }
 
+    /// Counts immediate stop requests for controller assertions.
     void stopImmediately() override { ++immediateStops; }
 
+    /// Returns whether the fake utterance has started and not yet been completed.
     [[nodiscard]] bool speakingNow() const override { return m_speaking; }
 
     // Simulates the engine reaching the end of an utterance.
@@ -669,6 +676,7 @@ void testPresenceAndIdleLoopProject() {
     check(presenceSignals > 0, "observers are told when presence changes");
 }
 
+/// Verifies that delivering a long answer produces the persona's offer to continue.
 void testLongAnswerIsOfferedToContinue() {
     std::cout << "a long answer is offered to continue\n";
 
@@ -831,6 +839,7 @@ void testIdleToolNeedsPermissionBeforeItRuns() {
           "a name the registry has never heard of changes nothing");
 }
 
+/// Verifies acknowledgement-first playback and complete, ordered delivery of every answer clause.
 void testSpokenResponseFollowsClauseOrder() {
     std::cout << "a spoken response is delivered clause by clause\n";
 

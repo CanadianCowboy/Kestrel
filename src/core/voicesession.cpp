@@ -19,6 +19,7 @@ bool isSentenceTerminator(char c) noexcept {
     return c == '.' || c == '!' || c == '?' || c == '\n';
 }
 
+/// Returns whether punctuation can end a sufficiently long speech clause.
 bool isClauseSoftBreak(char c) noexcept {
     return c == ',' || c == ';' || c == ':' || c == '\n';
 }
@@ -31,10 +32,12 @@ constexpr std::size_t kMinClauseChars = 16;
 // the quote in: He said "go." Then he left.
 constexpr std::string_view kClosingQuote = "\xe2\x80\x9d";
 
+/// Identifies ASCII quotes and closing brackets that may follow a sentence terminator.
 bool isTrailingPunctuation(char c) noexcept {
     return c == '"' || c == '\'' || c == ')' || c == ']' || c == '}';
 }
 
+/// Advances an offset past spaces, tabs, and line breaks without reading beyond the text.
 std::size_t skipSpace(std::string_view text, std::size_t i) noexcept {
     while (i < text.size() && isWhitespace(text[i])) {
         ++i;
@@ -109,6 +112,7 @@ std::size_t sentenceStartBefore(std::string_view text, std::size_t offset) noexc
     return start;
 }
 
+/// Returns the single shared default voice persona.
 const VoicePersona& defaultVoicePersona() noexcept {
     // A function-local static rather than an inline variable, so the default is
     // constructed once and every translation unit agrees on it.
@@ -116,6 +120,7 @@ const VoicePersona& defaultVoicePersona() noexcept {
     return kDefault;
 }
 
+/// Computes synthesis pace from rate and warmth, with 0.6 warmth treated as neutral.
 float paceFor(const VoicePersona& persona) noexcept {
     // The warmth the engine is left alone at, which is the voice persona's own
     // default and the resting point of PersonaState::warmth, and how far the pace
@@ -129,6 +134,7 @@ float paceFor(const VoicePersona& persona) noexcept {
          - kWarmthRange * (persona.warmth - kNeutralWarmth);
 }
 
+/// Finds the last clause start before a bounded offset, skipping whitespace after breaks.
 std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcept {
     const std::size_t limit = std::min(offset, text.size());
     std::size_t start = 0;
@@ -145,6 +151,7 @@ std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcep
     return start;
 }
 
+/// Chooses a sentence or clause pause from trailing punctuation; invalid ends use the clause pause.
 int pauseAfterClause(std::string_view text, std::size_t clauseEnd,
                      const VoicePersona& persona) noexcept {
     if (clauseEnd == 0 || clauseEnd > text.size()) {
@@ -167,6 +174,7 @@ int pauseAfterClause(std::string_view text, std::size_t clauseEnd,
     return persona.clausePauseMs;
 }
 
+/// Splits text into clauses with byte offsets and pauses preceding each segment.
 std::vector<SpeechSegment> planSpeech(std::string_view text, const VoicePersona& persona,
                                       int openingPauseMs) {
     std::vector<SpeechSegment> segments;
@@ -401,14 +409,17 @@ bool VoiceSession::fail(ResponseId id, std::string error) {
     return true;
 }
 
+/// Replaces the voice persona used by future speech plans.
 void VoiceSession::setVoicePersona(VoicePersona persona) {
     m_voicePersona = std::move(persona);
 }
 
+/// Returns the voice persona used for speech planning by reference.
 const VoicePersona& VoiceSession::voicePersona() const noexcept {
     return m_voicePersona;
 }
 
+/// Plans the next unspoken segment with absolute byte offsets without advancing playback.
 std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
                                                              int openingPauseMs) const {
     const VoiceResponse* response = find(id);
@@ -445,6 +456,7 @@ std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
     return segment;
 }
 
+/// Returns the second unspoken segment for prefetch, or no segment if fewer than two remain.
 std::optional<SpeechSegment> VoiceSession::peekSpeechSegment(ResponseId id) const {
     const VoiceResponse* response = find(id);
     if (response == nullptr) {

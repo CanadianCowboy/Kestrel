@@ -32,6 +32,7 @@ constexpr std::array<IdleTaskKind, 7> kAllKinds = {
     IdleTaskKind::ModelWarmup,
 };
 
+/// Clamps an idle dial to the interior range [0.05, 0.95].
 float clampDial(float value) noexcept {
     return std::clamp(value, kDialFloor, 1.0F - kDialFloor);
 }
@@ -57,6 +58,7 @@ constexpr std::array<const char*, 4> kGreetings = {
 
 } // namespace
 
+/// Returns the display label for an idle task, or unknown for an unrecognized value.
 const char* toString(IdleTaskKind kind) noexcept {
     switch (kind) {
     case IdleTaskKind::SelfReflection: return "self reflection";
@@ -70,6 +72,7 @@ const char* toString(IdleTaskKind kind) noexcept {
     return "unknown";
 }
 
+/// Returns whether policy permits the task kind; unknown kinds are refused.
 bool IdlePolicy::permits(IdleTaskKind kind) const noexcept {
     switch (kind) {
     case IdleTaskKind::SelfReflection: return allowSelfReflection;
@@ -83,6 +86,7 @@ bool IdlePolicy::permits(IdleTaskKind kind) const noexcept {
     return false;
 }
 
+/// Counts the task kinds currently permitted by this policy.
 int IdlePolicy::permittedCount() const noexcept {
     int count = 0;
     for (const IdleTaskKind kind : kAllKinds) {
@@ -93,41 +97,51 @@ int IdlePolicy::permittedCount() const noexcept {
     return count;
 }
 
+/// Returns whether generation, voice activity, or pending user input blocks idle work.
 bool IdleGate::busy() const noexcept {
     return generating || voiceActive || userInputPending;
 }
 
+/// Borrows the persona whose dials the idle loop will update; it must outlive the loop.
 IdlePersona::IdlePersona(Persona& persona) noexcept
     : m_persona(persona) {}
 
+/// Replaces the policy used for subsequent idle task selection.
 void IdlePersona::setPolicy(IdlePolicy policy) noexcept {
     m_policy = policy;
 }
 
+/// Returns the current idle permission policy.
 const IdlePolicy& IdlePersona::policy() const noexcept {
     return m_policy;
 }
 
+/// Updates the activity flags that suppress idle work.
 void IdlePersona::setGate(IdleGate gate) noexcept {
     m_gate = gate;
 }
 
+/// Enables or disables future idle ticks without resetting accumulated state.
 void IdlePersona::setEnabled(bool enabled) noexcept {
     m_enabled = enabled;
 }
 
+/// Returns whether idle processing is enabled.
 bool IdlePersona::enabled() const noexcept {
     return m_enabled;
 }
 
+/// Sets the minimum quiet duration in milliseconds before idle work can run.
 void IdlePersona::setQuietPeriodMs(std::uint64_t ms) noexcept {
     m_quietPeriodMs = ms;
 }
 
+/// Sets the interval in milliseconds between eligible idle cycles.
 void IdlePersona::setIntervalMs(std::uint64_t ms) noexcept {
     m_intervalMs = ms;
 }
 
+/// Anchors the activity clock and resets greeting state for the next absence.
 void IdlePersona::noteActivity(std::uint64_t nowMs) noexcept {
     m_anchored = true;
     m_lastActivityMs = nowMs;
@@ -135,10 +149,12 @@ void IdlePersona::noteActivity(std::uint64_t nowMs) noexcept {
     m_greeted = false;
 }
 
+/// Copies the topic that future idle thoughts and greetings may mention.
 void IdlePersona::setTopic(std::string_view topic) {
     m_topic.assign(topic);
 }
 
+/// Returns milliseconds since activity, or zero for an unanchored or backward clock.
 std::uint64_t IdlePersona::idleForMs(std::uint64_t nowMs) const noexcept {
     if (!m_anchored || nowMs < m_lastActivityMs) {
         return 0;
@@ -146,6 +162,7 @@ std::uint64_t IdlePersona::idleForMs(std::uint64_t nowMs) const noexcept {
     return nowMs - m_lastActivityMs;
 }
 
+/// Returns whether an enabled, unblocked, ungreeted absence has reached the threshold.
 bool IdlePersona::userReturned(std::uint64_t nowMs, std::uint64_t thresholdMs) const noexcept {
     if (!m_enabled || m_gate.busy() || m_greeted) {
         return false;
@@ -153,6 +170,7 @@ bool IdlePersona::userReturned(std::uint64_t nowMs, std::uint64_t thresholdMs) c
     return idleForMs(nowMs) >= thresholdMs;
 }
 
+/// Lists permitted task kinds, excluding greetings already consumed for this absence.
 std::vector<IdleTaskKind> IdlePersona::permittedKinds() const {
     std::vector<IdleTaskKind> kinds;
     for (const IdleTaskKind kind : kAllKinds) {
@@ -169,6 +187,7 @@ std::vector<IdleTaskKind> IdlePersona::permittedKinds() const {
     return kinds;
 }
 
+/// Computes a task's selection weight from the current persona dials.
 float IdlePersona::weightFor(IdleTaskKind kind) const noexcept {
     // Each dial feeds the work it would plausibly motivate. This is the whole
     // personality state machine: change a number here and the mix of idle work
@@ -186,6 +205,7 @@ float IdlePersona::weightFor(IdleTaskKind kind) const noexcept {
     return 0.0F;
 }
 
+/// Returns the highest weighted index with deterministic variation; kinds must be nonempty.
 std::size_t IdlePersona::chooseKind(const std::vector<IdleTaskKind>& kinds) const {
     std::size_t best = 0;
     float bestScore = -1.0F;
@@ -204,6 +224,7 @@ std::size_t IdlePersona::chooseKind(const std::vector<IdleTaskKind>& kinds) cons
     return best;
 }
 
+/// Applies task-specific dial changes, relaxation, and bounds to the shared persona.
 void IdlePersona::applyDrift(IdleTaskKind kind) noexcept {
     PersonaState next = m_persona.state();
     // Warmth moves with the same tasks that move the other dials, and in the
@@ -243,6 +264,7 @@ void IdlePersona::applyDrift(IdleTaskKind kind) noexcept {
     m_persona.setState(next);
 }
 
+/// Produces at most one permitted task when quiet and due, then records it and drifts dials.
 IdleTick IdlePersona::tick(std::uint64_t nowMs) {
     if (!m_enabled) {
         return {};
@@ -346,6 +368,7 @@ IdleTick IdlePersona::tick(std::uint64_t nowMs) {
     return result;
 }
 
+/// Appends an idle task while retaining at most the latest sixteen entries.
 void IdlePersona::record(IdleTask task) {
     if (m_history.size() >= kHistoryLimit) {
         m_history.erase(m_history.begin());
@@ -353,6 +376,7 @@ void IdlePersona::record(IdleTask task) {
     m_history.push_back(std::move(task));
 }
 
+/// Consumes a prepared greeting and marks the absence greeted; returns empty if none exists.
 std::string IdlePersona::takeGreeting() {
     if (m_greeting.empty()) {
         return {};
@@ -365,22 +389,27 @@ std::string IdlePersona::takeGreeting() {
     return greeting;
 }
 
+/// Returns whether a prepared greeting is waiting to be consumed.
 bool IdlePersona::hasGreeting() const noexcept {
     return !m_greeting.empty();
 }
 
+/// Returns the state of the shared persona without copying its dials.
 const PersonaState& IdlePersona::state() const noexcept {
     return m_persona.state();
 }
 
+/// Returns the scheduled next tick in the caller's millisecond clock domain.
 std::uint64_t IdlePersona::nextTickAt() const noexcept {
     return m_nextTickAt;
 }
 
+/// Returns the number of idle cycles that have produced a task.
 std::size_t IdlePersona::cycles() const noexcept {
     return m_cycles;
 }
 
+/// Returns the bounded history of produced idle tasks.
 const std::vector<IdleTask>& IdlePersona::history() const noexcept {
     return m_history;
 }
