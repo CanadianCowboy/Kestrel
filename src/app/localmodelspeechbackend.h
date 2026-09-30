@@ -125,6 +125,7 @@ private:
     struct PendingRequest {
         QString text;
         bool playsNow = false;
+        bool obsolete = false;
     };
     QList<PendingRequest> m_pending;
     QHash<QString, QString> m_prefetched;

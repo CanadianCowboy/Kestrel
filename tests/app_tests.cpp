@@ -24,11 +24,27 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#if KESTREL_HAS_QT_MULTIMEDIA
+#include "app/localmodelspeechbackend.h"
+#endif
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
 #include "app/speechsynthesizer.h"
 #include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
+
+namespace kestrel::app {
+struct AppControllerTestAccess {
+    static const core::VoiceSession& voice(const AppController& app) { return app.m_voice; }
+    static void runTools(AppController& app) { app.runIdleToolIfPermitted(); }
+    static bool summarising(const AppController& app) { return app.m_toolRequestId != 0; }
+    static void idleThought(AppController& app) {
+        app.m_idleTaskKind = QStringLiteral("Context reindex");
+        app.m_idleTaskDetail = QStringLiteral("Private detail");
+        app.m_ambientThought = QStringLiteral("Private thought");
+    }
+};
+} // namespace kestrel::app
 
 namespace {
 
@@ -780,6 +796,124 @@ void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
 // does nothing, and says why. This is the path a user walks through in the
 // panel, so it is tested from the panel's own entry points rather than from the
 // core registry the app happens to own.
+void testIdleToolOutputIsIndependentOfConversationRows() {
+    using Access = kestrel::app::AppControllerTestAccess;
+    using Model = kestrel::app::MessageModel;
+    using kestrel::app::MessageStatus;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setBackendForTesting(std::make_unique<SlowBackend>(3, 2));
+    auto* messages = controller.messages();
+    messages->appendMessage(kestrel::core::MessageRole::User, QStringLiteral("original question"), MessageStatus::Complete);
+    messages->appendMessage(kestrel::core::MessageRole::Assistant, QStringLiteral("stopped answer"), MessageStatus::Stopped);
+    Access::idleThought(controller);
+    controller.setShowIdleThoughts(false);
+    Access::runTools(controller);
+    check(controller.idleTaskLabel().contains(QStringLiteral("grant a capability")),
+          "refusal is visible while thoughts are hidden");
+    controller.setIdleToolEnabled(QStringLiteral("index recent threads"), true);
+    controller.setToolPermission(QStringLiteral("read conversations"), true);
+    Access::runTools(controller);
+    check(messages->rowCount() == 3, "indexing appends a tool row");
+    check(!controller.idleTaskLabel().contains(QStringLiteral("grant a capability")),
+          "a successful tool clears the previous refusal");
+    Access::runTools(controller);
+    check(messages->rowCount() == 3, "identical indexing does not append a duplicate");
+    controller.setIdleToolEnabled(QStringLiteral("summarise the session"), true);
+    controller.setToolPermission(QStringLiteral("run generation"), true);
+    Access::runTools(controller);
+    for (int i = 0; i < 100 && Access::summarising(controller); ++i) {
+        QEventLoop loop;
+        QTimer::singleShot(10, &loop, &QEventLoop::quit);
+        loop.exec();
+    }
+    check(!Access::summarising(controller), "summary completes");
+    check(messages->rowCount() == 4, "summary creates its own tool row");
+    check(messages->data(messages->index(3), Model::ContentRole).toString() == QStringLiteral("toktoktok"),
+          "summary uses generated tokens");
+    check(messages->data(messages->index(1), Model::ContentRole).toString() == QStringLiteral("stopped answer")
+          && messages->data(messages->index(1), Model::StatusRole).toString() == QStringLiteral("stopped"),
+          "summary leaves the prior response and its status intact");
+    Access::runTools(controller);
+    check(!Access::summarising(controller) && messages->rowCount() == 4,
+          "a conversation is summarised only once and indexing stays deduplicated");
+    messages->appendMessage(kestrel::core::MessageRole::User, QStringLiteral("different topic astronomy"), MessageStatus::Complete);
+    Access::runTools(controller);
+    check(messages->rowCount() == 6, "different indexing output appends a new row");
+}
+
+void testUserRequestCancelsIdleSummary() {
+    using Access = kestrel::app::AppControllerTestAccess;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto backend = std::make_unique<SlowBackend>(200, 5);
+    auto* observed = backend.get();
+    controller.setBackendForTesting(std::move(backend));
+    controller.setIdleToolEnabled(QStringLiteral("summarise the session"), true);
+    controller.setToolPermission(QStringLiteral("read conversations"), true);
+    controller.setToolPermission(QStringLiteral("run generation"), true);
+    Access::runTools(controller);
+    for (int i = 0; i < 100 && observed->tokensEmitted() == 0; ++i) {
+        QEventLoop loop;
+        QTimer::singleShot(5, &loop, &QEventLoop::quit);
+        loop.exec();
+    }
+    check(Access::summarising(controller), "summary owns the worker before the request");
+    controller.sendMessage(QStringLiteral("answer this now"));
+    check(!Access::summarising(controller), "the summary is drained before the user request");
+    check(controller.generating(), "the user response starts after cancellation");
+    check(controller.messages()->rowCount() == 2, "cancelled summary appends no transcript row");
+    controller.stopGeneration();
+}
+
+#if KESTREL_HAS_QT_MULTIMEDIA
+class TestLocalSpeechBackend final : public kestrel::app::LocalModelSpeechBackend {
+public:
+    TestLocalSpeechBackend() { completeSetup(); }
+    using LocalModelSpeechBackend::noteSynthesised;
+    using LocalModelSpeechBackend::noteClauseFailed;
+    QStringList requests;
+    QStringList voices;
+    QStringList paths;
+protected:
+    void startEngine() override { markLaunched(); markStarted(); }
+    void synthesise(const QString& text, const QString& path) override {
+        requests.append(text);
+        voices.append(currentVoice());
+        paths.append(path);
+    }
+    QStringList engineVoices() const override { return {QStringLiteral("first"), QStringLiteral("second")}; }
+    QString engineName() const override { return QStringLiteral("test"); }
+};
+
+void testLocalVoicePendingRequests() {
+    TestLocalSpeechBackend voice;
+    voice.prefetch(QStringLiteral("clause"));
+    voice.speak(QStringLiteral("clause"));
+    check(voice.requests.size() == 1 && voice.speakingNow(),
+          "speaking promotes the pending prefetch without duplicate synthesis");
+    check(voice.setVoice(QStringLiteral("second")), "a supported voice can be selected");
+    check(voice.requests.size() == 2 && voice.voices.last() == QStringLiteral("second"),
+          "a voice change regenerates the pending clause");
+    voice.noteSynthesised(voice.paths.first());
+    check(voice.speakingNow(), "the obsolete reply leaves the replacement pending");
+    voice.noteClauseFailed(QStringLiteral("test failure"));
+    check(!voice.speakingNow() && voice.usable(),
+          "replacement preserves immediate playback and a clause failure keeps the engine usable");
+    voice.prefetch(QStringLiteral("cached"));
+    voice.noteSynthesised(voice.paths.last());
+    const auto before = voice.requests.size();
+    voice.setVoice(QStringLiteral("first"));
+    voice.prefetch(QStringLiteral("cached"));
+    check(voice.requests.size() == before + 1, "voice change invalidates completed prefetched audio");
+    voice.speak(QStringLiteral("cached"));
+    voice.stop();
+    check(!voice.speakingNow(), "boundary stop finishes immediately when no audio is playing");
+    voice.noteSynthesised(voice.paths.last());
+    check(!voice.speakingNow(), "a stopped pending request cannot start playback");
+}
+#endif
+
 void testIdleToolNeedsPermissionBeforeItRuns() {
     std::cout << "an idle tool runs only once it is permitted\n";
 
@@ -830,7 +964,11 @@ void testIdleToolNeedsPermissionBeforeItRuns() {
     // A capability the tool did not declare changes nothing, which is what
     // stops a grant from becoming a blank cheque.
     controller.setToolPermission(QStringLiteral("network"), true);
-    check(permitted, "an unrelated grant does not alter what the tool may do");
+    const auto afterGrant = find("index recent threads");
+    check(afterGrant.value(QStringLiteral("permitted")).toBool(),
+          "an unrelated grant does not alter what the tool may do");
+    check(afterGrant.value(QStringLiteral("missing")).toStringList().isEmpty(),
+          "an unrelated grant leaves no declared permission missing");
 
     // Unknown names are ignored rather than inventing a tool or a capability.
     controller.setIdleToolEnabled(QStringLiteral("no such tool"), true);
@@ -846,6 +984,7 @@ void testSpokenResponseFollowsClauseOrder() {
     kestrel::app::AppController controller;
     controller.setIdleLoopEnabled(false);
     auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+    controller.setBackendForTesting(std::move(backend));
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
     controller.setSpeechBackendForTesting(std::move(speech));
@@ -1435,6 +1574,7 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     controller.setIdleLoopEnabled(false);
     // Slow enough that the turn is still running when the second message lands.
     auto backend = std::make_unique<SlowBackend>(400, 1);
+    controller.setBackendForTesting(std::move(backend));
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
     controller.setSpeechBackendForTesting(std::move(speech));
@@ -1445,6 +1585,7 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     settle.exec();
     check(controller.speaking(), "the first answer is being spoken");
 
+    const auto interruptedId = kestrel::app::AppControllerTestAccess::voice(controller).activeResponseId();
     controller.sendMessage(QStringLiteral("actually, second question"));
     check(observed->boundaryStops == 1, "a barge-in asks for a boundary stop");
     check(observed->immediateStops == 0, "a barge-in does not cut the clause in flight");
@@ -1452,12 +1593,17 @@ void testBargeInStopsAudioAtAClauseBoundary() {
 
     // The abandoned response is replaced, not resumed: the spoken text is kept
     // for the record and the new turn owns the timeline.
-    const bool stopped = controller.voiceState() == QLatin1String("interrupted")
-                      || controller.voiceState() == QLatin1String("cancelled")
-                      || controller.voiceState() == QLatin1String("generating")
-                      || controller.voiceState() == QLatin1String("speaking")
-                      || controller.voiceState() == QLatin1String("queued");
-    check(stopped, "the interrupted response moves out of the speaking state");
+    const auto& voice = kestrel::app::AppControllerTestAccess::voice(controller);
+    const auto* interrupted = voice.find(interruptedId);
+    check(interrupted != nullptr
+          && (interrupted->state() == kestrel::core::ResponseState::Interrupted
+              || interrupted->state() == kestrel::core::ResponseState::Cancelled),
+          "the original response was interrupted or cancelled");
+    check(voice.activeResponseId() != interruptedId,
+          "the replacement has its own response ID");
+    check(controller.voiceState() == QLatin1String("generating")
+          || controller.voiceState() == QLatin1String("speaking"),
+          "the new response is generating or speaking");
     controller.stopGeneration();
 }
 
@@ -1473,7 +1619,7 @@ void testSpokenPhraseTakesTheTypedPath() {
     auto backend = std::make_unique<SlowBackend>(200, 1);
     controller.setBackendForTesting(std::move(backend));
 
-    check(controller.sttAvailable(), "a recognizer is available");
+    check(!controller.sttAvailable(), "scripted preview is not available dictation");
     check(controller.listening() == false, "not listening before asked");
     check(controller.startListening(), "listening starts");
     check(controller.listening(), "the controller reports listening");
@@ -1553,6 +1699,11 @@ int main(int argc, char** argv) {
     testPresenceAndIdleLoopProject();
     testLongAnswerIsOfferedToContinue();
     testIdleToolNeedsPermissionBeforeItRuns();
+    testIdleToolOutputIsIndependentOfConversationRows();
+    testUserRequestCancelsIdleSummary();
+#if KESTREL_HAS_QT_MULTIMEDIA
+    testLocalVoicePendingRequests();
+#endif
     testSpokenTurnIsNotDeliveredBeforeTheLastClause();
     testSpokenResponseFollowsClauseOrder();
     testBargeInStopsAudioAtAClauseBoundary();

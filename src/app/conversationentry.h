@@ -29,6 +29,7 @@ struct MessageExtra {
 // list; ConversationEntry owners must mutate both together).
 struct ConversationEntry {
     int id = 0;
+    bool summarised = false;
     core::Conversation conversation;
     std::vector<MessageExtra> extras;
     QDateTime updatedAt;

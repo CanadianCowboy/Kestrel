@@ -20,9 +20,13 @@ KokoroSpeechBackend::KokoroSpeechBackend(QString python, QString serverScript,
     connect(m_process, &QProcess::readyReadStandardOutput, this,
             &KokoroSpeechBackend::onReadyRead);
     connect(m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart) {
+        if (error == QProcess::FailedToStart || error == QProcess::Crashed) {
             noteEngineFailed(tr("the local voice could not be started"));
         }
+    });
+    connect(m_process, &QProcess::started, this, [this] { markLaunched(); });
+    connect(m_process, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
+        noteEngineFailed(tr("the local voice process exited"));
     });
     completeSetup();
 }
@@ -56,7 +60,7 @@ QStringList KokoroSpeechBackend::engineVoices() const {
     return kVoices;
 }
 
-/// Launches the configured driver, waiting up to five seconds for process startup.
+/// Launches the driver asynchronously; process signals publish launch or failure.
 void KokoroSpeechBackend::startEngine() {
     if (m_python.isEmpty() || m_serverScript.isEmpty()) {
         // Nothing to launch, so nothing will ever answer. Said out loud, because
@@ -66,15 +70,7 @@ void KokoroSpeechBackend::startEngine() {
         return;
     }
     m_process->start(m_python, {m_serverScript});
-    if (!m_process->waitForStarted(5000)) {
-        markGivenUp();
-        return;
-    }
-    // Launched, not ready. The model is still loading at this point, which is
-    // deliberate: the driver answers requests only once it has the model, and
-    // queues the ones that arrive before that rather than dropping them. The
-    // voice becomes usable when the driver announces itself, not here.
-    markLaunched();
+
 }
 
 /// Writes a JSON synthesis request containing the text, voice, speed, and output path.
@@ -112,7 +108,7 @@ void KokoroSpeechBackend::onReadyRead() {
             continue;
         }
         if (!reply.value(QStringLiteral("ok")).toBool()) {
-            noteEngineFailed(reply.value(QStringLiteral("error")).toString());
+            noteClauseFailed(reply.value(QStringLiteral("error")).toString());
             continue;
         }
         noteSynthesised(reply.value(QStringLiteral("out")).toString());

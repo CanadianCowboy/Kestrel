@@ -118,6 +118,12 @@ void LocalModelSpeechBackend::speak(const QString& text) {
         return;
     }
 
+    for (auto& request : m_pending) {
+        if (!request.obsolete && request.text == text) {
+            request.playsNow = true;
+            return;
+        }
+    }
     m_pending.append(PendingRequest{text, true});
     synthesise(text, nextScratchPath());
 }
@@ -128,7 +134,7 @@ void LocalModelSpeechBackend::prefetch(const QString& text) {
         return;
     }
     for (const PendingRequest& request : m_pending) {
-        if (request.text == text) {
+        if (!request.obsolete && request.text == text) {
             return;
         }
     }
@@ -157,6 +163,9 @@ void LocalModelSpeechBackend::noteSynthesised(const QString& path) {
     // Engines answer in the order they were written to, so the front of the
     // queue is what this reply belongs to.
     const PendingRequest request = m_pending.takeFirst();
+    if (request.obsolete) {
+        return;
+    }
     if (request.playsNow) {
         m_player->setSource(QUrl::fromLocalFile(path));
         m_player->play();
@@ -172,7 +181,10 @@ void LocalModelSpeechBackend::noteClauseFailed(const QString& reason) {
     if (m_pending.isEmpty()) {
         return;
     }
-    m_pending.takeFirst();
+    const auto request = m_pending.takeFirst();
+    if (request.obsolete || !request.playsNow) {
+        return;
+    }
     m_speaking = false;
     reportFailed(reason);
 }
@@ -185,16 +197,22 @@ void LocalModelSpeechBackend::noteEngineFailed(const QString& reason) {
     reportFailed(reason.isEmpty() ? tr("the local voice failed") : reason);
 }
 
-/// Stops the media player; synthesis requests already sent remain pending.
+/// Lets playing audio reach its boundary and prevents pending audio from playing.
 void LocalModelSpeechBackend::stop() {
-    // A clause already handed to the model is not recalled; it finishes, which is
-    // the same bargain the platform voice makes and the reason a barge-in lands
-    // between clauses rather than mid-word.
-    m_player->stop();
+    for (auto& request : m_pending) {
+        request.playsNow = false;
+    }
+    if (m_player->playbackState() != QMediaPlayer::PlayingState) {
+        m_speaking = false;
+        reportFinished();
+    }
 }
 
 /// Stops the media player immediately and clears the speaking flag.
 void LocalModelSpeechBackend::stopImmediately() {
+    for (auto& request : m_pending) {
+        request.playsNow = false;
+    }
     m_player->stop();
     m_speaking = false;
 }
@@ -220,6 +238,19 @@ bool LocalModelSpeechBackend::setVoice(const QString& voice) {
     // sound like two people, so the cache is dropped and the next clause is
     // built afresh.
     m_prefetched.clear();
+    QList<PendingRequest> replacements;
+    for (auto& request : m_pending) {
+        if (!request.obsolete) {
+            replacements.append(request);
+            request.obsolete = true;
+        }
+    }
+    // Keep old queue slots until their replies arrive, so those replies cannot
+    // be mistaken for requests synthesized with the new voice.
+    for (const auto& request : replacements) {
+        m_pending.append(request);
+        synthesise(request.text, nextScratchPath());
+    }
     return true;
 }
 

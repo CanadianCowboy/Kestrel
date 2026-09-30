@@ -739,12 +739,14 @@ void testMockRecognizerStillStreamsPartials() {
     // A stop mid-phrase is a cancellation, and reports no phrase. A recognizer
     // that handed back a half-sentence on cancel would submit words the user
     // did not finish saying.
-    assert(recognizer->start(
+    const bool restarted = recognizer->start(
         [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
         [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
             end_reason = runtime::toString(reason);
         },
-        failure));
+        failure);
+    assert(restarted);
+    static_cast<void>(restarted);
     mock->emitNextPartial();
     const std::size_t before_stop = seen.size();
     recognizer->stop();

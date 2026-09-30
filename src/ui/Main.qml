@@ -454,7 +454,7 @@ ApplicationWindow {
                                     Row {
                                         spacing: 10
                                         Text {
-                                            text: entry.fromAssistant ? "KESTREL" : "YOU"
+                                            text: entry.fromAssistant ? "KESTREL" : (entry.author === "tool" ? "TOOL" : "YOU")
                                             color: entry.fromAssistant ? window.accent : window.muted
                                             font.pixelSize: 10
                                             font.weight: Font.DemiBold
@@ -710,376 +710,384 @@ ApplicationWindow {
                 NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
             }
 
-            ColumnLayout {
+            ScrollView {
+                id: diagnosticsScroll
                 anchors.fill: parent
                 anchors.margins: 18
-                spacing: 14
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    Column {
-                        spacing: 3
-                        Text { text: "Runtime"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
-                        Text { text: "Ctrl+D to close  ·  click Refresh to re-probe"; color: window.muted; font.pixelSize: 10 }
-                    }
-                    Item { Layout.fillWidth: true }
-                    Button {
-                        text: "Refresh"
-                        implicitHeight: 30
-                        onClicked: appController.refreshRuntime()
-                        contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                        background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: window.line; opacity: 0.7 }
-
+                clip: true
+                contentWidth: availableWidth
+                contentHeight: diagnosticsContent.implicitHeight
                 ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 6
-                    Text { text: "ACTIVE MODEL"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
-                    Text { text: appController.modelName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                    Text { text: appController.runtimeDetail; color: window.muted; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                }
+                    id: diagnosticsContent
+                    width: diagnosticsScroll.availableWidth
+                    spacing: 14
 
-                Rectangle {
-                    Layout.fillWidth: true
-                    implicitHeight: gpuColumn.implicitHeight + 24
-                    radius: 12
-                    color: "#1a1d23"
-                    border.color: window.line
-                    ColumnLayout {
-                        id: gpuColumn
-                        anchors.fill: parent
-                        anchors.margins: 12
-                        spacing: 6
-                        Text { text: "GPU"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
-                        Text { text: appController.gpuName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                        Text {
-                            text: appController.gpuAvailable
-                                  ? appController.gpuSummary + "  ·  " + appController.gpuDeviceCount + " device(s)"
-                                  : appController.gpuDetail
-                            color: window.muted; font.pixelSize: 11
-                            wrapMode: Text.Wrap
-                            Layout.fillWidth: true
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Column {
+                            spacing: 3
+                            Text { text: "Runtime"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
+                            Text { text: "Ctrl+D to close  ·  click Refresh to re-probe"; color: window.muted; font.pixelSize: 10 }
+                        }
+                        Item { Layout.fillWidth: true }
+                        Button {
+                            text: "Refresh"
+                            implicitHeight: 30
+                            onClicked: appController.refreshRuntime()
+                            contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                         }
                     }
-                }
 
-                Text { text: "ASSISTANT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Rectangle { Layout.fillWidth: true; height: 1; color: window.line; opacity: 0.7 }
 
-                Rectangle {
-                    Layout.fillWidth: true
-                    implicitHeight: presenceColumn.implicitHeight + 24
-                    radius: 12
-                    color: "#1a1d23"
-                    border.color: window.line
                     ColumnLayout {
-                        id: presenceColumn
-                        anchors.fill: parent
-                        anchors.margins: 12
-                        spacing: 7
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "PRESENCE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text { text: appController.presenceState; color: window.ink; font.pixelSize: 12 }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "MOOD"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text { text: appController.personaMood; color: window.ink; font.pixelSize: 12 }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "TOPIC"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.sessionTopic.length > 0 ? appController.sessionTopic : "—"
-                                color: window.muted; font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
-                                elide: Text.ElideLeft
-                                Layout.maximumWidth: 170
-                            }
-                        }
-                        // Which voice is speaking, or why nothing is. Said
-                        // plainly rather than as a silent failure: a reply that
-                        // was never spoken is otherwise indistinguishable from
-                        // one that was too fast to notice.
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "VOICE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.ttsAvailable ? appController.ttsVoice
-                                                                : (appController.ttsError.length > 0 ? appController.ttsError : "text only")
-                                color: appController.ttsAvailable ? window.ink : window.muted
-                                font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: 170
-                            }
-                        }
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Text { text: "ACTIVE MODEL"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                        Text { text: appController.modelName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                        Text { text: appController.runtimeDetail; color: window.muted; font.pixelSize: 11; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                    }
 
-                        // Voice choice, when the backend has a choice to offer.
-                        // Hidden otherwise rather than shown empty: a picker with
-                        // nothing in it is a control that cannot be used, and on
-                        // a machine using the platform voice there is genuinely
-                        // nothing to choose between.
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: gpuColumn.implicitHeight + 24
+                        radius: 12
+                        color: "#1a1d23"
+                        border.color: window.line
                         ColumnLayout {
-                            Layout.fillWidth: true
-                            visible: appController.speechVoices.length > 0
-                            spacing: 4
-
+                            id: gpuColumn
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 6
+                            Text { text: "GPU"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                            Text { text: appController.gpuName; color: window.ink; font.pixelSize: 13; wrapMode: Text.Wrap; Layout.fillWidth: true }
                             Text {
-                                text: "VOICE PROFILE"
-                                color: window.muted
-                                font.pixelSize: 10
-                                font.letterSpacing: 1.2
-                            }
-
-                            Flow {
+                                text: appController.gpuAvailable
+                                      ? appController.gpuSummary + "  ·  " + appController.gpuDeviceCount + " device(s)"
+                                      : appController.gpuDetail
+                                color: window.muted; font.pixelSize: 11
+                                wrapMode: Text.Wrap
                                 Layout.fillWidth: true
-                                spacing: 6
+                            }
+                        }
+                    }
 
-                                Repeater {
-                                    model: appController.speechVoices
-                                    delegate: Rectangle {
-                                        required property string modelData
-                                        readonly property bool selected:
-                                            modelData === appController.currentVoice
-                                        width: profileText.implicitWidth + 16
-                                        height: 22
-                                        radius: 11
-                                        color: selected ? window.accent : "#1a1d23"
-                                        border.color: selected ? window.accent : window.line
-                                        Behavior on color { ColorAnimation { duration: 140 } }
+                    Text { text: "ASSISTANT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
 
-                                        Text {
-                                            id: profileText
-                                            anchors.centerIn: parent
-                                            text: parent.modelData
-                                            color: parent.selected ? "#0d1015" : window.muted
-                                            font.pixelSize: 11
-                                        }
-
-                                        MouseArea {
-                                            id: profileHit
-                                            anchors.fill: parent
-                                            hoverEnabled: true
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: appController.setSpeechVoice(parent.modelData)
-                                        }
-                                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: presenceColumn.implicitHeight + 24
+                        radius: 12
+                        color: "#1a1d23"
+                        border.color: window.line
+                        ColumnLayout {
+                            id: presenceColumn
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 7
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "PRESENCE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text { text: appController.presenceState; color: window.ink; font.pixelSize: 12 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "MOOD"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text { text: appController.personaMood; color: window.ink; font.pixelSize: 12 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "TOPIC"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.sessionTopic.length > 0 ? appController.sessionTopic : "—"
+                                    color: window.muted; font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignRight
+                                    elide: Text.ElideLeft
+                                    Layout.maximumWidth: 170
                                 }
                             }
-                        }
-
-                        // The three switches that keep the idle loop inside its
-                        // box: whether it runs at all, whether it may touch the
-                        // GPU, and whether its private thoughts are shown.
-                        IdleToggle {
-                            label: "Idle loop"
-                            hint: "quiet internal work between turns"
-                            checked: appController.idleLoopEnabled
-                            onToggled: appController.idleLoopEnabled = !appController.idleLoopEnabled
-                        }
-                        IdleToggle {
-                            label: "GPU prewarm"
-                            hint: "opt-in: a discarded generation while idle"
-                            checked: appController.idlePrewarmEnabled
-                            onToggled: appController.idlePrewarmEnabled = !appController.idlePrewarmEnabled
-                        }
-                        IdleToggle {
-                            label: "Show thoughts"
-                            hint: "reveal what the idle loop is thinking"
-                            checked: appController.showIdleThoughts
-                            onToggled: appController.showIdleThoughts = !appController.showIdleThoughts
-                        }
-
-                        Text {
-                            Layout.fillWidth: true
-                            visible: appController.idleTaskLabel.length > 0
-                            text: appController.idleTaskLabel
-                            color: "#4d5a68"
-                            font.pixelSize: 11
-                            font.italic: true
-                            wrapMode: Text.Wrap
-                        }
-
-                        // Idle tools. A switch is not enough on its own: a tool
-                        // that is on but has not been granted what it declared
-                        // is still off, and the user is the one who decides
-                        // which is which. So each tool gets its own switch and
-                        // its own list of capabilities, each of which can be
-                        // granted here.
-                        Repeater {
-                            model: appController.idleTools
-                            delegate: ColumnLayout {
-                                required property var modelData
-                                readonly property var tool: modelData
+                            // Which voice is speaking, or why nothing is. Said
+                            // plainly rather than as a silent failure: a reply that
+                            // was never spoken is otherwise indistinguishable from
+                            // one that was too fast to notice.
+                            RowLayout {
                                 Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "VOICE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.ttsAvailable ? appController.ttsVoice
+                                                                    : (appController.ttsError.length > 0 ? appController.ttsError : "text only")
+                                    color: appController.ttsAvailable ? window.ink : window.muted
+                                    font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignRight
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 170
+                                }
+                            }
+
+                            // Voice choice, when the backend has a choice to offer.
+                            // Hidden otherwise rather than shown empty: a picker with
+                            // nothing in it is a control that cannot be used, and on
+                            // a machine using the platform voice there is genuinely
+                            // nothing to choose between.
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: appController.speechVoices.length > 0
                                 spacing: 4
 
-                                IdleToggle {
-                                    label: tool.name
-                                    // Both states are worth saying out loud, and
-                                    // saying which one applies is the point of the
-                                    // hint rather than decoration.
-                                    hint: tool.enabled
-                                          ? (tool.permitted
-                                             ? tool.summary
-                                             : "needs: " + tool.missing.join(", "))
-                                          : "switch on to allow this"
-                                    checked: tool.enabled
-                                    onToggled: appController.setIdleToolEnabled(tool.name, !tool.enabled)
+                                Text {
+                                    text: "VOICE PROFILE"
+                                    color: window.muted
+                                    font.pixelSize: 10
+                                    font.letterSpacing: 1.2
                                 }
 
-                                ColumnLayout {
+                                Flow {
                                     Layout.fillWidth: true
-                                    Layout.leftMargin: 24
-                                    spacing: 2
-                                    visible: tool.required.length > 0
+                                    spacing: 6
 
                                     Repeater {
-                                        model: tool.required
-                                        delegate: IdleToggle {
+                                        model: appController.speechVoices
+                                        delegate: Rectangle {
                                             required property string modelData
-                                            required property var model
-                                            readonly property string capability: modelData
-                                            readonly property bool granted: !tool.missing.includes(capability)
-                                            label: capability
-                                            hint: granted
-                                                  ? "granted"
-                                                  : "Kestrel cannot do this until you allow it"
-                                            checked: granted
-                                            onToggled: appController.setToolPermission(capability, !granted)
+                                            readonly property bool selected:
+                                                modelData === appController.currentVoice
+                                            width: profileText.implicitWidth + 16
+                                            height: 22
+                                            radius: 11
+                                            color: selected ? window.accent : "#1a1d23"
+                                            border.color: selected ? window.accent : window.line
+                                            Behavior on color { ColorAnimation { duration: 140 } }
+
+                                            Text {
+                                                id: profileText
+                                                anchors.centerIn: parent
+                                                text: parent.modelData
+                                                color: parent.selected ? "#0d1015" : window.muted
+                                                font.pixelSize: 11
+                                            }
+
+                                            MouseArea {
+                                                id: profileHit
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: appController.setSpeechVoice(parent.modelData)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // The three switches that keep the idle loop inside its
+                            // box: whether it runs at all, whether it may touch the
+                            // GPU, and whether its private thoughts are shown.
+                            IdleToggle {
+                                label: "Idle loop"
+                                hint: "quiet internal work between turns"
+                                checked: appController.idleLoopEnabled
+                                onToggled: appController.idleLoopEnabled = !appController.idleLoopEnabled
+                            }
+                            IdleToggle {
+                                label: "GPU prewarm"
+                                hint: "opt-in: a discarded generation while idle"
+                                checked: appController.idlePrewarmEnabled
+                                onToggled: appController.idlePrewarmEnabled = !appController.idlePrewarmEnabled
+                            }
+                            IdleToggle {
+                                label: "Show thoughts"
+                                hint: "reveal what the idle loop is thinking"
+                                checked: appController.showIdleThoughts
+                                onToggled: appController.showIdleThoughts = !appController.showIdleThoughts
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                visible: appController.idleTaskLabel.length > 0
+                                text: appController.idleTaskLabel
+                                color: "#4d5a68"
+                                font.pixelSize: 11
+                                font.italic: true
+                                wrapMode: Text.Wrap
+                            }
+
+                            // Idle tools. A switch is not enough on its own: a tool
+                            // that is on but has not been granted what it declared
+                            // is still off, and the user is the one who decides
+                            // which is which. So each tool gets its own switch and
+                            // its own list of capabilities, each of which can be
+                            // granted here.
+                            Repeater {
+                                model: appController.idleTools
+                                delegate: ColumnLayout {
+                                    required property var modelData
+                                    readonly property var tool: modelData
+                                    Layout.fillWidth: true
+                                    spacing: 4
+
+                                    IdleToggle {
+                                        label: tool.name
+                                        // Both states are worth saying out loud, and
+                                        // saying which one applies is the point of the
+                                        // hint rather than decoration.
+                                        hint: tool.enabled
+                                              ? (tool.permitted
+                                                 ? tool.summary
+                                                 : "needs: " + tool.missing.join(", "))
+                                              : "switch on to allow this"
+                                        checked: tool.enabled
+                                        onToggled: appController.setIdleToolEnabled(tool.name, !tool.enabled)
+                                    }
+
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        Layout.leftMargin: 24
+                                        spacing: 2
+                                        visible: tool.required.length > 0
+
+                                        Repeater {
+                                            model: tool.required
+                                            delegate: IdleToggle {
+                                                required property string modelData
+                                                required property var model
+                                                readonly property string capability: modelData
+                                                readonly property bool granted: !tool.missing.includes(capability)
+                                                label: capability
+                                                hint: granted
+                                                      ? "granted"
+                                                      : "Kestrel cannot do this until you allow it"
+                                                checked: granted
+                                                onToggled: appController.setToolPermission(capability, !granted)
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                Text { text: "LIVE GENERATION"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Text { text: "LIVE GENERATION"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
 
-                Rectangle {
-                    Layout.fillWidth: true
-                    implicitHeight: liveColumn.implicitHeight + 24
-                    radius: 12
-                    color: "#1a1d23"
-                    border.color: appController.generating ? window.accent : window.line
-                    Behavior on border.color { ColorAnimation { duration: 160 } }
-                    ColumnLayout {
-                        id: liveColumn
-                        anchors.fill: parent
-                        anchors.margins: 12
-                        spacing: 7
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "THROUGHPUT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.tokensPerSecond > 0
-                                      ? appController.tokensPerSecond.toFixed(1) + " tok/s"
-                                      : "—"
-                                color: appController.tokensPerSecond > 0 ? window.accent : window.muted
-                                font.pixelSize: 13
-                                font.weight: Font.DemiBold
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: liveColumn.implicitHeight + 24
+                        radius: 12
+                        color: "#1a1d23"
+                        border.color: appController.generating ? window.accent : window.line
+                        Behavior on border.color { ColorAnimation { duration: 160 } }
+                        ColumnLayout {
+                            id: liveColumn
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 7
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "THROUGHPUT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.tokensPerSecond > 0
+                                          ? appController.tokensPerSecond.toFixed(1) + " tok/s"
+                                          : "—"
+                                    color: appController.tokensPerSecond > 0 ? window.accent : window.muted
+                                    font.pixelSize: 13
+                                    font.weight: Font.DemiBold
+                                }
                             }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "TOKENS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text { text: appController.tokensGenerated; color: window.ink; font.pixelSize: 13 }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "CONTEXT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.contextSummary
-                                color: window.ink; font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: 160
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "TOKENS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text { text: appController.tokensGenerated; color: window.ink; font.pixelSize: 13 }
                             }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "KV CACHE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.kvCacheSummary
-                                color: window.ink; font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: 160
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "CONTEXT"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.contextSummary
+                                    color: window.ink; font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignRight
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 160
+                                }
                             }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "SHARED PREFIX"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text {
-                                text: appController.prefixSummary
-                                color: window.ink; font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: 160
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "KV CACHE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.kvCacheSummary
+                                    color: window.ink; font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignRight
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 160
+                                }
                             }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 10
-                            Text { text: "VOICE STATE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
-                            Text { text: appController.voiceState; color: window.ink; font.pixelSize: 12 }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "SHARED PREFIX"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text {
+                                    text: appController.prefixSummary
+                                    color: window.ink; font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignRight
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 160
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "VOICE STATE"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.2; Layout.fillWidth: true }
+                                Text { text: appController.voiceState; color: window.ink; font.pixelSize: 12 }
+                            }
                         }
                     }
-                }
 
-                Text { text: "DIAGNOSTICS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Text { text: "DIAGNOSTICS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
 
-                ListView {
-                    id: diagnosticList
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-                    spacing: 10
-                    model: appController.runtimeDiagnostics
-                    boundsBehavior: Flickable.StopAtBounds
-                    delegate: ColumnLayout {
-                        required property var modelData
+                    ListView {
+                        id: diagnosticList
                         Layout.fillWidth: true
-                        spacing: 2
-                        RowLayout {
+                        Layout.preferredHeight: 240
+                        clip: true
+                        spacing: 10
+                        model: appController.runtimeDiagnostics
+                        boundsBehavior: Flickable.StopAtBounds
+                        delegate: ColumnLayout {
+                            required property var modelData
                             Layout.fillWidth: true
-                            spacing: 7
-                            Rectangle {
-                                width: 6; height: 6; radius: 3
-                                color: modelData.ok ? window.accent : "#8a6a74"
-                                Layout.alignment: Qt.AlignTop
-                                Layout.topMargin: 4
+                            spacing: 2
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 7
+                                Rectangle {
+                                    width: 6; height: 6; radius: 3
+                                    color: modelData.ok ? window.accent : "#8a6a74"
+                                    Layout.alignment: Qt.AlignTop
+                                    Layout.topMargin: 4
+                                }
+                                Text {
+                                    text: modelData.label
+                                    color: window.ink
+                                    font.pixelSize: 12
+                                    font.weight: Font.DemiBold
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.Wrap
+                                }
                             }
                             Text {
-                                text: modelData.label
-                                color: window.ink
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                                Layout.fillWidth: true
+                                text: modelData.value
+                                color: window.muted
+                                font.pixelSize: 11
                                 wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 13
                             }
-                        }
-                        Text {
-                            text: modelData.value
-                            color: window.muted
-                            font.pixelSize: 11
-                            wrapMode: Text.Wrap
-                            Layout.fillWidth: true
-                            Layout.leftMargin: 13
                         }
                     }
                 }

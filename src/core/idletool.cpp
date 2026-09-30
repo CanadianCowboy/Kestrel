@@ -48,6 +48,7 @@ const char* toString(ToolPermission permission) noexcept {
 
 /// Adds a tool declaration or replaces a matching declaration and disables it again.
 void IdleToolRegistry::declare(IdleToolDeclaration declaration) {
+    declaration.enabled = false;
     const auto match = findByName(m_declarations, declaration.name);
     if (match == m_declarations.end()) {
         m_declarations.push_back(std::move(declaration));
@@ -57,7 +58,6 @@ void IdleToolRegistry::declare(IdleToolDeclaration declaration) {
     // agreed to was the previous declaration, and a declaration that has
     // changed what a tool does is not the thing they agreed to -- including
     // when the new version asks for more than the old one.
-    declaration.enabledByDefault = false;
     *match = std::move(declaration);
 }
 
@@ -81,14 +81,14 @@ void IdleToolRegistry::setEnabled(std::string_view name, bool enabled) {
     // `enabled` answers false for it, which is the whole of the report.
     const auto match = findByName(m_declarations, name);
     if (match != m_declarations.end()) {
-        match->enabledByDefault = enabled;
+        match->enabled = enabled;
     }
 }
 
 /// Returns whether the named tool is both declared and enabled.
 bool IdleToolRegistry::enabled(std::string_view name) const {
     const IdleToolDeclaration* declaration = find(name);
-    return declaration != nullptr && declaration->enabledByDefault;
+    return declaration != nullptr && declaration->enabled;
 }
 
 /// Adds or removes a granted capability without duplicating grants.
@@ -118,7 +118,7 @@ bool IdleToolRegistry::permits(std::string_view name) const {
     // declared capabilities are not all granted. Collapsing the last two would
     // let a tool that asks for nothing run unasked, which is the opposite of
     // what an opt-in registry is for.
-    return declaration != nullptr && declaration->enabledByDefault
+    return declaration != nullptr && declaration->enabled
         && missing(name).empty();
 }
 
@@ -149,7 +149,7 @@ IdleToolDeclaration indexThreadsDeclaration() {
     declaration.permissions = {ToolPermission::ReadConversations};
     // Opt-in, like every tool. Even this one asks first: it is the user's
     // conversation, and deciding that Kestrel may read it unprompted is theirs.
-    declaration.enabledByDefault = false;
+    declaration.enabled = false;
     return declaration;
 }
 
@@ -164,7 +164,7 @@ IdleToolDeclaration summariseSessionDeclaration() {
     // should never happen quietly on a background timer.
     declaration.permissions = {ToolPermission::ReadConversations,
                                ToolPermission::RunGeneration};
-    declaration.enabledByDefault = false;
+    declaration.enabled = false;
     return declaration;
 }
 
@@ -305,6 +305,13 @@ ToolRunResult runIdleTool(const IdleToolRegistry& registry, std::string_view nam
     if (name == kIndexThreadsTool) {
         result = indexThreads(messages);
         result.ran = true;
+        return result;
+    }
+
+    if (name == kSummariseSessionTool) {
+        // Authorize the asynchronous generation; the app owns the worker.
+        result.ran = true;
+        result.summary = "Session summary authorized.";
         return result;
     }
 

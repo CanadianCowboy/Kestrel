@@ -5,34 +5,9 @@
 // CUDA header: the platform header stays behind the boundary, and everything
 // above it is written against SpeechRecognizer.
 //
-// The whole pipeline, and every name in it is declared in the Windows SDK's
-// sapi.h:
-//
-//   CoCreateInstance(CLSID_SpSharedRecognizer) -> ISpRecognizer
-//   ISpRecognizer::SetInput(nullptr, SPADTYPE_INPUT)   the default microphone
-//   ISpRecognizer::CreateRecoContext()       -> ISpRecoContext
-//   ISpEventSource::SetInterest(SPRVI_SR | SPRVI_OTHER, 0)
-//   ISpEventSource::SetNotifyWin32Event()    -> an HANDLE to wait on
-//   ISpEventSource::GetNotifyEventHandle()
-//   ISpEventSource::GetEvents(...)           -> the events themselves
-//
-// Two things about that list are worth writing down, because both look like
-// missing features and are not:
-//
-//   * There is no ISpeechRecognitionClient here. That interface, and
-//     ISpRecoContext::SetAudioStreamSource, are SAPI 5.1 additions that live in
-//     the Speech SDK rather than in the Windows SDK. The Windows SDK's sapi.h is
-//     the 5.0 view of these interfaces, and the 5.0 view is the one the shared
-//     engine implements: it takes its input device from SetInput, and its events
-//     are pulled with GetEvents rather than pushed through a client object.
-//
-//   * Events are pulled rather than delivered to a callback. That is not a
-//     stylistic choice. A callback would have to carry a pointer to its owner
-//     through SAPI's wParam and would have to be released before it could be
-//     called, which is the single easiest way to get a call into a
-//     half-destroyed object on shutdown. A wait handle and a pull cannot.
-//     Nothing here can run after the object that owns it is gone, because the
-//     only thread that runs it is joined first.
+// The shared recognizer uses the user's configured audio input. A context with
+// an active dictation grammar supplies recognition events through a wait handle.
+// All COM objects and event payloads are owned and released by the worker.
 
 #include "runtime/sapirecognizer.h"
 
@@ -48,6 +23,8 @@
 #include <mmsystem.h>
 #include <sapi.h>
 
+#include <algorithm>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -56,22 +33,9 @@
 #include <string>
 #include <system_error>
 #include <thread>
-#include <vector>
 
 namespace kestrel::runtime {
 namespace {
-
-// SPRVI_* is the SPRVIFLAGS enum, which is a Speech SDK header the Windows SDK
-// does not ship. These are its published values, and they are load bearing: the
-// interest mask decides which events the engine raises at all, so a wrong bit
-// produces a recognizer that hears nothing and says nothing about why.
-constexpr ULONGLONG kInterestRecognition = 0x0001; // SPRVI_SR
-constexpr ULONGLONG kInterestOther = 0x0010;      // SPRVI_OTHER
-
-// The audio category SetInput is told to look in, when the token is null and
-// the engine picks its own default device. SPADTYPE_INPUT is a Speech SDK enum
-// the Windows SDK does not ship, and it is one stable value.
-constexpr DWORD kAudioCategoryInput = 1;
 
 // How long one phrase may take before the session is ended as a failure.
 //
@@ -80,21 +44,6 @@ constexpr DWORD kAudioCategoryInput = 1;
 // that never ends a session -- leaves the interface sitting in a listening
 // state forever, which is the one outcome worse than an error message.
 constexpr std::chrono::seconds kPhraseDeadline{30};
-
-// The payload of SPEI_RECOGNITION. SPRECOCGNITION belongs to the Speech SDK's
-// sapi.h, so its layout is declared here from the published SAPI 5 definition.
-// The two asserts pin the offsets that matter: a mistake in this file then
-// fails the build rather than producing a misread pointer at run time.
-struct RecognitionPayload {
-    SPEVENT streamEnd;        // the SPEI_END_SR_STREAM that closes this phrase
-    LRESULT confidence;       // 0..1000, the scale SAPI reports on
-    wchar_t* phrase;          // the words, NUL terminated
-    void* alternates;         // unused: one phrase per turn is enough
-};
-static_assert(offsetof(RecognitionPayload, confidence) == sizeof(SPEVENT),
-              "SPEVENT is not the first member, or the SDK added padding");
-static_assert(offsetof(RecognitionPayload, phrase) == sizeof(SPEVENT) + sizeof(LRESULT),
-              "the phrase pointer does not follow the confidence");
 
 // UTF-16 from the engine to UTF-8 for the interface. Reported, not repaired:
 // a conversion failure yields no text, and a session with no text ends as
@@ -111,7 +60,7 @@ std::string toUtf8(const wchar_t* text) {
     if (size <= 1) {
         return {};
     }
-    std::string out(static_cast<std::size_t>(size - 1), '\0');
+    std::string out(static_cast<std::size_t>(size), '\0');
     const int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1,
                                             out.data(), size, nullptr, nullptr);
     if (written <= 0) {
@@ -119,6 +68,26 @@ std::string toUtf8(const wchar_t* text) {
     }
     out.resize(static_cast<std::size_t>(written - 1));
     return out;
+}
+
+// Release SAPI event payloads according to their ownership tag. Kept here so
+// builds need only sapi.h, including SDKs without the SpClearEvent helper.
+void clearEvent(SPEVENT& event) {
+    if (event.lParam != 0) {
+        switch (event.elParamType) {
+        case SPET_LPARAM_IS_TOKEN:
+        case SPET_LPARAM_IS_OBJECT:
+            reinterpret_cast<IUnknown*>(event.lParam)->Release();
+            break;
+        case SPET_LPARAM_IS_POINTER:
+        case SPET_LPARAM_IS_STRING:
+            CoTaskMemFree(reinterpret_cast<void*>(event.lParam));
+            break;
+        default:
+            break;
+        }
+    }
+    event = {};
 }
 
 /// Formats an HRESULT as a hexadecimal diagnostic code.
@@ -220,9 +189,9 @@ public:
             std::lock_guard<std::mutex> lock(m_mutex);
             m_onResult = std::move(onResult);
             m_onEnd = std::move(onEnd);
+            m_callbackGeneration = m_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+            m_listening.store(true, std::memory_order_release);
         }
-        m_listening.store(true, std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_acq_rel);
         if (m_thread.joinable()) {
             SetEvent(m_wake);
             return true;
@@ -250,8 +219,11 @@ public:
         // The generation bump is what actually ends a session: the worker's
         // wait loop compares against it, so a stop is noticed even if the
         // worker is between two events rather than sitting in the wait.
-        m_listening.store(false, std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_generation.fetch_add(1, std::memory_order_acq_rel);
+            m_listening.store(false, std::memory_order_release);
+        }
         if (m_thread.joinable() && m_wake != nullptr) {
             SetEvent(m_wake);
         }
@@ -269,10 +241,17 @@ private:
         // release below is followed by CoUninitialize on this thread.
         const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(comInit)) {
-            m_listening.store(false, std::memory_order_release);
-            deliverEnd(RecognitionEnd::Failed,
-                       "COM could not be initialised on the recognizer thread: "
-                           + formatHr(comInit));
+            EndCallback onEnd;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                onEnd = std::move(m_onEnd);
+                m_onResult = {};
+                m_listening.store(false, std::memory_order_release);
+            }
+            if (onEnd) {
+                onEnd(RecognitionEnd::Failed,
+                      "COM could not be initialised on the recognizer thread: " + formatHr(comInit));
+            }
             return;
         }
 
@@ -312,37 +291,44 @@ private:
 
     /// Runs one SAPI session on the worker and reports its phrase, cancellation, or failure.
     void runSession(unsigned generation) {
+        ResultCallback onResult;
+        EndCallback onEnd;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_callbackGeneration != generation) {
+                return;
+            }
+            onResult = std::move(m_onResult);
+            onEnd = std::move(m_onEnd);
+        }
+        // These callbacks belong to this start(), even if a new start arrives
+        // while the old worker is releasing its COM objects.
+        const auto finishListening = [this, generation] {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_generation.load(std::memory_order_acquire) == generation) {
+                m_listening.store(false, std::memory_order_release);
+            }
+        };
         SessionState state;
 
         ISpRecognizer* recognizer = nullptr;
         ISpRecoContext* context = nullptr;
+        ISpRecoGrammar* grammar = nullptr;
         HANDLE events = nullptr;
 
-        // The order of these steps is not a style choice. A shared recognizer
-        // cannot create a recognition context until it has an input, so
-        // SetInput comes first and its failure is the one worth reporting: the
-        // context that follows fails too, with a code that says nothing about
-        // the microphone being the problem.
-        //
-        // Every step keeps the name of what it was doing, because a bare status
-        // code is not something a user can act on. "SAPI could not open the
-        // microphone: 0x8004503A" is.
+        // The shared recognizer owns its input; activate dictation on our context.
         const char* step_name = "creating the recognizer";
         HRESULT hr = CoCreateInstance(CLSID_SpSharedRecognizer, nullptr, CLSCTX_ALL,
                                       IID_PPV_ARGS(&recognizer));
-        if (SUCCEEDED(hr)) {
-            // A null token means the default capture device, which is the one
-            // the user chose in the system sound settings.
-            step_name = "opening the microphone";
-            hr = recognizer->SetInput(nullptr, kAudioCategoryInput);
-        }
         if (SUCCEEDED(hr)) {
             step_name = "creating a recognition context";
             hr = recognizer->CreateRecoContext(&context);
         }
         if (SUCCEEDED(hr)) {
             step_name = "asking the engine for recognition events";
-            hr = context->SetInterest(kInterestRecognition | kInterestOther, 0);
+            const ULONGLONG interests = SPFEI(SPEI_RECOGNITION)
+                | SPFEI(SPEI_FALSE_RECOGNITION) | SPFEI(SPEI_SOUND_START);
+            hr = context->SetInterest(interests, interests);
         }
         if (SUCCEEDED(hr)) {
             // An event handle rather than a callback, so the worker can wait on
@@ -358,10 +344,23 @@ private:
             }
         }
 
+        if (SUCCEEDED(hr)) {
+            step_name = "creating a dictation grammar";
+            hr = context->CreateGrammar(0, &grammar);
+        }
+        if (SUCCEEDED(hr)) {
+            step_name = "loading dictation";
+            hr = grammar->LoadDictation(nullptr, SPLO_STATIC);
+        }
+        if (SUCCEEDED(hr)) {
+            step_name = "activating dictation";
+            hr = grammar->SetDictationState(SPRS_ACTIVE);
+        }
+
         if (FAILED(hr)) {
-            releaseAudio(context, recognizer);
-            m_listening.store(false, std::memory_order_release);
-            deliverEnd(RecognitionEnd::Failed,
+            releaseAudio(grammar, context, recognizer);
+            finishListening();
+            onEnd(RecognitionEnd::Failed,
                        std::string("SAPI could not ") + step_name + ": " + formatHr(hr));
             return;
         }
@@ -411,8 +410,10 @@ private:
             // loop, where it is turned into a reason.
         }
 
-        releaseAudio(context, recognizer);
-        m_listening.store(false, std::memory_order_release);
+        releaseAudio(grammar, context, recognizer);
+        cancelled = cancelled || m_shuttingDown.load(std::memory_order_acquire)
+                    || m_generation.load(std::memory_order_acquire) != generation;
+        finishListening();
 
         if (cancelled) {
             // A stop is a cancellation, not a completed phrase. Reporting the
@@ -421,16 +422,16 @@ private:
             RecognitionResult stopped;
             stopped.isFinal = false;
             stopped.end = RecognitionEnd::Cancelled;
-            deliverResult(stopped);
-            deliverEnd(RecognitionEnd::Cancelled, {});
+            onResult(stopped);
+            onEnd(RecognitionEnd::Cancelled, {});
             return;
         }
         if (!state.failure.empty()) {
-            deliverEnd(RecognitionEnd::Failed, state.failure);
+            onEnd(RecognitionEnd::Failed, state.failure);
             return;
         }
         if (state.phrase.empty()) {
-            deliverEnd(RecognitionEnd::NoAudio,
+            onEnd(RecognitionEnd::NoAudio,
                        state.heardSound ? "the microphone heard no recognisable speech"
                                         : "the microphone heard nothing at all");
             return;
@@ -441,68 +442,66 @@ private:
         final.confidence = state.confidence;
         final.isFinal = true;
         final.end = RecognitionEnd::Silence;
-        deliverResult(final);
-        deliverEnd(RecognitionEnd::Silence, {});
+        onResult(final);
+        onEnd(RecognitionEnd::Silence, {});
     }
 
     // Reads whatever the engine has queued. Called on the worker thread with
     // the context it belongs to, so every pointer in here is valid for the
     // duration of the call.
     static void pullEvents(ISpRecoContext* context, SessionState& state) {
-        ULONG available = 0;
-        if (FAILED(context->GetEvents(0, nullptr, &available)) || available == 0) {
-            return;
-        }
-        std::vector<SPEVENT> events(available);
+        SPEVENT event{};
         ULONG fetched = 0;
-        if (FAILED(context->GetEvents(available, events.data(), &fetched))) {
-            return;
-        }
-        for (ULONG i = 0; i < fetched; ++i) {
-            const SPEVENT& event = events[i];
-            switch (event.eEventId) {
-            case SPEI_SOUND_START:
-                state.heardSound = true;
-                break;
-            case SPEI_RECOGNITION: {
-                const auto* payload =
-                    reinterpret_cast<const RecognitionPayload*>(event.lParam);
-                if (payload == nullptr) {
+        while (SUCCEEDED(context->GetEvents(1, &event, &fetched)) && fetched == 1) {
+            if (!state.finished) {
+                switch (event.eEventId) {
+                case SPEI_SOUND_START:
+                    state.heardSound = true;
+                    break;
+                case SPEI_RECOGNITION: {
+                    ISpRecoResult* result = nullptr;
+                    if (event.elParamType == SPET_LPARAM_IS_OBJECT && event.lParam != 0
+                        && SUCCEEDED(reinterpret_cast<IUnknown*>(event.lParam)
+                            ->QueryInterface(IID_PPV_ARGS(&result)))) {
+                        wchar_t* text = nullptr;
+                        if (SUCCEEDED(result->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE,
+                                                       TRUE, &text, nullptr))) {
+                            state.phrase = toUtf8(text);
+                        }
+                        CoTaskMemFree(text);
+                        SPPHRASE* phrase = nullptr;
+                        if (SUCCEEDED(result->GetPhrase(&phrase)) && phrase != nullptr) {
+                            // SAPI's rule confidence is low (-1), normal (0), high (1).
+                            state.confidence = std::clamp(
+                                (static_cast<double>(phrase->Rule.Confidence) + 1.0) / 2.0,
+                                0.0, 1.0);
+                        }
+                        CoTaskMemFree(phrase);
+                        result->Release();
+                    }
+                    state.finished = true;
                     break;
                 }
-                const std::string text = toUtf8(payload->phrase);
-                if (text.empty()) {
+                case SPEI_FALSE_RECOGNITION:
+                    state.phrase.clear();
+                    state.finished = true;
+                    break;
+                default:
                     break;
                 }
-                // The engine revises a phrase while the speaker is still
-                // talking, so the latest one wins and only the last is ever
-                // delivered. This adapter reports a finished phrase, not the
-                // words so far; ListenSession already treats partial text as
-                // optional.
-                state.phrase = text;
-                // SAPI reports confidence on a 0..1000 scale and the interface
-                // promises [0, 1], so it is converted rather than reported raw.
-                state.confidence = static_cast<double>(payload->confidence) / 1000.0;
-                break;
             }
-            case SPEI_END_SR_STREAM:
-                // The engine closed the phrase: the speaker stopped and it
-                // decided that was the end. This is the normal exit.
-                state.finished = true;
-                break;
-            default:
-                break;
-            }
+            clearEvent(event);
         }
     }
 
-    // Dependency order, not creation order. The context is created from the
-    // recognizer and holds the reference to the audio device, so it is released
-    // first; releasing the recognizer underneath a live context is the mistake
-    // that leaves a dangling engine reference behind. Interest is turned off
-    // before any of it, so nothing is delivered into an object that is on its
-    // way out.
-    static void releaseAudio(ISpRecoContext* context, ISpRecognizer* recognizer) {
+    // Deactivate and release the grammar, then the context, then its recognizer.
+    // Each COM object is released on the worker that created it.
+    static void releaseAudio(ISpRecoGrammar* grammar, ISpRecoContext* context,
+                             ISpRecognizer* recognizer) {
+        if (grammar != nullptr) {
+            grammar->SetDictationState(SPRS_INACTIVE);
+            grammar->Release();
+        }
         if (context != nullptr) {
             context->SetInterest(0, 0);
             context->Release();
@@ -521,34 +520,6 @@ private:
         }
     }
 
-    // Copies the callback out and clears the member before invoking it, so a
-    // callback that stops the recognizer cannot leave a second invocation
-    // pointing at an empty std::function.
-    void deliverResult(const RecognitionResult& result) {
-        ResultCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            callback = m_onResult;
-            m_onResult = {};
-        }
-        if (callback) {
-            callback(result);
-        }
-    }
-
-    /// Clears the stored end callback under lock and invokes its copy outside the lock.
-    void deliverEnd(RecognitionEnd reason, const std::string& detail) {
-        EndCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            callback = m_onEnd;
-            m_onEnd = {};
-        }
-        if (callback) {
-            callback(reason, detail);
-        }
-    }
-
     unsigned m_devices = 0;
     bool m_available = false;
     HANDLE m_wake = nullptr;
@@ -560,6 +531,7 @@ private:
     std::atomic<bool> m_listening{false};
     std::atomic<bool> m_shuttingDown{false};
     std::mutex m_mutex;
+    unsigned m_callbackGeneration = 0;
     ResultCallback m_onResult;
     EndCallback m_onEnd;
 };

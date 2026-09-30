@@ -31,11 +31,11 @@ struct IdleToolDeclaration {
     std::string name;
     std::string summary;
     std::vector<ToolPermission> permissions;
-    // False unless a tool opts in. A tool that touches the conversation or the
-    // model has to be asked for, even though it is local and harmless, because
+    // Live state, set only by the registry after the user opts in. A tool that
+    // touches the conversation or the model has to be asked for, even though it is local and harmless, because
     // "local and harmless" is a judgement the user should make rather than one
     // the code makes on their behalf.
-    bool enabledByDefault = false;
+    bool enabled = false;
 };
 
 // The registry of tools the idle loop may ask for.

@@ -19,13 +19,10 @@ namespace {
 // hang, and clamping keeps one odd plan from stalling the whole response.
 constexpr int kMaxPauseMs = 1200;
 
-// QTextToSpeech expresses pitch on a -50..50 scale while the core voice
-// persona counts semitones. Four per semitone puts the useful range of about
-// an octave at either end of the scale, and stops short of the point where it
-// stops sounding like a person and starts sounding broken.
-constexpr float kPitchPerSemitone = 4.0F;
-
 #if KESTREL_HAS_TEXT_TO_SPEECH
+
+// Map an octave in either direction onto Qt's normalized pitch range.
+constexpr double kPitchPerSemitone = 1.0 / 12.0;
 
 // Choosing which voice to speak with.
 //
@@ -71,16 +68,13 @@ bool soundsStrained(const QVoice& voice) {
         || name.contains(QStringLiteral("babble"));
 }
 
-/// Ranks neural-sounding voices first, then language matches and unstrained voices.
+/// Ranks language matches first, then neural-sounding and unstrained voices.
 int scoreVoice(const QVoice& voice, const QLocale& preferred) {
-    if (soundsLikeNeuralVoice(voice.name())) {
-        return 100;
-    }
-    int score = 0;
+    int score = soundsLikeNeuralVoice(voice.name()) ? 30 : 0;
     // A voice the user can actually understand matters more than one that merely
     // exists, so the language match is checked before the niceness of the name.
     if (voice.locale().language() == preferred.language()) {
-        score += 40;
+        score += 100;
     }
     if (!soundsStrained(voice)) {
         score += 20;
@@ -140,8 +134,8 @@ public:
         // mood, the same mapping would make the assistant audibly pump quieter
         // and louder as it got thoughtful. Volume is left alone and warmth is
         // left to an engine that can express it as pace.
-        m_voice.setRate(static_cast<double>(persona.rate));
-        m_voice.setPitch(static_cast<double>(persona.pitch) * kPitchPerSemitone);
+        m_voice.setRate(std::clamp(static_cast<double>(persona.rate) - 1.0, -1.0, 1.0));
+        m_voice.setPitch(std::clamp(static_cast<double>(persona.pitch) * kPitchPerSemitone, -1.0, 1.0));
     }
 
     /// Hands an utterance to Qt's platform text-to-speech engine.

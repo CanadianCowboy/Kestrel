@@ -369,6 +369,7 @@ signals:
     void listeningChanged();
 
 private:
+    friend struct AppControllerTestAccess;
     // Worker callbacks, delivered on the UI thread by queued connections.
     void onGenerationToken(quint64 requestId, const QString& token);
     void onGenerationFinished(quint64 requestId, bool success, const QString& error);
@@ -534,6 +535,9 @@ private:
     // the prewarm id so a backend swap can tell "busy answering someone" from
     // "busy thinking on its own".
     quint64 m_toolRequestId = 0;
+    QString m_toolOutput;
+    int m_toolConversationId = 0;
+    bool m_toolCancelled = false;
     // Why the last idle tool did not run, shown in place of the task detail. A
     // tool that is refused without saying so is a tool the user cannot debug.
     QString m_idleToolNotice;

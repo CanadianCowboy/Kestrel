@@ -160,7 +160,11 @@ AppController::AppController(QObject* parent)
     // fatal: asking for an engine that is not installed should leave the app
     // with the voice it can actually speak, not with no voice at all.
     const QString requested = qEnvironmentVariable("KESTREL_VOICE_ENGINE");
-    m_speechEngine = (!requested.isEmpty() && m_localVoices->create(requested) != nullptr)
+    const auto engines = m_localVoices->engines();
+    const bool known = std::any_of(engines.begin(), engines.end(), [&requested](const auto& engine) {
+        return engine.id == requested;
+    });
+    m_speechEngine = (!requested.isEmpty() && known)
                          ? requested
                          : m_localVoices->defaultEngineId();
     if (!m_speechEngine.isEmpty()) {
@@ -260,7 +264,9 @@ bool AppController::listening() const noexcept {
 
 /// Returns whether the selected speech recognizer is available.
 bool AppController::sttAvailable() const noexcept {
-    return m_recognizer != nullptr && m_recognizer->available();
+    return m_recognizer != nullptr
+        && dynamic_cast<runtime::MockSpeechRecognizer*>(m_recognizer.get()) == nullptr
+        && m_recognizer->available();
 }
 
 /// Returns the recognizer's availability detail, or an empty string if absent.
@@ -301,6 +307,7 @@ AppController::~AppController() {
     // a tick arriving during teardown would call into a half-destroyed
     // controller.
     m_idleTimer.stop();
+    m_recognizer.reset();
     // Order matters: cancel so a blocked generate() returns, then stop the event
     // loop, then wait. Only once the thread is idle is it safe to destroy an
     // object whose affinity was that thread.
@@ -554,16 +561,15 @@ QVariantList AppController::speechEngines() const {
     return m_localVoices != nullptr ? m_localVoices->describe() : QVariantList();
 }
 
-/// Adopts a usable local engine; returns false for unchanged, unknown, or unusable choices.
+/// Adopts a present local engine, allowing its model to finish loading asynchronously.
 bool AppController::setSpeechEngine(const QString& engineId) {
     if (m_localVoices == nullptr || engineId == m_speechEngine) {
         return false;
     }
     std::unique_ptr<SpeechBackend> backend = m_localVoices->create(engineId);
-    if (backend == nullptr || !backend->usable()) {
-        // Refused rather than swapped in and failed later: an engine that cannot
-        // start would leave the app with no voice at all, which is worse than
-        // staying on the one that works.
+    if (backend == nullptr) {
+        // Unknown engines have no backend. A known engine may still be loading;
+        // its availability signals report readiness or failure asynchronously.
         return false;
     }
     m_speechEngine = engineId;
@@ -590,6 +596,12 @@ QString AppController::idleTaskLabel() const {
     if (m_idleTaskKind.isEmpty()) {
         return {};
     }
+    // A tool that was refused is reported instead of the task that wanted to
+    // run it. The task happened either way, but the part the user is being
+    // asked about is why nothing came of it.
+    if (!m_idleToolNotice.isEmpty()) {
+        return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleToolNotice);
+    }
     // A detail is private to the extent the thought beside it is. When thoughts
     // are hidden, the detail goes with them, and that has to be decided here
     // rather than when the task ran or the detail would outlive the setting.
@@ -598,12 +610,6 @@ QString AppController::idleTaskLabel() const {
     }
     if (!m_showIdleThoughts && !m_ambientThought.isEmpty()) {
         return m_idleTaskKind;
-    }
-    // A tool that was refused is reported instead of the task that wanted to
-    // run it. The task happened either way, but the part the user is being
-    // asked about is why nothing came of it.
-    if (!m_idleToolNotice.isEmpty()) {
-        return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleToolNotice);
     }
     return QStringLiteral("%1 \u00b7 %2").arg(m_idleTaskKind, m_idleTaskDetail);
 }
@@ -735,7 +741,11 @@ void AppController::pumpNextSegment() {
     // holding the text makes it sound like a person pausing to think rather than
     // a program waiting on a file.
     if (const auto ahead = m_voice.peekSpeechSegment(m_activeResponse); ahead.has_value()) {
-        m_speech->prefetch(QString::fromStdString(ahead->text));
+        const auto* response = m_voice.find(m_activeResponse);
+        if (response != nullptr && (response->generationComplete()
+            || ahead->endOffset < response->generatedText().size())) {
+            m_speech->prefetch(QString::fromStdString(ahead->text));
+        }
     }
 }
 
@@ -805,7 +815,6 @@ void AppController::onOwedAudioReleased(bool voiceGaveUp) {
     // stops here is the promise of audio for them.
     m_voice.complete(m_activeResponse);
     noteAssistant(core::AssistantAction::Waiting);
-    anticipateForDelivery();
     emit voiceChanged();
 }
 
@@ -975,7 +984,7 @@ void AppController::setBackendForTesting(std::unique_ptr<runtime::ModelBackend> 
         return;
     }
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating || m_warmupRequestId != 0) {
+    if (m_generating || m_warmupRequestId != 0 || m_toolRequestId != 0) {
         return;
     }
     m_backend = std::move(backend);
@@ -1081,7 +1090,7 @@ void AppController::loadModelFromUrl(const QString& url) {
         m_modelLoadThread->wait();
         if (!m_discardModelLoad && result->error.isEmpty()) {
             waitForIdleGeneration(kBackendSwapTimeoutMs);
-            if (m_generating || m_warmupRequestId != 0) {
+            if (m_generating || m_warmupRequestId != 0 || m_toolRequestId != 0) {
                 result->error = tr("A response is still running. Stop it and try again.");
             }
         }
@@ -1114,7 +1123,7 @@ void AppController::loadModelFromUrl(const QString& url) {
 void AppController::usePreviewBackend() {
     m_discardModelLoad = true;
     waitForIdleGeneration(kBackendSwapTimeoutMs);
-    if (m_generating || m_warmupRequestId != 0) {
+    if (m_generating || m_warmupRequestId != 0 || m_toolRequestId != 0) {
         m_modelError = tr("A response is still running. Stop it and try again.");
         emit modelErrorChanged();
         return;
@@ -1132,19 +1141,20 @@ void AppController::usePreviewBackend() {
 }
 
 /// Requests cancellation and pumps a nested event loop for at most timeoutMs.
-/// Callers must check generation and warmup afterwards before replacing the backend.
+/// Callers must check reply, warmup, and tool requests before replacing the backend.
 void AppController::waitForIdleGeneration(int timeoutMs) {
-    if (!m_generating && m_warmupRequestId == 0) {
+    if (!m_generating && m_warmupRequestId == 0 && m_toolRequestId == 0) {
         return;
     }
+    m_toolCancelled = m_toolRequestId != 0;
     stopGeneration();
-    if (m_warmupRequestId != 0) {
+    if (m_warmupRequestId != 0 || m_toolRequestId != 0) {
         m_worker->cancel();
     }
     QEventLoop loop;
     const QMetaObject::Connection done =
         connect(this, &AppController::generatingChanged, &loop, [&loop, this] {
-        if (!m_generating && m_warmupRequestId == 0) {
+        if (!m_generating && m_warmupRequestId == 0 && m_toolRequestId == 0) {
             loop.quit();
         }
     });
@@ -1219,9 +1229,17 @@ void AppController::runIdleToolIfPermitted() {
         const core::ToolRunResult outcome = core::runIdleTool(
             m_idleTools, core::kIndexThreadsTool, entry->conversation.messages());
         if (outcome.ran) {
-            m_messageModel->appendMessage(core::MessageRole::Tool,
-                                          QString::fromStdString(outcome.summary),
-                                          MessageStatus::Complete);
+            m_idleToolNotice.clear();
+            const auto& messages = entry->conversation.messages();
+            const bool repeated = std::any_of(messages.begin(), messages.end(),
+                [&outcome](const auto& message) {
+                    return message.role == core::MessageRole::Tool && message.content == outcome.summary;
+                });
+            if (!repeated) {
+                m_messageModel->appendMessage(core::MessageRole::Tool,
+                                             QString::fromStdString(outcome.summary),
+                                             MessageStatus::Complete);
+            }
         } else {
             m_idleToolNotice = QString::fromStdString(outcome.summary);
         }
@@ -1242,17 +1260,34 @@ void AppController::runIdleToolIfPermitted() {
     emit presenceChanged();
 }
 
-/// Queues a token-limited summary of truncated conversation text; the caller checks permission.
+/// Checks tool permission and queues one token-limited summary per conversation.
 void AppController::startSessionSummary() {
     const ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
         return;
     }
+    if (entry->summarised) {
+        return;
+    }
+    const auto outcome = core::runIdleTool(m_idleTools, core::kSummariseSessionTool,
+                                           entry->conversation.messages());
+    if (!outcome.ran) {
+        m_idleToolNotice = QString::fromStdString(outcome.summary);
+        emit presenceChanged();
+        return;
+    }
+    m_idleToolNotice.clear();
+    m_toolOutput.clear();
+    m_toolConversationId = entry->id;
+    m_toolCancelled = false;
     // The material goes in the prompt rather than into the system prompt, so a
     // background summary cannot quietly change how every later reply is
     // answered.
     QString material;
     for (const core::Message& message : entry->conversation.messages()) {
+        if (message.role != core::MessageRole::User && message.role != core::MessageRole::Assistant) {
+            continue;
+        }
         const QString prefix = message.role == core::MessageRole::User
             ? QStringLiteral("User: ")
             : QStringLiteral("Kestrel: ");
@@ -1278,7 +1313,7 @@ void AppController::onIdleTick() {
     // A live response owns the timeline, and an in-flight prewarm owns the
     // worker. Either one means there is no thinking space to be had.
     gate.voiceActive = m_voice.activeResponseId() != core::kInvalidResponseId
-                       || m_warmupRequestId != 0;
+                       || m_warmupRequestId != 0 || m_toolRequestId != 0;
     gate.userInputPending = m_inputPending;
     m_idle.setGate(gate);
     m_idle.setTopic(m_persona.sessionTopic());
@@ -1315,7 +1350,7 @@ void AppController::onIdleTick() {
     // worker is free. Its tokens are discarded: the point is warm caches, not
     // something said.
     if (tick.produced && tick.task.kind == core::IdleTaskKind::ModelWarmup
-        && m_warmupRequestId == 0 && runtimeAvailable() && !m_generating) {
+        && m_warmupRequestId == 0 && m_toolRequestId == 0 && runtimeAvailable() && !m_generating) {
         m_warmupRequestId = m_nextRequestId++;
         m_worker->start(m_warmupRequestId, kWarmupPrompt, 0.1F, kWarmupMaxTokens);
     }
@@ -1362,6 +1397,12 @@ void AppController::publishMetrics() {
 }
 
 void AppController::onGenerationToken(quint64 requestId, const QString& token) {
+    if (requestId == m_toolRequestId) {
+        if (!m_toolCancelled) {
+            m_toolOutput += token;
+        }
+        return;
+    }
     if (requestId != m_activeRequestId || m_userPaused || m_userStopped) {
         return;
     }
@@ -1405,15 +1446,20 @@ void AppController::onGenerationFinished(quint64 requestId,
         // user was away -- and then released, so the worker is free for the
         // next real question.
         m_toolRequestId = 0;
-        const int lastRow = m_messageModel->rowCount() - 1;
-        const QString said = success && lastRow >= 0
-            ? m_messageModel->data(m_messageModel->index(lastRow, 0),
-                                   MessageModel::ContentRole).toString()
-            : QString();
-        m_messageModel->setLastMessageStatus(MessageStatus::Complete, {});
-        if (!said.trimmed().isEmpty()) {
-            m_idleToolNotice = tr("Summarised the session.");
-        } else {
+        const QString said = m_toolOutput.trimmed();
+        m_toolOutput.clear();
+        if (!m_toolCancelled && success && !said.isEmpty()) {
+            if (auto* entry = findEntry(m_toolConversationId)) {
+                entry->summarised = true;
+                if (entry->id == m_activeId) {
+                    m_messageModel->appendMessage(core::MessageRole::Tool, said, MessageStatus::Complete);
+                } else {
+                    entry->conversation.addMessage(core::MessageRole::Tool, said.toStdString());
+                    entry->extras.push_back({MessageStatus::Complete, {}});
+                }
+            }
+            m_idleToolNotice.clear();
+        } else if (!m_toolCancelled) {
             m_idleToolNotice = error.isEmpty()
                 ? tr("The session summary came back empty.")
                 : tr("Session summary failed: %1").arg(error);
@@ -1582,6 +1628,17 @@ void AppController::sendMessage(const QString& text) {
     ConversationEntry* entry = activeEntry();
     if (entry == nullptr) {
         return;
+    }
+
+    if (m_toolRequestId != 0) {
+        waitForIdleGeneration(kBackendSwapTimeoutMs);
+        if (m_toolRequestId != 0) {
+            return;
+        }
+        entry = activeEntry();
+        if (entry == nullptr) {
+            return;
+        }
     }
 
     if (m_generating || m_speaking) {
@@ -1926,7 +1983,7 @@ void AppController::setActiveConversation(int id) {
 // reintroduces exactly the stall this exists to remove, since the backend's
 // accessors take the lock generate() is holding.
 void AppController::refreshCachedRuntime() {
-    if (m_generating || m_warmupRequestId != 0) {
+    if (m_generating || m_warmupRequestId != 0 || m_toolRequestId != 0) {
         return;
     }
     m_cachedStatus = m_backend->status();

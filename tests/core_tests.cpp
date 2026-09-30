@@ -734,7 +734,33 @@ void testIdleStopsWhenDisabled() {
 
 // --- Idle tool registry ------------------------------------------------------
 
-/// Builds a disabled test tool requiring conversation-read and generation permissions.
+/// Checks the shipped declarations and execution boundary with real permissions.
+void testShippedIdleToolsEnforcePermissions() {
+    const auto declaration = core::indexThreadsDeclaration();
+    assert(declaration.permissions == std::vector{core::ToolPermission::ReadConversations});
+    core::IdleToolRegistry registry;
+    auto incoming = declaration;
+    incoming.enabled = true;
+    registry.declare(incoming);
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    assert(!core::runIdleTool(registry, core::kIndexThreadsTool, {}).ran);
+    registry.setEnabled(core::kIndexThreadsTool, true);
+    registry.grant(core::ToolPermission::ReadConversations, false);
+    assert(!core::runIdleTool(registry, core::kIndexThreadsTool, {}).ran);
+    registry.grant(core::ToolPermission::ReadConversations, true);
+    assert(core::runIdleTool(registry, core::kIndexThreadsTool,
+                            {{core::MessageRole::User, "testing shipped indexing"}}).ran);
+    registry.declare(incoming);
+    assert(!registry.enabled(core::kIndexThreadsTool));
+
+    registry.declare(core::summariseSessionDeclaration());
+    registry.setEnabled(core::kSummariseSessionTool, true);
+    assert(!core::runIdleTool(registry, core::kSummariseSessionTool, {}).ran);
+    registry.grant(core::ToolPermission::RunGeneration, true);
+    assert(core::runIdleTool(registry, core::kSummariseSessionTool, {}).ran);
+}
+
+/// Builds a synthetic tool requiring conversation-read and generation permissions.
 core::IdleToolDeclaration indexingTool() {
     core::IdleToolDeclaration declaration;
     declaration.name = "index recent threads";
@@ -1158,6 +1184,7 @@ int main() {
     testUndeclaredToolIsRefused();
     testDeclaredToolIsRefusedUntilEnabled();
     testMissingPermissionIsNamed();
+    testShippedIdleToolsEnforcePermissions();
     testNothingIsGrantedByDefault();
     testReplacedToolMustBeAgreedAgain();
     testPresenceTracksMeaning();
