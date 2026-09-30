@@ -228,7 +228,7 @@ The distribution packages cover the core build; the desktop target needs
 versions Ubuntu does not currently ship, so the two are listed separately.
 
 ```bash
-sudo apt-get install -y build-essential ninja-build git python3-pip
+sudo apt-get install -y build-essential ninja-build git pipx
 ```
 
 For the core, tests, and the engine-build tool, any CMake 3.24 or newer:
@@ -237,8 +237,22 @@ For the core, tests, and the engine-build tool, any CMake 3.24 or newer:
 sudo apt-get install -y cmake       # 3.28 on Ubuntu 24.04
 ```
 
-Ubuntu 22.04 ships CMake 3.22, which is below the minimum. `pip install cmake`
-or Kitware's APT repository fixes that; nothing else in the core build needs
+Ubuntu 22.04 ships CMake 3.22, which is below the minimum, so upgrade it from
+Kitware's own APT repository:
+
+```bash
+sudo apt-get install -y ca-certificates gpg wget
+wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
+  | gpg --dearmor - \
+  | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] \
+  https://apt.kitware.com/ubuntu/ jammy main' \
+  | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+sudo apt-get update
+sudo apt-get install cmake
+```
+
+Substitute `noble` for `jammy` on 24.04. Nothing else in the core build needs
 changing.
 
 For the desktop application, Qt 6.6 or newer. No Ubuntu release ships it: 22.04
@@ -246,9 +260,16 @@ has 6.2.4 and 24.04 has 6.4.2, so `apt install qt6-base-dev` will not do. Get it
 from qt.io or install the same build the CI uses:
 
 ```bash
-pip install --user aqtinstall
-~/.local/bin/aqt install-qt linux desktop 6.9.0 gcc_64 -O "$HOME/Qt"
+pipx install aqtinstall
+aqt install-qt linux desktop 6.9.0 gcc_64 -O "$HOME/Qt"
 ```
+
+`pipx`, not `pip install --user`: Ubuntu 23.10 and newer mark the system Python
+as externally managed, so pip refuses to install into it and aborts with
+`error: externally-managed-environment` before aqtinstall is ever downloaded.
+`pipx` keeps the tool in its own environment and links `aqt` into
+`~/.local/bin`; run `pipx ensurepath` once if that directory is not already on
+your `PATH`.
 
 That provides Qt Core, Qt Quick, and Qt Quick Controls 2. Without a Qt 6.6 or
 newer prefix, CMake skips the desktop target and builds the core and its tests,
