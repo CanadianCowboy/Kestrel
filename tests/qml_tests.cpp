@@ -19,6 +19,8 @@
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
 
+#include "ui/layoutaudit.h"
+
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -365,6 +367,146 @@ void testMessagePropertiesAreRequired() {
     }
 }
 
+/// A layout cell that loses its height is the failure this file could not see.
+///
+/// Every check above measures one item: this bubble's width, that row's
+/// height. A cell that has been given *no* height at all still measures fine
+/// on its own -- zero is a number, and zero is what the layout handed it. What
+/// is wrong is the relationship between it and its neighbour, and no
+/// single-item assertion looks at that. The diagnostics panel shipped three
+/// switches stacked on each other for exactly this reason, and this file was
+/// green throughout.
+///
+/// So the probe below is the shipped switch, reproduced exactly: a RowLayout
+/// whose only sized child is a plain Item wrapping the hit target, with the
+/// label inside that. Stated `implicitHeight` it lays out; without it, the
+/// layout has nothing to take a height from and the row collapses to nothing
+/// while the label still draws. The two panels differ by that one line, which
+/// is the whole claim: the audit can tell them apart.
+void testCollapsedLayoutCellIsFound() {
+    std::cout << "a layout cell with no height is found, and a healthy one is not reported\n";
+
+    const QString probe = QStringLiteral(R"QML(
+import QtQuick
+import QtQuick.Layouts
+
+Item {
+    id: root
+    width: 420
+    height: 420
+
+    // The one line that separates the two panels. Absent, a RowLayout with a
+    // single plain-Item child has nothing to take an implicit height from,
+    // which is precisely what shipped.
+    property bool rowsHaveHeight: true
+
+    component Switch: RowLayout {
+        required property string label
+        Layout.fillWidth: true
+        implicitHeight: root.rowsHaveHeight ? 18 : 0
+
+        // A hit target around the whole row, so the label is what you click.
+        Item {
+            Layout.fillWidth: true
+            Rectangle {
+                objectName: "dot"
+                width: 14; height: 14
+                anchors.verticalCenter: parent.verticalCenter
+                color: "#4d5a68"
+            }
+            Text {
+                objectName: "label"
+                text: parent.label
+                anchors.verticalCenter: parent.verticalCenter
+                font.pixelSize: 11
+            }
+            MouseArea { anchors.fill: parent }
+        }
+    }
+
+    ColumnLayout {
+        objectName: "column"
+        anchors.fill: parent
+        spacing: 6
+
+        Switch { objectName: "idleLoop";  label: "Idle loop" }
+        Switch { objectName: "gpuPrewarm"; label: "GPU prewarm" }
+        Switch { objectName: "thoughts";   label: "Show thoughts" }
+    }
+}
+)QML");
+
+    const QString path = QStringLiteral(KESTREL_UI_DIR "/layoutprobe.qml");
+    {
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            std::cout << "  FAIL cannot write the layout probe: " << file.errorString().toStdString()
+                      << "\n";
+            ++g_failures;
+            return;
+        }
+        file.write(probe.toUtf8());
+    }
+
+    static QQuickWindow* window = new QQuickWindow();
+    window->resize(420, 420);
+
+    // Instantiated twice from the same file, so the two panels are the same
+    // document differing only in the property under test.
+    const auto problemsFor = [&](bool rowsHaveHeight) {
+        QQmlEngine probe;
+        probe.addImportPath(QStringLiteral(KESTREL_UI_DIR));
+        QQmlComponent component(&probe);
+        component.loadUrl(QUrl::fromLocalFile(path));
+        if (component.isError()) {
+            std::cout << "  FAIL cannot load the layout probe: "
+                      << component.errorString().toStdString() << "\n";
+            ++g_failures;
+            return QVector<kestrel::ui::LayoutProblem>{};
+        }
+        std::unique_ptr<QObject> scene(component.create());
+        auto* sceneItem = qobject_cast<QQuickItem*>(scene.get());
+        if (sceneItem == nullptr) {
+            std::cout << "  FAIL the layout probe is not an Item\n";
+            ++g_failures;
+            return QVector<kestrel::ui::LayoutProblem>{};
+        }
+        sceneItem->setProperty("rowsHaveHeight", rowsHaveHeight);
+        sceneItem->setParentItem(window->contentItem());
+        window->show();
+        QCoreApplication::processEvents();
+        sceneItem->polish();
+        QCoreApplication::processEvents();
+        const auto found = kestrel::ui::auditLayouts(sceneItem);
+        sceneItem->setParentItem(nullptr);
+        return found;
+    };
+
+    const QVector<kestrel::ui::LayoutProblem> healthy = problemsFor(true);
+    const QVector<kestrel::ui::LayoutProblem> collapsed = problemsFor(false);
+
+    if (healthy.isEmpty()) {
+        std::cout << "  ok   the panel with a stated height reports nothing\n";
+    } else {
+        std::cout << "  FAIL the healthy panel reported " << healthy.size() << " problem(s); first is "
+                  << healthy.first().where.toStdString() << ": "
+                  << healthy.first().what.toStdString() << "\n";
+        ++g_failures;
+    }
+
+    // Three switches, three cells, three problems. The count is the point: a
+    // checker that finds one and misses the other two has not been shown to
+    // work, it has been shown to work once.
+    check(collapsed.size() == 3, "the collapsed panel reports all three switches (reported "
+                                     + std::to_string(collapsed.size()) + ")");
+    for (const auto& problem : collapsed) {
+        std::cout << "       " << problem.where.toStdString() << ": " << problem.what.toStdString()
+                  << "\n";
+    }
+    check(!collapsed.isEmpty() && collapsed.first().what.contains(QStringLiteral("cell is")),
+          "the report names a cell, not something else in the tree");
+}
+
 }  // namespace
 
 /// Runs the QML geometry tests; returns nonzero if any check fails.
@@ -388,6 +530,7 @@ int main(int argc, char** argv) {
     testUnbreakableTextIsNotClipped(engine);
     testListViewGivesRowsRealHeight(engine);
     testMessagePropertiesAreRequired();
+    testCollapsedLayoutCellIsFound();
 
     if (g_failures == 0) {
         std::cout << "qml geometry tests passed\n";

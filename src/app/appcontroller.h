@@ -332,6 +332,20 @@ public:
     /// speak in URLs and converting here is far more reliable than string
     /// surgery on the percent-encoded form.
     Q_INVOKABLE void loadModelFromUrl(const QString& url);
+    /// Tries each path in turn and keeps the first that loads, publishing
+    /// modelLoadFinished exactly once, when the sequence has finished.
+    ///
+    /// The sequence lives here rather than in main because it is a property of
+    /// loading a model, not of the entry point that started it. Wiring it as a
+    /// second observer of modelLoadFinished -- which is what it was -- makes it
+    /// race every other observer: queued connections run in the order they were
+    /// made, so a --print-runtime that exits on the first completion never got
+    /// as far as trying the second candidate, and neither did the smoke test.
+    /// The fallback existed and had never once run.
+    ///
+    /// One signal, one meaning: whoever is listening hears the outcome of the
+    /// whole sequence rather than of whichever attempt happened to finish.
+    void loadModelFromUrls(const QStringList& urls);
     /// Goes back to the built-in preview backend, so a user who loaded the
     /// wrong file is not stuck with it.
     Q_INVOKABLE void usePreviewBackend();
@@ -491,6 +505,13 @@ private:
     // work, stop the loop, wait for it, and only then destroy the worker.
     QThread m_generationThread;
     std::unique_ptr<QThread> m_modelLoadThread;
+    // Candidates still to try, most promising first, and the ones already
+    // refused. The second list exists so the final error can say which paths
+    // were tried and what each of them said, which is the difference between
+    // "your model is broken" and "the 4B model is broken but there is a 0.5B
+    // one beside it that works".
+    QStringList m_modelQueue;
+    QStringList m_modelAttempts;
     bool m_discardModelLoad = false;
     GenerationWorker* m_worker = nullptr;
 

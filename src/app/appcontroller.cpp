@@ -1021,10 +1021,20 @@ QString AppController::modelError() const {
 
 /// Loads a candidate off the UI thread, then installs it through a queued signal.
 /// Keeps the current backend on validation/load failure or if generation remains active.
+void AppController::loadModelFromUrls(const QStringList& urls) {
+    m_modelQueue = urls;
+    m_modelAttempts.clear();
+    if (m_modelQueue.isEmpty()) {
+        return;
+    }
+    loadModelFromUrl(m_modelQueue.takeFirst());
+}
+
 void AppController::loadModelFromUrl(const QString& url) {
     if (m_modelLoadThread) {
         return;
     }
+    m_modelAttempts.append(QUrl(url).toLocalFile());
     struct LoadResult {
         QString path;
         QString error;
@@ -1117,6 +1127,28 @@ void AppController::loadModelFromUrl(const QString& url) {
             emit modelErrorChanged();
         }
         m_modelLoadThread.reset();
+        // A failure here is only the end of the sequence when there is nothing
+        // left to try. Otherwise the next candidate starts here, before the
+        // signal, so that everything listening for modelLoadFinished hears the
+        // outcome of the whole attempt rather than of the first one to end.
+        //
+        // Emitting first and retrying from a connection is the shape this
+        // replaced, and it was wrong for a reason worth writing down: queued
+        // connections are delivered in the order they were connected, so a
+        // --print-runtime or a smoke test already waiting on that signal ran,
+        // concluded, and exited before the retry was ever delivered. The
+        // fallback was in the code and had never run.
+        if (!m_modelError.isEmpty() && !m_modelQueue.isEmpty()) {
+            m_modelError.clear();
+            loadModelFromUrl(m_modelQueue.takeFirst());
+            return;
+        }
+        if (!m_modelError.isEmpty() && m_modelAttempts.size() > 1) {
+            m_modelError = tr("No model could be loaded. Tried %n candidate(s), "
+                              "and the last one said: %1",
+                              nullptr, static_cast<int>(m_modelAttempts.size()))
+                               .arg(m_modelError);
+        }
         emit modelLoadFinished();
     }, Qt::QueuedConnection);
     m_modelLoadThread->start();

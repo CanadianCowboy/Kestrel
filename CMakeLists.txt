@@ -194,6 +194,8 @@ add_library(kestrel_core
     src/runtime/cudadevice.h
     src/runtime/modelbackend.cpp
     src/runtime/modelbackend.h
+    src/runtime/modeldiscovery.cpp
+    src/runtime/modeldiscovery.h
     src/runtime/speechrecognizer.h
     src/runtime/speechrecognizer.cpp
     src/runtime/sapirecognizer.h
@@ -594,6 +596,13 @@ if(KESTREL_BUILD_UI)
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
+            # The layout audit is compiled into the app as well as into
+            # kestrel_qml_tests: the test asserts the detector works, and the app
+            # runs it over the real window. It links no kestrel_core -- it is Qt
+            # Quick and nothing else, which is what lets the test target stay a
+            # pure-Qt one.
+            src/ui/layoutaudit.cpp
+            src/ui/layoutaudit.h
             src/app/generationworker.cpp
             src/app/generationworker.h
     src/app/speechsynthesizer.cpp
@@ -712,9 +721,15 @@ if(KESTREL_BUILD_UI)
             # than a screenshot nobody compares against last week.
             add_executable(kestrel_qml_tests
                 tests/qml_tests.cpp
+                src/ui/layoutaudit.cpp
+                src/ui/layoutaudit.h
             )
             set_target_properties(kestrel_qml_tests PROPERTIES AUTOMOC ON)
             target_link_libraries(kestrel_qml_tests PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+            # src, so layoutaudit.h is reached as "ui/layoutaudit.h" exactly as
+            # the app reaches it. Deliberately not kestrel_core: this target
+            # links no runtime and therefore needs no model beside it.
+            target_include_directories(kestrel_qml_tests PRIVATE src)
             # The test loads the component from source rather than from the
             # app's compiled QML module, so it needs the directory itself.
             target_compile_definitions(kestrel_qml_tests PRIVATE

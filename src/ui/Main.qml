@@ -37,6 +37,17 @@ ApplicationWindow {
         property bool checked: false
         signal toggled()
         Layout.fillWidth: true
+        // Height, and it has to be stated rather than inherited.
+        //
+        // The outer RowLayout had exactly one fixed-size child, the 14 pixel
+        // indicator, and that is where its height came from. Moving the
+        // indicator inside the hit target -- which is what makes the whole row
+        // clickable -- left the layout with one child, a plain Item, whose
+        // implicitHeight is zero. Every toggle in the panel then collapsed to
+        // no height and its label drew on top of its neighbour's, and the
+        // screenshot check could not see it because it looks for black bands
+        // and this is text on text.
+        implicitHeight: 18
         activeFocusOnTab: true
         Keys.onSpacePressed: function(event) {
             toggle.toggled()

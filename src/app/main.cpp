@@ -18,7 +18,10 @@
 #include <utility>
 
 #include "app/appcontroller.h"
+#include "core/pathtext.h"
 #include "runtime/backendregistry.h"
+#include "runtime/modeldiscovery.h"
+#include "ui/layoutaudit.h"
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -95,123 +98,41 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
     return value.startsWith(QStringLiteral("--")) ? QString() : value;
 }
 
-// The model to load when nobody named one on the command line.
+// The models this launch will try, in order, as URLs the controller can load.
 //
-// A model used to be reachable only through --model, so an ordinary launch --
-// double-clicked from Explorer, started from the desktop shortcut -- had no
-// model at all. Every real backend then reported itself unavailable and the
-// registry handed the conversation to the mock, which is why the app talked in
-// canned lines by default and why a real model had to be passed on the command
-// line to see one working. A launcher with no way to reach the point of the
-// product is the defect, not the missing flag.
+// The ranking and the rules about what counts as a candidate live in
+// runtime::discoverModels, beside backendregistry and for the same reason:
+// they are decisions about the filesystem rather than about how this program
+// starts, and a rule that can only be reached from a GUI entry point cannot be
+// tested. What is left here is the part that is genuinely this file's -- two
+// sources, in order.
 //
-// Two sources, in order:
-//
-//   1. KESTREL_MODEL, for a model kept anywhere on the machine. This is what
-//      a developer sets, because build trees and model stores are separate.
-//   2. A `models` directory beside the executable. This is what the packaged
+//   1. KESTREL_MODEL, for a model kept anywhere on the machine. This is what a
+//      developer sets, because build trees and model stores are separate.
+//   2. A "models" directory beside the executable. This is what the packaged
 //      app uses, and it is why the packager ships that directory: dropping a
 //      model in it is the whole installation step.
 //
-// Two layouts are recognised, because Kestrel has two real backends reading two
-// model formats:
-//
-//   * a .gguf file, for llama.cpp;
-//   * a *directory* holding genai_config.json, for ONNX Runtime GenAI. A GenAI
-//     model is a config plus one or more ONNX graphs plus external data, so it
-//     is a folder rather than a file, and requiring a .gguf here would have
-//     made the ONNX backend unreachable from a plain launch -- the same class of
-//     defect as the one this function was written to fix.
-//
-// Among candidates the largest is tried first. A quantisation of the same family
-// differs in size by a wide margin, and among different families the larger
-// model is the more capable one -- picking alphabetically would hand a 0.5 B
-// model chosen for the name starting with 'a' over the 8 B one sitting next to
-// it. Kestrel shipped a `qwen.gguf` next to a much better local model precisely
-// because the name said nothing about the contents.
-//
-// The rest come back too, rather than only the best, because a ranking is a
-// guess and the caller is what settles it.
-QStringList discoverModels(const QString& explicitPath) {
+// An explicit --model or KESTREL_MODEL is a single candidate and is never
+// second-guessed. A choice the user made is not a guess to be improved on.
+QStringList modelCandidatesFor(const QString& explicitPath) {
     if (!explicitPath.isEmpty()) {
         return {explicitPath};
     }
 
-    const QString fromEnvironment =
-        qEnvironmentVariable("KESTREL_MODEL", QString());
+    const QString fromEnvironment = qEnvironmentVariable("KESTREL_MODEL", QString());
     if (!fromEnvironment.isEmpty() && QFileInfo::exists(fromEnvironment)) {
         return {fromEnvironment};
     }
 
     const QString modelDirectory =
         QCoreApplication::applicationDirPath() + QStringLiteral("/models");
-    QDir directory(modelDirectory);
-    if (!directory.exists()) {
-        return {};
+    QStringList urls;
+    for (const kestrel::runtime::ModelCandidate& candidate :
+         kestrel::runtime::discoverModels(kestrel::core::pathFromUtf8(modelDirectory.toStdString()))) {
+        urls.append(QUrl::fromLocalFile(QString::fromStdString(candidate.path)).toString());
     }
-
-    // (size, path), largest first. Kept as a ranked list rather than a single
-    // winner because "largest" is a guess about which model will load, and
-    // guesses about model files are wrong: a folder can hold gigabytes of
-    // weights behind a config that is empty or truncated, and a .gguf can be a
-    // half-finished download. Ranking says who to try; the caller loading each
-    // in turn and moving on is what actually decides.
-    QList<QPair<qint64, QString>> ranked;
-    const auto consider = [&ranked](const QString& path, qint64 bytes) {
-        ranked.append({bytes, path});
-    };
-
-    for (const QString& entry :
-         directory.entryList({QStringLiteral("*.gguf")}, QDir::Files, QDir::Name)) {
-        const QFileInfo info(directory.filePath(entry));
-        if (info.isFile() && info.isReadable() && info.size() > 0) {
-            consider(info.absoluteFilePath(), info.size());
-        }
-    }
-    for (const QString& entry :
-         directory.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
-        // A GenAI model is identified by its config, not by its name, so the
-        // presence of that one file is what makes a directory a candidate.
-        const QDir candidate(directory.filePath(entry));
-        if (!candidate.exists(QStringLiteral("genai_config.json"))) {
-            continue;
-        }
-        const QFileInfo config(
-            candidate.filePath(QStringLiteral("genai_config.json")));
-        if (!config.isReadable() || config.size() == 0) {
-            // An empty or unreadable config is the specific case that used to
-            // win the ranking on the strength of the weights beside it and then
-            // fail to load. There is no graph to run, so it is not a model
-            // however large the folder is.
-            continue;
-        }
-        if (candidate.entryList({QStringLiteral("*.onnx")}, QDir::Files).isEmpty()) {
-            continue;
-        }
-        qint64 bytes = 0;
-        const QFileInfoList files =
-            candidate.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
-        for (const QFileInfo& file : files) {
-            bytes += file.size();
-        }
-        consider(candidate.absolutePath(), bytes);
-    }
-
-    // Ties broken by path, so the same directory always yields the same order.
-    std::sort(ranked.begin(), ranked.end(),
-              [](const QPair<qint64, QString>& left,
-                 const QPair<qint64, QString>& right) {
-                  if (left.first != right.first) {
-                      return left.first > right.first;
-                  }
-                  return left.second < right.second;
-              });
-    QStringList ordered;
-    ordered.reserve(ranked.size());
-    for (const QPair<qint64, QString>& entry : std::as_const(ranked)) {
-        ordered.append(entry.second);
-    }
-    return ordered;
+    return urls;
 }
 
 // Sends one message through the real window and reports whether a reply came
@@ -403,7 +324,7 @@ int main(int argc, char* argv[]) {
     const QStringList arguments = QGuiApplication::arguments();
 
     const QStringList modelCandidates =
-        discoverModels(valueAfter(arguments, QStringLiteral("--model")));
+        modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
     if (reportRuntime && modelCandidates.isEmpty()) {
         attachToLaunchConsole();
@@ -415,37 +336,18 @@ int main(int argc, char* argv[]) {
                              &app, [&] { app.exit(printRuntime(controller)); },
                              Qt::QueuedConnection);
         }
-        // Each candidate in turn, and the next one when the last fails to load.
+        // One call, and the controller walks the list itself. That used to be
+        // a retry loop wired to modelLoadFinished from here, and it never ran:
+        // queued connections are delivered in the order they were made, so the
+        // --print-runtime handler above -- already connected, and already
+        // calling app.exit -- was still ahead of the retry by the time the first
+        // candidate failed. The fallback shipped without ever having been
+        // observed to work.
         //
-        // Ranking by size picks the model most likely to be the one wanted; it
-        // cannot know whether the largest file on disk is a complete download
-        // or a folder whose config names a graph that is not there. Trying the
-        // rest costs one failed load and is the difference between starting on
-        // a real model and starting on the preview mock with an error nobody
-        // asked for. An explicit --model is a single candidate, so the loop
-        // never second-guesses a choice the user made.
-        //
-        // The controller drops its load thread before publishing
-        // modelLoadFinished, so the next attempt is not refused as a load
-        // already in flight.
-        auto attempt = std::make_shared<int>(0);
-        QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
-                         &app, [&controller, modelCandidates, attempt] {
-            if (controller.modelError().isEmpty()) {
-                return; // loaded; the loop is finished
-            }
-            if (*attempt >= modelCandidates.size()) {
-                return; // every candidate refused; the last error stands
-            }
-            const QString next = modelCandidates.at(*attempt);
-            ++(*attempt);
-            controller.loadModelFromUrl(QUrl::fromLocalFile(next).toString());
-        }, Qt::QueuedConnection);
-        // The controller loads on a worker and publishes the result on the UI
-        // thread. Start once the event loop can receive that completion.
-        const QString first = modelCandidates.first();
-        QTimer::singleShot(0, &controller, [&controller, first] {
-            controller.loadModelFromUrl(QUrl::fromLocalFile(first).toString());
+        // The controller publishes modelLoadFinished once, when the sequence is
+        // over, so this file has nothing to get wrong about ordering.
+        QTimer::singleShot(0, &controller, [&controller, modelCandidates] {
+            controller.loadModelFromUrls(modelCandidates);
         });
     }
     if (reportRuntime) {
@@ -567,6 +469,60 @@ int main(int argc, char* argv[]) {
                                  }
                                  app.quit();
                              });
+        });
+    }
+
+    // Development aid: KESTREL_LAYOUT_CHECK=1 asks the scene graph where every
+    // layout put its cells, prints anything wrong, and exits. KESTREL_LAYOUT_CHECK_DELAY_MS
+    // sets how long to wait first, and it has to be a delay rather than a
+    // connection: the panels that are the point of this are built lazily, and a
+    // layout that has not run yet has no geometry to be wrong about.
+    //
+    // The diagnostics panel is opened first, because the audit only judges what
+    // the user can see and that panel is closed by default. Judging it while
+    // closed would pass on the exact defect this exists to catch, so the panel
+    // is opened the way a user opens it.
+    //
+    // The exit status is the answer, because a check whose result is only in
+    // its output is a check the packaging step has to be trusted to read. This
+    // is the counterpart to KESTREL_SCREENSHOT above, and it exists because
+    // that one could not see the defect this found: a panel can be a correct
+    // size, correctly laid out at the top level, and have its rows drawn on top
+    // of each other, and a picture of that is a picture with more contrast in
+    // it than before.
+    if (qEnvironmentVariableIsSet("KESTREL_LAYOUT_CHECK")) {
+        controller.setDiagnosticsOpen(true);
+        bool waitGiven = false;
+        const int requested = qEnvironmentVariableIntValue("KESTREL_LAYOUT_CHECK_DELAY_MS", &waitGiven);
+        const int waitMs = waitGiven ? requested : 2000;
+        // A deadline, because the alternative to ending is a process that sits
+        // there holding a model load open with nothing watching it.
+        auto* expired = new QTimer(&app);
+        expired->setSingleShot(true);
+        QObject::connect(expired, &QTimer::timeout, &app, [&app] { app.exit(2); });
+        expired->start(waitMs + 15000);
+        QTimer::singleShot(waitMs, &app, [&engine, &app] {
+            auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0));
+            if (window == nullptr || window->contentItem() == nullptr) {
+                QTextStream(stderr) << "Kestrel could not find a window to audit\n";
+                app.exit(2);
+                return;
+            }
+            const QVector<kestrel::ui::LayoutProblem> problems =
+                kestrel::ui::auditLayouts(window->contentItem());
+            QTextStream out(stdout);
+            if (problems.isEmpty()) {
+                out << "layout check: ok, no cell is collapsed or overlapping\n";
+                out.flush();
+                app.exit(0);
+                return;
+            }
+            out << "layout check: " << problems.size() << " problem(s)\n";
+            for (const auto& problem : problems) {
+                out << "  " << problem.where << ": " << problem.what << "\n";
+            }
+            out.flush();
+            app.exit(1);
         });
     }
 
