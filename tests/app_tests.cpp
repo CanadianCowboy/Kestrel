@@ -28,6 +28,10 @@
 #include "app/messagemodel.h"
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
+#if KESTREL_HAS_QT_MULTIMEDIA
+#include "app/localmodelspeechbackend.h"
+#include <QMediaPlayer>
+#endif
 #include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
 
@@ -754,8 +758,7 @@ void testPresenceAndIdleLoopProject() {
     // that is off is not a capability, whatever the setting is called. So this
     // asserts both halves -- on by default, and still switchable -- because
     // only the first was ever verified.
-    check(controller.idlePrewarmEnabled(),
-          "prewarming is on by default, so a cold GPU is warmed at all");
+    check(!controller.idlePrewarmEnabled(), "prewarming requires an explicit opt-in");
     controller.setIdlePrewarmEnabled(false);
     check(!controller.idlePrewarmEnabled(), "prewarming can still be turned off");
     controller.setIdlePrewarmEnabled(true);
@@ -1639,6 +1642,87 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     controller.stopGeneration();
 }
 
+void testNewTurnReleasesOwedAudioAndOmitsToolHistory() {
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto model = std::make_unique<SlowBackend>(1, 0);
+    SlowBackend* observed = model.get();
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    speech->startLoading();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    controller.sendMessage(QStringLiteral("first question"));
+    runTurnToCompletion(controller);
+    check(!controller.speaking(), "the loading voice holds the first reply without speaking");
+    controller.messages()->appendMessage(kestrel::core::MessageRole::Tool,
+                                         QStringLiteral("private index result"),
+                                         kestrel::app::MessageStatus::Complete);
+    controller.sendMessage(QStringLiteral("second question"));
+    runTurnToCompletion(controller);
+    const auto requests = observed->requests();
+    check(requests.size() == 2, "owed audio does not block the next generation");
+    if (requests.size() == 2) {
+        bool hasTool = false;
+        for (const auto& message : requests.back().messages) {
+            hasTool = hasTool || message.role == kestrel::runtime::Role::Tool
+                      || message.content == "private index result";
+        }
+        check(!hasTool, "tool results do not enter model history");
+    }
+    controller.stopGeneration();
+}
+
+void testPreviewInputRequiresExplicitOptIn() {
+    // Construct the scripted recognizer deterministically, then remove consent
+    // before starting it, as with the automatic preview fallback.
+    qputenv("KESTREL_SPEECH_INPUT", "mock");
+    kestrel::app::AppController controller;
+    controller.setIdleLoopEnabled(false);
+    qunsetenv("KESTREL_SPEECH_INPUT");
+    check(!controller.startListening(), "preview input requires explicit mock selection");
+    check(controller.listenError() == controller.sttDetail(), "refusal reports speech detail");
+    check(!controller.listening(), "refusing preview input leaves listening stopped");
+    qputenv("KESTREL_SPEECH_INPUT", "mock");
+}
+
+#if KESTREL_HAS_QT_MULTIMEDIA
+class PendingSpeechBackend final : public kestrel::app::LocalModelSpeechBackend {
+public:
+    PendingSpeechBackend() { completeSetup(); }
+    using LocalModelSpeechBackend::noteSynthesised;
+    using LocalModelSpeechBackend::noteClauseFailed;
+    QStringList requests;
+protected:
+    void startEngine() override { markLaunched(); markStarted(); }
+    void synthesise(const QString& text, const QString&) override { requests.append(text); }
+    QStringList engineVoices() const override { return {QStringLiteral("test")}; }
+    QString engineName() const override { return QStringLiteral("test"); }
+};
+
+void testSpeakingAdoptsPendingPrefetch() {
+    PendingSpeechBackend backend;
+    backend.prefetch(QStringLiteral("first"));
+    backend.speak(QStringLiteral("first"));
+    backend.prefetch(QStringLiteral("second"));
+    check(backend.requests.size() == 2, "speaking reuses an in-flight prefetch");
+    QTemporaryFile audio;
+    check(audio.open(), "a local audio path is available");
+    backend.noteSynthesised(audio.fileName());
+    const auto* player = backend.findChild<QMediaPlayer*>();
+    check(player != nullptr && player->source() == QUrl::fromLocalFile(audio.fileName()),
+          "the pending prefetch is played when it completes");
+    backend.stopImmediately();
+
+    backend.prefetch(QStringLiteral("failed"));
+    backend.prefetch(QStringLiteral("survivor"));
+    backend.noteClauseFailed(QStringLiteral("one clause failed"));
+    check(backend.usable(), "a failed clause leaves the engine available");
+    backend.speak(QStringLiteral("survivor"));
+    check(backend.requests.size() == 4, "a clause failure preserves the next pending request");
+    backend.stopImmediately();
+}
+#endif
+
 // The whole claim about speech input: a recognized phrase is a typed phrase
 // that happened to arrive by ear. Everything downstream -- the transcript row,
 // the acknowledgement, the barge-in, the presence projection -- must be identical
@@ -1758,6 +1842,11 @@ int main(int argc, char** argv) {
     testStoppingDropsAReplyHeldForAVoice();
     testAReplySentMidSpeechTakesItsOwnWarmth();
     testAHeldReplyGivesUpIfTheVoiceNeverArrives();
+    testNewTurnReleasesOwedAudioAndOmitsToolHistory();
+    testPreviewInputRequiresExplicitOptIn();
+#if KESTREL_HAS_QT_MULTIMEDIA
+    testSpeakingAdoptsPendingPrefetch();
+#endif
     testSpokenPhraseTakesTheTypedPath();
     testAbandonedPhraseIsNotSubmitted();
 

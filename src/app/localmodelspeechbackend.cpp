@@ -115,6 +115,12 @@ void LocalModelSpeechBackend::speak(const QString& text) {
         return;
     }
 
+    for (PendingRequest& request : m_pending) {
+        if (request.text == text) {
+            request.playsNow = true;
+            return;
+        }
+    }
     m_pending.append(PendingRequest{text, true});
     synthesise(text, nextScratchPath());
 }

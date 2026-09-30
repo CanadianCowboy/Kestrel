@@ -13,8 +13,10 @@ Item {
     property bool rowsHaveHeight: true
 
     component Switch: RowLayout {
+        id: switchRow
         required property string label
         Layout.fillWidth: true
+        Layout.maximumHeight: root.rowsHaveHeight ? 18 : 0
         implicitHeight: root.rowsHaveHeight ? 18 : 0
 
         // A hit target around the whole row, so the label is what you click.
@@ -28,7 +30,7 @@ Item {
             }
             Text {
                 objectName: "label"
-                text: parent.label
+                text: switchRow.label
                 anchors.verticalCenter: parent.verticalCenter
                 font.pixelSize: 11
             }

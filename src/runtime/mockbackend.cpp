@@ -90,11 +90,11 @@ void MockBackend::generate(const GenerationRequest& request,
         onToken(token);
     }
 
-    // Context grows by the shared prefix, the prompt and whatever this turn
+    // Context contains the shared prefix, the prompt and whatever this turn
     // produced, capped at the window so the UI cannot show an impossible fill
     // level.
     m_contextUsed = std::min(kContextLimit,
-                             m_contextUsed + countTokens(m_systemPrompt) +
+                             countTokens(m_systemPrompt) +
                                  countTokens(renderPlainChat(request.messages, request.addAssistantCue)) +
                                  countTokens(delivered));
 

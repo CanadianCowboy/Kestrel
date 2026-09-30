@@ -161,6 +161,7 @@ struct LlamaCppBackend::Impl {
     // this text, since only generate() can safely reconcile the two.
     std::vector<llama_token> prefixTokens;
     bool prefixDirty = true;
+    bool prefixSharingUnsupported = false;
 };
 
 // Initialises the process-global llama.cpp library once and starts this
@@ -272,6 +273,7 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     // has to be decoded again against it.
     m_impl->prefixTokens.clear();
     m_impl->prefixDirty = true;
+    m_impl->prefixSharingUnsupported = false;
     m_contextUsed = 0;
     refreshStatus();
     return true;
@@ -366,6 +368,7 @@ void LlamaCppBackend::setSystemPrompt(std::string_view text) {
     if (m_impl != nullptr) {
         m_impl->prefixTokens.clear();
         m_impl->prefixDirty = true;
+        m_impl->prefixSharingUnsupported = false;
     }
 }
 
@@ -424,6 +427,10 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
         return 0;
     }
     llama_memory_t memory = llama_get_memory(m_impl->context);
+    if (m_impl->prefixSharingUnsupported) {
+        llama_memory_clear(memory, /* data */ true);
+        return 0;
+    }
 
     if (m_impl->prefixDirty) {
         // The prefix changed (or this is the first turn): nothing in the cache
@@ -595,7 +602,8 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
             // copy of the system prompt.
             llama_memory_clear(llama_get_memory(context), true);
             m_impl->prefixTokens.clear();
-            m_impl->prefixDirty = true;
+            m_impl->prefixDirty = false;
+            m_impl->prefixSharingUnsupported = true;
             prefixLength = 0;
         }
     }

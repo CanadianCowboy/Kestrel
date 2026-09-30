@@ -6,6 +6,7 @@
 #include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/mockbackend.h"
+#include "runtime/chatformat.h"
 
 #include <cassert>
 #include <filesystem>
@@ -87,10 +88,13 @@ void testMockBackend() {
     // fail loudly if a fabricated value is reintroduced.
     assert(status.tokensPerSecond == 0.0);
 
-    const std::size_t usedAfterFirst = status.contextUsed;
-    backend.generate(ask("again", 0.7F, 32), [](std::string_view) {},
+    streamed.clear();
+    const auto second = ask("again", 0.7F, 32);
+    backend.generate(second, [&streamed](std::string_view token) { streamed += token; },
                      [](bool, std::string_view) {});
-    assert(backend.status().contextUsed > usedAfterFirst);
+    assert(backend.status().contextUsed
+           == backend.countTokens(runtime::renderPlainChat(second.messages, second.addAssistantCue))
+              + backend.countTokens(streamed));
 }
 
 void testVoiceHappyPathAndEvents() {
@@ -542,18 +546,9 @@ void testIdleStaysSilentWhileTheUserIsPresent() {
 
 void testIdleDefaultPolicyIsLocalOnly() {
     core::IdlePolicy policy;
-    // The default grants every task, including the one that touches the model
-    // runtime. It used to withhold exactly that one, on the reasoning that
-    // prewarming is the only capability leaving pure computation -- and the
-    // effect of that default was a feature that never ran. A policy that
-    // guarantees the warmup does not happen is not a safe default for a
-    // warmup; it is a warmup that is off, described as one that is on.
-    //
-    // What still holds is the part that matters: nothing here can reach the
-    // network or the filesystem, and every task can still be switched off
-    // individually and collectively, which the second half of this test proves.
-    assert(policy.permittedCount() == 7);
-    assert(policy.permits(core::IdleTaskKind::ModelWarmup));
+    // Model warmup is the only task that touches the runtime and stays opt-in.
+    assert(policy.permittedCount() == 6);
+    assert(!policy.permits(core::IdleTaskKind::ModelWarmup));
     assert(policy.permits(core::IdleTaskKind::SelfReflection));
     assert(policy.permits(core::IdleTaskKind::AmbientWhisper));
     assert(policy.permits(core::IdleTaskKind::ContextReindex));
@@ -1099,6 +1094,7 @@ void testVoicePersonaIsReplaceable() {
     brisk.rate = 1.2F;
     brisk.clausePauseMs = 40;
     brisk.sentencePauseMs = 90;
+    brisk.leadInMs = 25;
     session.setVoicePersona(brisk);
 
     const core::ResponseId id = session.queueResponse();
@@ -1107,13 +1103,17 @@ void testVoicePersonaIsReplaceable() {
     const std::size_t eventsBefore = session.events().size();
     const auto segment = session.nextSpeechSegment(id);
     assert(segment.has_value());
-    assert(segment->leadingPauseMs == brisk.sentencePauseMs);
+    assert(segment->leadingPauseMs == brisk.leadInMs);
 
     // A stricter voice is a pacing change only: asking what to say next is a
     // question, not a transition, so the timeline and its event log are
     // untouched until something is actually played.
     assert(session.find(id)->state() == core::ResponseState::Generating);
     assert(session.events().size() == eventsBefore);
+    assert(session.advancePlayback(id, segment->endOffset));
+    const auto nextSegment = session.nextSpeechSegment(id);
+    assert(nextSegment.has_value());
+    assert(nextSegment->leadingPauseMs == brisk.sentencePauseMs);
 }
 
 void testSentenceStartBefore() {

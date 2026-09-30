@@ -25,7 +25,11 @@ LocalVoiceEngines LocalVoiceEngines::discover() {
 
     for (const QString& root : roots) {
         const QString python = QDir(root).filePath(
+#ifdef Q_OS_WIN
             QStringLiteral(".kestrel-voice/Scripts/python.exe"));
+#else
+            QStringLiteral(".kestrel-voice/bin/python"));
+#endif
         const QString kokoro = QDir(root).filePath(
             QStringLiteral("tools/kokoro_voice_server.py"));
         const bool haveKokoro = QFileInfo::exists(python) && QFileInfo::exists(kokoro)

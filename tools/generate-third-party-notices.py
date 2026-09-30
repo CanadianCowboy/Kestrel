@@ -216,7 +216,9 @@ LICENCE_OPENINGS = (
     (r"GNU LESSER GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 3", "LGPL-3.0"),
     (r"GNU GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 3", "GPL-3.0"),
     (r"GNU GENERAL PUBLIC LICENSE[\s\S]{0,80}Version 2", "GPL-2.0"),
-    (r"Mozilla Public License[\s\S]{0,80}Version 2\.0", "MPL-2.0"),
+    (r"Mozilla Public License[\s\S]{0,80}(?:Version|v\.)\s*2\.0", "MPL-2.0"),
+    (r"terms of \*either\* of the licenses\s+found in LICENSE\.APACHE or LICENSE\.BSD",
+     "Apache-2.0 OR BSD-2-Clause"),
     (r"This is free and unencumbered software released into the public domain",
      "0BSD"),
 )
@@ -234,6 +236,9 @@ BSD_THIRD_CLAUSE = r"[Nn]either the name"
 
 def sniff_licence(body):
     """The SPDX id a licence text opens with, or "" when it is not recognisable."""
+    # The PSF terms follow several pages of Python history in bundled distlib.
+    if re.search(r"PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2", body[:8192]):
+        return "PSF-2.0"
     head = body[:4000]
     for pattern, spdx in LICENCE_OPENINGS:
         if re.search(pattern, head, re.IGNORECASE):
@@ -276,9 +281,9 @@ def text_licence(declared, body):
     CC0-1.0 indexed under the whole expression rather than under whichever part
     happened to be the opening of one of its files.
     """
-    if not declared or declared == "NOT DECLARED":
-        return declared
     found = sniff_licence(body)
+    if not declared or declared == "NOT DECLARED":
+        return found or declared
     terms = licence_terms(declared)
     if not found:
         return declared
@@ -366,6 +371,7 @@ def copy_texts(rows, components, written):
     """Copies each distinct licence text into licenses/ and returns what it used."""
     used = {}
     for row in rows:
+        row["copied_texts"] = set()
         many = len(row["texts"]) > 1
         for text in row["texts"]:
             try:
@@ -378,6 +384,7 @@ def copy_texts(rows, components, written):
             key = (label, body)
             if key in written:
                 used.setdefault(label, set()).add(written[key])
+                row["copied_texts"].add(written[key])
                 continue
             stem = text_stem(text, row["name"]) if many else safe_name(row["name"])
             filename = f"{safe_name(label)}-{stem}.txt"
@@ -385,6 +392,7 @@ def copy_texts(rows, components, written):
             target.write_text(body, encoding="utf-8")
             written[key] = filename
             used.setdefault(label, set()).add(filename)
+            row["copied_texts"].add(filename)
     for component in components:
         source = component.get("from", "")
         if not source or not os.path.isfile(source):
@@ -412,11 +420,25 @@ def licence_order(text):
     return len(order)
 
 
+def licence_gaps(rows):
+    """A package is covered only by its own successfully copied text files."""
+    missing = [
+        row for row in rows
+        if not any((OUT_DIR / name).is_file() and (OUT_DIR / name).stat().st_size > 0
+                   for name in row.get("copied_texts", ()))
+    ]
+    return (
+        [row for row in missing if row["licence"] == "NOT DECLARED"],
+        [row for row in missing if row["licence"] != "NOT DECLARED"],
+    )
+
+
 def main():
     rows = collect_python_packages()
     if not rows:
         print("warning: no packages found in", VENV)
-        print("         the Python half of the notice will be empty.")
+        print("         keeping the existing notices; run where the package metadata is installed.")
+        return 1
 
     OUT_DIR.mkdir(exist_ok=True)
     for stale in OUT_DIR.glob("*.txt"):
@@ -425,12 +447,7 @@ def main():
     written = {}
     by_licence = copy_texts(rows, NATIVE_COMPONENTS, written)
 
-    undeclared = [r for r in rows if r["licence"] == "NOT DECLARED"]
-    untexted = [
-        r for r in rows
-        if r["licence"] != "NOT DECLARED"
-        and r["licence"] not in by_licence
-    ]
+    undeclared, untexted = licence_gaps(rows)
 
     lines = []
     lines.append("# Third-party notices")

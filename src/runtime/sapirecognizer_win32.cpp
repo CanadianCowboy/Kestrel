@@ -684,18 +684,10 @@ private:
                 if (text.empty()) {
                     break;
                 }
-                // The engine revises a phrase while the speaker is still
-                // talking, so the latest one wins and only the last is ever
-                // delivered. This adapter reports a finished phrase, not the
-                // words so far; ListenSession already treats partial text as
-                // optional.
-                //
-                // Note what is deliberately not here: this event does not end
-                // the session. A dictation grammar raises one of these for
-                // every revision of the utterance, so treating the first as
-                // final would deliver the opening word and throw the sentence
-                // away. SPEI_END_SR_STREAM is what closes a phrase.
+                // Recognition supplies a completed phrase; the input stream
+                // may remain open, so do not wait for it to end.
                 state.phrase = text;
+                state.finished = true;
                 // No confidence is set, and the reason is in the note above the
                 // old SPRECOCGNITION declaration: the Windows SDK's
                 // ISpRecoResult has no accessor for one. The field stays at its

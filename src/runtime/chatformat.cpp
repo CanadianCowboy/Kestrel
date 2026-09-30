@@ -63,9 +63,13 @@ std::string renderPlainChat(const std::vector<ChatMessage>& messages, bool addAs
     }
     if (addAssistantCue) {
         out += "assistant:";
-    } else if (!out.empty() && !messages.empty()
-               && messages.back().role == Role::Assistant && out.back() == '\n') {
-        out.pop_back(); // Continue the partial assistant text without a turn boundary.
+    } else if (!messages.empty()
+               && messages.back().role == Role::Assistant) {
+        if (messages.back().content.empty()) {
+            out += "assistant:";
+        } else if (out.back() == '\n') {
+            out.pop_back(); // Continue the partial assistant text without a turn boundary.
+        }
     }
     return out;
 }

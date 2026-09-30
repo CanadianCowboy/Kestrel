@@ -109,9 +109,6 @@ Full texts are in `licenses/`, one file per component.
 - `MIT-rpds-py.txt` -- MIT
 - `MIT-s-authors.txt` -- MIT
 - `MIT-s-license.txt` -- MIT
-- `MIT-s-src-pip--vendor-certifi-license.txt` -- MIT
-- `MIT-s-src-pip--vendor-distlib-license.txt` -- MIT
-- `MIT-s-src-pip--vendor-packaging-license.txt` -- MIT
 - `MIT-s-src-pip--vendor-pkg-resources-license.txt` -- MIT
 - `MIT-s-src-pip--vendor-platformdirs-license.txt` -- MIT
 - `MIT-s-src-pip--vendor-pyproject-hooks-license.txt` -- MIT
@@ -133,6 +130,8 @@ Full texts are in `licenses/`, one file per component.
 - `BSD-3-Clause-rdflib.txt` -- BSD-3-Clause
 - `BSD-3-Clause-s-src-pip--vendor-idna-license.txt` -- BSD-3-Clause
 - `BSD-3-Clause-soundfile.txt` -- BSD-3-Clause
+- `BSD-2-Clause-s-src-pip--vendor-packaging-license-bsd.txt` -- BSD-2-Clause
+- `BSD-2-Clause-s-src-pip--vendor-pygments-license.txt` -- BSD-2-Clause
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-license.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-numpy--core-include-numpy-libdivide-license.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-numpy--core-src-common-pythoncapi-compat-copying.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
@@ -149,9 +148,10 @@ Full texts are in `licenses/`, one file per component.
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-numpy-random-src-philox-license.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-numpy-random-src-sfc64-license.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
 - `BSD-3-Clause-AND-0BSD-AND-MIT-AND-Zlib-AND-CC0-1.0-s-numpy-random-src-splitmix64-license.txt` -- BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
-- `BSD-2-Clause-s-src-pip--vendor-packaging-license-bsd.txt` -- BSD-2-Clause
-- `BSD-2-Clause-s-src-pip--vendor-pygments-license.txt` -- BSD-2-Clause
 - `BSD-3-Clause-OR-Apache-2.0-uritemplate.txt` -- BSD 3-Clause OR Apache-2.0
+- `Apache-2.0-OR-BSD-2-Clause-s-license-apache.txt` -- Apache-2.0 OR BSD-2-Clause
+- `Apache-2.0-OR-BSD-2-Clause-s-license-bsd.txt` -- Apache-2.0 OR BSD-2-Clause
+- `Apache-2.0-OR-BSD-2-Clause-s-src-pip--vendor-packaging-license.txt` -- Apache-2.0 OR BSD-2-Clause
 - `Apache-2.0-csvw.txt` -- Apache-2.0
 - `Apache-2.0-python-dateutil.txt` -- Apache-2.0
 - `Apache-2.0-rfc3986.txt` -- Apache-2.0
@@ -162,11 +162,10 @@ Full texts are in `licenses/`, one file per component.
 - `Apache-2.0-s-src-pip--vendor-msgpack-copying.txt` -- Apache-2.0
 - `Apache-2.0-s-src-pip--vendor-packaging-license-apache.txt` -- Apache-2.0
 - `Apache-2.0-s-src-pip--vendor-requests-license.txt` -- Apache-2.0
-- `Apache-2.0-OR-BSD-2-Clause-s-license-apache.txt` -- Apache-2.0 OR BSD-2-Clause
-- `Apache-2.0-OR-BSD-2-Clause-s-license-bsd.txt` -- Apache-2.0 OR BSD-2-Clause
-- `Apache-2.0-OR-BSD-2-Clause-s-license.txt` -- Apache-2.0 OR BSD-2-Clause
 - `Apache-2.0-AND-CNRI-Python-regex.txt` -- Apache-2.0 AND CNRI-Python
+- `PSF-2.0-s-src-pip--vendor-distlib-license.txt` -- PSF-2.0
 - `PSF-2.0-typing_extensions.txt` -- PSF-2.0
+- `MPL-2.0-s-src-pip--vendor-certifi-license.txt` -- MPL-2.0
 - `GPL-3.0-or-later-phonemizer-fork.txt` -- GPL-3.0-or-later
 - `GPL-3.0-or-later-s-copying.txt` -- GPL-3.0-or-later
 - `LicenseRef-NVIDIA-Proprietary-nvidia-cublas-cu12.txt` -- LicenseRef-NVIDIA-Proprietary
@@ -182,5 +181,11 @@ Distributions that install no licence metadata. They are listed here because a c
 
 Declared by the package, with no licence text shipped alongside it. The identifier is reported from its own metadata; the text was not available to copy.
 
-- python-dateutil 2.9.0.post0 -- `Dual License`
+- flatbuffers 25.12.19 -- `Apache-2.0`
+- nvidia-cuda-nvrtc-cu12 12.9.86 -- `LicenseRef-NVIDIA-Proprietary`
+- nvidia-cuda-runtime-cu12 12.9.79 -- `LicenseRef-NVIDIA-Proprietary`
+- onnxruntime 1.30.0 -- `MIT`
+- onnxruntime-gpu 1.30.0 -- `MIT`
+- referencing 0.37.0 -- `MIT`
+- segments 2.4.0 -- `Apache-2.0`
 

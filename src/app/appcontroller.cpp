@@ -265,6 +265,13 @@ bool AppController::startListening() {
         emit listeningChanged();
         return false;
     }
+    const bool mockRequested = qEnvironmentVariable("KESTREL_SPEECH_INPUT")
+        .compare(QLatin1String("mock"), Qt::CaseInsensitive) == 0;
+    if (!sttAvailable() && !mockRequested) {
+        m_listenError = sttDetail();
+        emit listeningChanged();
+        return false;
+    }
     QString error;
     if (!m_listen->startListening(error)) {
         m_listenError = error;
@@ -1070,8 +1077,7 @@ bool AppController::canLoadModel() const {
     // Ask a throwaway instance rather than caching a flag: whether a real model
     // can be loaded is a build-time fact, but a cached copy would go stale the
     // moment the answer is refactored into a runtime check.
-    return runtime::LlamaCppBackend{}.status().available
-        || runtime::OrtGenAiBackend{}.status().available;
+    return runtime::LlamaCppBackend{}.status().available;
 }
 
 /// Returns the loaded model's local path, or an empty string in preview mode.
@@ -1382,9 +1388,7 @@ void AppController::runIdleToolIfPermitted() {
         const core::ToolRunResult outcome = core::runIdleTool(
             m_idleTools, core::kIndexThreadsTool, entry->conversation.messages());
         if (outcome.ran) {
-            m_messageModel->appendMessage(core::MessageRole::Tool,
-                                          QString::fromStdString(outcome.summary),
-                                          MessageStatus::Complete);
+            m_idleTaskDetail = QString::fromStdString(outcome.summary);
         } else {
             m_idleToolNotice = QString::fromStdString(outcome.summary);
         }
@@ -1415,6 +1419,9 @@ void AppController::startSessionSummary() {
     // answered.
     QString material;
     for (const core::Message& message : entry->conversation.messages()) {
+        if (message.role == core::MessageRole::Tool) {
+            continue;
+        }
         const QString prefix = message.role == core::MessageRole::User
             ? QStringLiteral("User: ")
             : QStringLiteral("Kestrel: ");
@@ -1464,9 +1471,8 @@ void AppController::onIdleTick() {
 
         // The one idle task that does real work rather than thinking. It goes
         // through the registry, so it runs only when the user has switched it
-        // on and granted what it declared, and its outcome is written into the
-        // transcript rather than into a thought the user may never see: a tool
-        // that did something and left no trace would be a tool nobody can audit.
+        // on and granted what it declared. Its latest outcome is shown in the
+        // idle detail without growing the conversation on each run.
         if (tick.task.kind == core::IdleTaskKind::ContextReindex) {
             runIdleToolIfPermitted();
         }
@@ -1584,12 +1590,7 @@ void AppController::onGenerationFinished(quint64 requestId,
         const QString said = success ? m_toolOutput.trimmed() : QString();
         m_toolOutput.clear();
         if (!said.isEmpty()) {
-            // Appended as its own row rather than written over the last one.
-            // Overwriting is what turned a Stopped or Failed reply into a
-            // Complete one on every successful summary -- a different kind of
-            // wrong, and just as visible once the user reads the transcript.
-            m_messageModel->appendMessage(core::MessageRole::Tool, said,
-                                          MessageStatus::Complete);
+            m_idleTaskDetail = said;
             m_idleToolNotice = tr("Summarised the session.");
         } else {
             m_idleToolNotice = error.isEmpty()
@@ -1753,8 +1754,7 @@ std::vector<runtime::ChatMessage> AppController::buildMessages() const {
                     role = runtime::Role::System;
                     break;
                 case core::MessageRole::Tool:
-                    role = runtime::Role::Tool;
-                    break;
+                    continue;
             }
             messages.push_back(runtime::ChatMessage{role, message.content});
         }
@@ -1803,6 +1803,9 @@ void AppController::sendMessage(const QString& text) {
     if (canResume()) {
         m_voice.cancel(m_activeResponse);
         m_messageModel->setLastMessageStatus(MessageStatus::Stopped, {});
+    }
+    if (!m_speaking && m_speech != nullptr && m_speech->audioOwed()) {
+        m_speech->releaseOwedAudio();
     }
     if (m_speaking) {
         // A new prompt mid-response is a barge-in: preserve what was already

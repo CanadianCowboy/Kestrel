@@ -63,13 +63,13 @@ runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
 void testModelDiscoveryAndPlainContinuation() {
     const auto root = std::filesystem::temp_directory_path() / "kestrel_discovery_regression";
     std::filesystem::remove_all(root);
-    std::filesystem::create_directories(root / "onnx");
+    std::filesystem::create_directories(root / "onnx/decoder");
     std::filesystem::create_directories(root / "empty");
     const auto unicodeName = core::pathFromUtf8("\xe6\xa8\xa1\xe5\x9e\x8b.GGUF");
     { std::ofstream(root / unicodeName, std::ios::binary) << "gguf"; }
     { std::ofstream(root / "zero.gguf", std::ios::binary); }
     { std::ofstream(root / "onnx/genai_config.json") << "{}"; }
-    { std::ofstream(root / "onnx/model.ONNX", std::ios::binary) << "graph"; }
+    { std::ofstream(root / "onnx/decoder/model.ONNX", std::ios::binary) << "graph"; }
     { std::ofstream(root / "empty/genai_config.json"); }
     { std::ofstream(root / "empty/model.onnx") << "graph"; }
     const auto candidates = runtime::discoverModels(root);
@@ -84,6 +84,11 @@ void testModelDiscoveryAndPlainContinuation() {
         {runtime::Role::Assistant, "Partial"}};
     assert(runtime::renderPlainChat(history, false) == "Instruction\n\nuser: Question\nassistant: Partial");
     assert(runtime::renderPlainChat(history, true).ends_with("Partial\nassistant:"));
+    auto emptyAssistant = history;
+    emptyAssistant.back().content.clear();
+    assert(runtime::renderPlainChat(emptyAssistant, false)
+           == "Instruction\n\nuser: Question\nassistant:");
+    assert(runtime::renderPlainChat({{runtime::Role::Assistant, ""}}, false) == "assistant:");
     assert(runtime::selectBackend(runtime::BackendKind::Mock)->kind() == runtime::BackendKind::Mock);
 }
 
@@ -479,6 +484,14 @@ void testSharedSystemPromptPrefix() {
            == mock.countTokens(prefix)
               + mock.countTokens(runtime::renderPlainChat(ask("hello").messages, true))
               + mock.countTokens(reply));
+    reply.clear();
+    mock.generate(ask("a second turn", 0.7F, 8),
+                  [&reply](std::string_view token) { reply.append(token); },
+                  [](bool, std::string_view) {});
+    assert(mock.status().contextUsed
+           == mock.countTokens(prefix)
+              + mock.countTokens(runtime::renderPlainChat(ask("a second turn").messages, true))
+              + mock.countTokens(reply));
 }
 
 /// One environment variable, as a string the caller owns.
@@ -796,17 +809,20 @@ void testOrtGenAiGeneratesFromRealModel() {
     {
         std::mutex mutex;
         std::string partial;
+        std::size_t tokensSeen = 0;
+        const auto request = ask("Count slowly from one to two hundred.", 0.7F, 256);
         bool done = false;
         bool wasSuccessful = true;
         bool cancelIssued = false;
 
         std::thread worker([&] {
             backend.generate(
-                ask("Count slowly from one to two hundred.", 0.7F, 256),
+                request,
                 [&](std::string_view token) {
                     {
                         std::lock_guard<std::mutex> lock(mutex);
                         partial.append(token);
+                        ++tokensSeen;
                         if (!cancelIssued) {
                             // From the generating thread, which is the case that
                             // matters: the app's cancel() arrives on the UI
@@ -833,7 +849,7 @@ void testOrtGenAiGeneratesFromRealModel() {
         // that a backend ignoring cancellation would never have seen land
         // mid-turn. What must never happen is a full 256-token reply to a
         // request that cancelled itself on its first token.
-        assert(!wasSuccessful || partial.size() < 256);
+        assert(!wasSuccessful || tokensSeen < static_cast<std::size_t>(request.maxTokens));
     }
 }
 

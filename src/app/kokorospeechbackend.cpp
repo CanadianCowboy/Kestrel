@@ -135,7 +135,7 @@ void KokoroSpeechBackend::onReadyRead() {
             continue;
         }
         if (!reply.value(QStringLiteral("ok")).toBool()) {
-            noteEngineFailed(reply.value(QStringLiteral("error")).toString());
+            noteClauseFailed(reply.value(QStringLiteral("error")).toString());
             continue;
         }
         noteSynthesised(reply.value(QStringLiteral("out")).toString());
