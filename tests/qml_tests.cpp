@@ -11,12 +11,15 @@
 /// tracks the file the app uses. A test measuring a hand-copied delegate would
 /// keep passing after the real one broke.
 #include <QtCore/QCoreApplication>
+#include <QtCore/QFile>
 #include <QtCore/QUrl>
 #include <QtGui/QGuiApplication>
 #include <QtQml/QQmlComponent>
 #include <QtQml/QQmlEngine>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
+
+#include "ui/layoutaudit.h"
 
 #include <cmath>
 #include <iostream>
@@ -79,7 +82,18 @@ Bubble measure(QQmlEngine& engine, const char* author, const QString& content, c
         return out;
     }
 
-    std::unique_ptr<QObject> object(component.create());
+    // The four message properties are required, because that is how a ListView
+    // delegate receives the model's roles. They are therefore supplied at
+    // creation rather than set afterwards, which is also closer to what the
+    // delegate does: this test used to set them by hand and so measured a
+    // bubble the app itself never produced.
+    QVariantMap initial;
+    initial.insert(QStringLiteral("author"), QString::fromLatin1(author));
+    initial.insert(QStringLiteral("content"), content);
+    initial.insert(QStringLiteral("status"), QString::fromLatin1(status));
+    initial.insert(QStringLiteral("note"), QString());
+
+    std::unique_ptr<QObject> object(component.createWithInitialProperties(initial));
     if (!object) {
         std::cout << "  FAIL cannot create MessageBubble: "
                   << component.errorString().toStdString() << "\n";
@@ -94,10 +108,6 @@ Bubble measure(QQmlEngine& engine, const char* author, const QString& content, c
         return out;
     }
 
-    root->setProperty("author", author);
-    root->setProperty("content", content);
-    root->setProperty("status", status);
-    root->setProperty("note", QString());
     root->setWidth(rowWidth);
     root->setParentItem(window->contentItem());
 
@@ -322,6 +332,121 @@ void testListViewGivesRowsRealHeight(QQmlEngine& engine) {
     check(rows >= 1, "the list built at least one row (built " + std::to_string(rows) + ")");
 }
 
+/// The four message properties are how a delegate gets its content at all.
+///
+/// A ListView hands the model's roles to a delegate's *required* properties
+/// and to nothing else. Declared as ordinary properties they keep their
+/// defaults, every message renders as an empty string, and the transcript goes
+/// invisible while every geometry check in this file still passes: a
+/// correctly measured, completely empty conversation.
+///
+/// Checked against the declaration rather than against a rendered row, and
+/// that is deliberate. The rendered row is not proof here. The rest of this
+/// file sets these four properties by hand, so it measures a bubble the app
+/// itself never produces, which is how the whole file stayed green through a
+/// blank transcript. The invariant is a declaration in the source, so the
+/// source is what gets read.
+void testMessagePropertiesAreRequired() {
+    std::cout << "the message properties are required, so a delegate receives them\n";
+
+    QFile source(QStringLiteral(KESTREL_UI_DIR "/MessageBubble.qml"));
+    if (!source.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        std::cout << "  FAIL cannot read MessageBubble.qml: "
+                  << source.errorString().toStdString() << "\n";
+        ++g_failures;
+        return;
+    }
+    const QString text = QString::fromUtf8(source.readAll());
+
+    for (const char* name : {"author", "content", "status", "note"}) {
+        const QString declaration =
+            QStringLiteral("required property string ") + QString::fromLatin1(name);
+        check(text.contains(declaration),
+              std::string("MessageBubble.") + name + " is declared `" + declaration.toStdString()
+                  + "`, or a delegate is handed nothing");
+    }
+}
+
+/// A layout cell that loses its height is the failure this file could not see.
+///
+/// Every check above measures one item: this bubble's width, that row's
+/// height. A cell that has been given *no* height at all still measures fine
+/// on its own -- zero is a number, and zero is what the layout handed it. What
+/// is wrong is the relationship between it and its neighbour, and no
+/// single-item assertion looks at that. The diagnostics panel shipped three
+/// switches stacked on each other for exactly this reason, and this file was
+/// green throughout.
+///
+/// So the probe below is the shipped switch, reproduced exactly: a RowLayout
+/// whose only sized child is a plain Item wrapping the hit target, with the
+/// label inside that. Stated `implicitHeight` it lays out; without it, the
+/// layout has nothing to take a height from and the row collapses to nothing
+/// while the label still draws. The two panels differ by that one line, which
+/// is the whole claim: the audit can tell them apart.
+void testCollapsedLayoutCellIsFound() {
+    std::cout << "a layout cell with no height is found, and a healthy one is not reported\n";
+
+    const QUrl baseUrl = QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/layoutprobe.qml"));
+
+    static QQuickWindow* window = new QQuickWindow();
+    window->resize(420, 420);
+
+    // Instantiated twice from the same file, so the two panels are the same
+    // document differing only in the property under test.
+    const auto problemsFor = [&](bool rowsHaveHeight) {
+        QQmlEngine probeEngine;
+        probeEngine.addImportPath(QStringLiteral(KESTREL_UI_DIR));
+        QQmlComponent component(&probeEngine);
+        component.loadUrl(baseUrl);
+        if (component.isError()) {
+            std::cout << "  FAIL cannot load the layout probe: "
+                      << component.errorString().toStdString() << "\n";
+            ++g_failures;
+            return QVector<kestrel::ui::LayoutProblem>{};
+        }
+        std::unique_ptr<QObject> scene(component.create());
+        auto* sceneItem = qobject_cast<QQuickItem*>(scene.get());
+        if (sceneItem == nullptr) {
+            std::cout << "  FAIL the layout probe is not an Item\n";
+            ++g_failures;
+            return QVector<kestrel::ui::LayoutProblem>{};
+        }
+        sceneItem->setProperty("rowsHaveHeight", rowsHaveHeight);
+        sceneItem->setParentItem(window->contentItem());
+        window->show();
+        QCoreApplication::processEvents();
+        sceneItem->polish();
+        QCoreApplication::processEvents();
+        const auto found = kestrel::ui::auditLayouts(sceneItem);
+        sceneItem->setParentItem(nullptr);
+        return found;
+    };
+
+    const QVector<kestrel::ui::LayoutProblem> healthy = problemsFor(true);
+    const QVector<kestrel::ui::LayoutProblem> collapsed = problemsFor(false);
+
+    if (healthy.isEmpty()) {
+        std::cout << "  ok   the panel with a stated height reports nothing\n";
+    } else {
+        std::cout << "  FAIL the healthy panel reported " << healthy.size() << " problem(s); first is "
+                  << healthy.first().where.toStdString() << ": "
+                  << healthy.first().what.toStdString() << "\n";
+        ++g_failures;
+    }
+
+    // Three switches, three cells, three problems. The count is the point: a
+    // checker that finds one and misses the other two has not been shown to
+    // work, it has been shown to work once.
+    check(collapsed.size() == 3, "the collapsed panel reports all three switches (reported "
+                                     + std::to_string(collapsed.size()) + ")");
+    for (const auto& problem : collapsed) {
+        std::cout << "       " << problem.where.toStdString() << ": " << problem.what.toStdString()
+                  << "\n";
+    }
+    check(!collapsed.isEmpty() && collapsed.first().what.contains(QStringLiteral("cell is")),
+          "the report names a cell, not something else in the tree");
+}
+
 }  // namespace
 
 /// Runs the QML geometry tests; returns nonzero if any check fails.
@@ -344,6 +469,8 @@ int main(int argc, char** argv) {
     testStatusNoteFitsInsideTheBubble(engine);
     testUnbreakableTextIsNotClipped(engine);
     testListViewGivesRowsRealHeight(engine);
+    testMessagePropertiesAreRequired();
+    testCollapsedLayoutCellIsFound();
 
     if (g_failures == 0) {
         std::cout << "qml geometry tests passed\n";

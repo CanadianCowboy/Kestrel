@@ -11,9 +11,15 @@
 *.so
 *.dylib
 
-# Local developer helper scripts. These wrap machine-specific toolchain paths
-# (Visual Studio, Qt, CUDA) and are intentionally not shared.
-/tools/
+# The build, packaging and verification scripts are shared, because a fix to how
+# the app is packaged is a fix to the project and not to one machine. They take
+# every toolchain path from the environment and fall back to the defaults below,
+# so they run unchanged on a machine that has them somewhere else.
+#
+# What is left ignored here is the throwaway instrumentation: one-off probes
+# written to answer a single question, which measure nothing once the question
+# has been answered.
+/tools/*
 
 # Third-party dependency caches (JunctionBox and friends). These are
 # machine-specific and must never be committed.
@@ -53,3 +59,13 @@ Thumbs.db
 
 # Freebuff agent worktrees
 .freebuff/
+
+# Generated audio comparisons. These are rendered from a downloaded speech
+# model, so they are an artefact of running the voice locally rather than
+# something the repository should carry.
+voice-samples/
+
+# Window captures taken while reviewing a UI change. Same reasoning: they
+# record one machine's screen at one moment, and the reasoning they support
+# belongs in the commit message rather than in the tree.
+audit/

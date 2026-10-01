@@ -3,22 +3,45 @@
 #include <QElapsedTimer>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QThread>
+#include <QTimer>
 #include <QVariantList>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "app/conversationentry.h"
+#include "app/localvoiceengines.h"
 #include "app/conversationmodel.h"
 #include "app/messagemodel.h"
+#include "core/idlepersona.h"
+#include "core/idletool.h"
+#include "core/persona.h"
+#include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/cudadevice.h"
 #include "runtime/modelbackend.h"
+#include "runtime/speechrecognizer.h"
 
 namespace kestrel::app {
 
 class GenerationWorker;
+class SpeechSynthesizer;
+class ListenSession;
+
+// How long a reply may wait for a voice to announce itself before the app stops
+// waiting and delivers it as text.
+//
+// The deadline on waiting for a voice lives with the voice: SpeechSynthesizer
+// owns it, because a response is owed audio because of what the engine is doing,
+// not because of anything the controller knows about engines.
+//
+// Forward declared as a class, not a struct, to match its definition in
+// speechsynthesizer.h. MSVC encodes that difference in the mangled name, so a
+// mismatched tag here compiles and then fails to link.
+class SpeechBackend;
 
 // QML-facing application state: owns the conversations, the model backend,
 // and the streaming pipeline between them.
@@ -69,6 +92,71 @@ class AppController final : public QObject {
     Q_PROPERTY(bool canResume READ canResume NOTIFY voiceChanged)
     Q_PROPERTY(bool canBargeIn READ canBargeIn NOTIFY voiceChanged)
 
+    // Assistant presence, projected from the core presence engine. The UI
+    // animates on these instead of on raw events, so a pulse means the same
+    // thing whether it was caused by a keystroke, a barge-in, or the idle loop.
+    Q_PROPERTY(QString presenceState READ presenceState NOTIFY presenceChanged)
+    Q_PROPERTY(double presenceIntensity READ presenceIntensity NOTIFY presenceChanged)
+    Q_PROPERTY(bool presenceSpeaking READ presenceSpeaking NOTIFY presenceChanged)
+    Q_PROPERTY(QString personaMood READ personaMood NOTIFY presenceChanged)
+    // The single status line shown under the composer: an activity whisper, or
+    // an anticipatory line while one is still fresh.
+    Q_PROPERTY(QString statusWhisper READ statusWhisper NOTIFY presenceChanged)
+    // The cue said the moment a request is accepted. Empty once the answer is
+    // already underway, so a consumer can speak it once and move on.
+    Q_PROPERTY(QString acknowledgement READ acknowledgement NOTIFY presenceChanged)
+    // Kestrel's own thought between turns. Always populated, displayed only when
+    // the user asks to see it: an internal note that leaks by default is not an
+    // internal note.
+    Q_PROPERTY(QString ambientThought READ ambientThought NOTIFY presenceChanged)
+    Q_PROPERTY(QString idleTaskLabel READ idleTaskLabel NOTIFY presenceChanged)
+    // The idle tools the loop may ask for, and what each one still needs before
+    // it is allowed to run. A list rather than a single flag because the tools
+    // are not interchangeable: each declares its own capabilities, and the point
+    // of the panel is that the user can see which is which.
+    Q_PROPERTY(QVariantList idleTools READ idleTools NOTIFY idleToolsChanged)
+    // The voices the current backend can speak with, and the one it is using.
+    // Empty when the platform voice is in charge: that choice belongs to the
+    // operating system, and offering a list the user cannot change would be a
+    // control that does nothing.
+    Q_PROPERTY(QStringList speechVoices READ speechVoices NOTIFY ttsChanged)
+    Q_PROPERTY(QString currentVoice READ currentVoice NOTIFY ttsChanged)
+    // The local engines found on this machine, for switching between them.
+    Q_PROPERTY(QVariantList speechEngines READ speechEngines NOTIFY ttsChanged)
+    Q_PROPERTY(QString sessionTopic READ sessionTopic NOTIFY presenceChanged)
+
+    // The autonomous loop between turns, plus the two switches that keep it
+    // inside its box: the loop itself, the GPU prewarm that is off until asked
+    // for, and the reveal of internal thoughts.
+    Q_PROPERTY(bool idleLoopEnabled READ idleLoopEnabled WRITE setIdleLoopEnabled NOTIFY presenceChanged)
+    Q_PROPERTY(bool idlePrewarmEnabled READ idlePrewarmEnabled WRITE setIdlePrewarmEnabled NOTIFY presenceChanged)
+    Q_PROPERTY(bool showIdleThoughts READ showIdleThoughts WRITE setShowIdleThoughts NOTIFY presenceChanged)
+    // True while the composer holds unsent text. The idle loop goes quiet
+    // whenever this is set, so a half-typed question is never interrupted.
+    Q_PROPERTY(bool inputPending READ inputPending WRITE setInputPending NOTIFY presenceChanged)
+
+    // Audio. Available only when this build has a speech engine and the machine
+    // has an installed voice; false means the response is delivered as text,
+    // which is a supported outcome rather than an error.
+    Q_PROPERTY(bool ttsAvailable READ ttsAvailable NOTIFY ttsChanged)
+    Q_PROPERTY(QString ttsVoice READ ttsVoice NOTIFY ttsChanged)
+    Q_PROPERTY(bool speaking READ speaking NOTIFY ttsChanged)
+    // Why audio is unavailable, or what went wrong with it. Empty when it is
+    // simply working, so the interface can say which of the two it is.
+    Q_PROPERTY(QString ttsError READ ttsError NOTIFY ttsChanged)
+
+    // Speech input. A recognized phrase is submitted through the same path a
+    // typed one takes, so a spoken request interrupts a reply exactly as
+    // typing one would.
+    Q_PROPERTY(bool listening READ listening NOTIFY listeningChanged)
+    Q_PROPERTY(bool sttAvailable READ sttAvailable NOTIFY listeningChanged)
+    Q_PROPERTY(QString sttDetail READ sttDetail NOTIFY listeningChanged)
+    // Words heard so far, so the user can see and correct them before the
+    // phrase is committed to a turn.
+    Q_PROPERTY(QString partialTranscript READ partialTranscript NOTIFY listeningChanged)
+    // Why listening stopped without a phrase, empty otherwise.
+    Q_PROPERTY(QString listenError READ listenError NOTIFY listeningChanged)
+
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
 
     // The shared instruction prefix. It is identical on every turn, so the
@@ -103,6 +191,23 @@ public:
     // exactly the part with no coverage, and it cannot be covered without
     // choosing which backend drives it.
     void setBackendForTesting(std::unique_ptr<runtime::ModelBackend> backend);
+
+    // Test seam for audio: adopt a speech backend supplied by the caller, so the
+    // clause pump can be driven on a machine with no voice installed. Mirrors
+    // setBackendForTesting, for the same reason.
+    void setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> backend);
+
+    // Test seam for the persona: put the dials somewhere the idle loop would
+    // have put them. The warmth dial reaches the synthesizer as a plain copy,
+    // and a copy from a value that happens to equal the voice persona's own
+    // default is indistinguishable from no copy at all -- so checking that the
+    // wiring exists needs a dial that has actually moved.
+    void setPersonaStateForTesting(const core::PersonaState& state);
+
+    // Test seam for the voice deadline: shorten or lengthen how long a reply may
+    // wait for an engine to announce itself. The production value is sized
+    // against a measured model load; a test cannot wait that long.
+    void setVoiceLoadTimeoutForTesting(int ms);
 
     [[nodiscard]] MessageModel* messages() const noexcept;
     [[nodiscard]] ConversationModel* conversations() const noexcept;
@@ -141,6 +246,43 @@ public:
     [[nodiscard]] bool canResume() const noexcept;
     [[nodiscard]] bool canBargeIn() const noexcept;
 
+    [[nodiscard]] QString presenceState() const;
+    [[nodiscard]] double presenceIntensity() const noexcept;
+    [[nodiscard]] bool presenceSpeaking() const noexcept;
+    [[nodiscard]] QString personaMood() const;
+    [[nodiscard]] QString statusWhisper() const;
+    [[nodiscard]] QString acknowledgement() const noexcept;
+    [[nodiscard]] QString ambientThought() const;
+    [[nodiscard]] QString idleTaskLabel() const;
+    [[nodiscard]] QStringList speechVoices() const;
+    [[nodiscard]] QString currentVoice() const;
+    [[nodiscard]] QVariantList speechEngines() const;
+    // One map per declared tool: name, summary, whether it is switched on, the
+    // capabilities it declared, and which of those are still outstanding.
+    [[nodiscard]] QVariantList idleTools() const;
+    [[nodiscard]] QString sessionTopic() const;
+    [[nodiscard]] bool idleLoopEnabled() const noexcept;
+    [[nodiscard]] bool idlePrewarmEnabled() const noexcept;
+    [[nodiscard]] bool showIdleThoughts() const noexcept;
+    [[nodiscard]] bool inputPending() const noexcept;
+    [[nodiscard]] bool ttsAvailable() const noexcept;
+    [[nodiscard]] QString ttsVoice() const;
+    /// True while a clause is being spoken. False for the whole lifetime of a
+    /// build with no voice, and false between clauses of one that has it.
+    [[nodiscard]] bool speaking() const noexcept;
+    [[nodiscard]] QString ttsError() const;
+
+    [[nodiscard]] bool listening() const noexcept;
+    [[nodiscard]] bool sttAvailable() const noexcept;
+    [[nodiscard]] QString sttDetail() const;
+    [[nodiscard]] QString partialTranscript() const;
+    [[nodiscard]] QString listenError() const;
+
+    void setIdleLoopEnabled(bool enabled);
+    void setIdlePrewarmEnabled(bool enabled);
+    void setShowIdleThoughts(bool show);
+    void setInputPending(bool pending);
+
     [[nodiscard]] bool gpuAvailable() const;
     [[nodiscard]] QString gpuName() const;
     [[nodiscard]] QString gpuSummary() const;
@@ -156,6 +298,26 @@ public:
     void setSystemPrompt(const QString& text);
 
     Q_INVOKABLE void sendMessage(const QString& text);
+    // Permissioned idle work. Both of these are deliberately string-keyed from
+    // QML: the panel lists what the registry actually holds, and a name that is
+    // not there is ignored rather than inventing a tool or a capability.
+    Q_INVOKABLE void setIdleToolEnabled(const QString& name, bool enabled);
+    Q_INVOKABLE void setToolPermission(const QString& permission, bool granted);
+    // Changes the speaking voice. Refuses a name the backend does not have, so a
+    // stale setting cannot leave the app quietly speaking with something else.
+    Q_INVOKABLE bool setSpeechVoice(const QString& voice);
+    // Switches between the local engines. Rebuilds the backend, which is the
+    // only way to change which model is in charge of the voice.
+    Q_INVOKABLE bool setSpeechEngine(const QString& engineId);
+    [[nodiscard]] QString speechEngine() const { return m_speechEngine; }
+    // Speech input. A completed phrase is submitted exactly as if it had been
+    // typed, which is what makes a spoken request interrupt a reply the same way
+    // a typed one does. Returns false and says why when the recognizer refuses,
+    // rather than failing silently at a button the user can see.
+    Q_INVOKABLE bool startListening();
+    Q_INVOKABLE void stopListening();
+    // Starts a phrase over: the partial text is discarded, not submitted.
+    Q_INVOKABLE void abandonListening();
     Q_INVOKABLE void stopGeneration();
     Q_INVOKABLE void pauseConversation();
     Q_INVOKABLE void resumeConversation();
@@ -170,6 +332,20 @@ public:
     /// speak in URLs and converting here is far more reliable than string
     /// surgery on the percent-encoded form.
     Q_INVOKABLE void loadModelFromUrl(const QString& url);
+    /// Tries each path in turn and keeps the first that loads, publishing
+    /// modelLoadFinished exactly once, when the sequence has finished.
+    ///
+    /// The sequence lives here rather than in main because it is a property of
+    /// loading a model, not of the entry point that started it. Wiring it as a
+    /// second observer of modelLoadFinished -- which is what it was -- makes it
+    /// race every other observer: queued connections run in the order they were
+    /// made, so a --print-runtime that exits on the first completion never got
+    /// as far as trying the second candidate, and neither did the smoke test.
+    /// The fallback existed and had never once run.
+    ///
+    /// One signal, one meaning: whoever is listening hears the outcome of the
+    /// whole sequence rather than of whichever attempt happened to finish.
+    void loadModelFromUrls(const QStringList& urls);
     /// Goes back to the built-in preview backend, so a user who loaded the
     /// wrong file is not stuck with it.
     Q_INVOKABLE void usePreviewBackend();
@@ -197,11 +373,59 @@ signals:
     void modelLoadFinished();
     void metricsChanged();
     void voiceChanged();
+    /// Notifies observers that presence, mood, or the status line changed.
+    void presenceChanged();
+    void idleToolsChanged();
+    /// Notifies observers that audio availability or playback state changed.
+    void ttsChanged();
+    /// Notifies observers that listening state or the partial transcript changed.
+    void listeningChanged();
 
 private:
     // Worker callbacks, delivered on the UI thread by queued connections.
     void onGenerationToken(quint64 requestId, const QString& token);
     void onGenerationFinished(quint64 requestId, bool success, const QString& error);
+
+    // The idle thought cycle, driven by m_idleTimer. Silent whenever the user
+    // is present: a turn is running, the voice is live, or something is typed
+    // and unsent.
+    void onIdleTick();
+
+    // Listen session callbacks. The final phrase is handed to sendMessage, so
+    // there is exactly one way a turn starts no matter how the user said it.
+    void onUtteranceFinal(const QString& text, double confidence);
+    void onListeningEnded(const QString& reason);
+
+    // Playback pump. The synthesizer reports a clause finished; the controller
+    // asks VoiceSession for the next one, or lets the response complete when
+    // there is nothing left to say.
+    void onSpeechSegmentFinished();
+    void onSpeechStopCompleted();
+    void onSpeechFailed(const QString& reason);
+    // A voice became usable. A response that was asked for before the engine
+    // could answer is spoken here, if the engine turned up while it was still
+    // held. Whether anything is held, and whether the engine gave up being one,
+    // are the synthesizer's facts, not this class's.
+    void onSpeechAvailabilityChanged(bool available);
+    // A response that was owed a voice is now text, and delivering it is this
+    // class's job: only the controller completes the response, notes the
+    // assistant idle and emits the change. Raised wherever the promise ends
+    // without the audio -- the engine giving up, the user stopping, or the user
+    // leaving the conversation it belongs to -- so all of them arrive here.
+    void onOwedAudioReleased(bool voiceGaveUp);
+    void startPlayback();
+    void pumpNextSegment();
+    void finishPlayback();
+    // The persona this response is spoken with, and the act of handing it to
+    // the engine. Called where audio is actually asked for, not once when
+    // playback happens to begin: the engine holds the pace it was last given,
+    // and a clause made under a pace this response was never given cannot be
+    // corrected when it plays. Sampled once per response, so the choice is
+    // still the persona's per-response one.
+    void applyResponseVoice();
+    /// Offers a closing line if the delivered answer was long enough to warrant
+    /// one. Called wherever delivery actually completes, text-only or spoken.
+    void anticipateForDelivery();
 
     [[nodiscard]] ConversationEntry* findEntry(int id) noexcept;
     [[nodiscard]] ConversationEntry* activeEntry() noexcept;
@@ -213,17 +437,31 @@ private:
     /// Uses userText for the voice response timeline and resets per-response metrics.
     void startGeneration(const QString& userText);
 
-    /// Assembles the text actually sent to the model: the recent conversation
-    /// followed by an assistant cue. The shared system prompt is excluded on
-    /// purpose, because the backend keeps it as a cached prefix.
-    [[nodiscard]] QString buildPrompt(const QString& userText) const;
+    // The conversation for this turn, as structured messages. The backend
+    // renders it, because only the backend knows the model's chat template --
+    // and a rendered string here would have to be thrown away by anything that
+    // later needs to address individual turns.
+    [[nodiscard]] std::vector<runtime::ChatMessage> buildMessages() const;
 
-    /// Spins the UI event loop until the in-flight generation reports back, or
-    /// the timeout expires. Needed before swapping or destroying a backend,
-    /// because the worker is inside the old backend's generate() right now and
-    /// that backend is about to go away. Bounded, so a wedged backend cannot
-    /// freeze the window.
-    void waitForIdleGeneration(int timeoutMs);
+    // Spins the UI event loop until the in-flight generation reports back, or
+    // the timeout expires. Needed before swapping or destroying a backend,
+    // because the worker is inside the old backend's generate() right now and
+    // that backend is about to go away. Bounded, so a wedged backend cannot
+    // freeze the window.
+    void waitForIdleGeneration(int timeoutMs, bool stopAudio = true);
+
+    /// True while the worker is running anything at all: a reply, the idle
+    /// prewarm, or a permissioned tool. Every check that needs the worker free
+    /// -- before a backend swap, before reading live backend state -- asks this
+    /// rather than testing a subset of the three.
+    [[nodiscard]] bool workerBusy() const noexcept;
+
+    /// Cancels the prewarm or the tool run and waits for the worker to let go
+    /// of it. Called when a real turn arrives: both of those are inside the
+    /// backend's generate(), and one backend has one generator, so a reply
+    /// queued behind them waits for tokens nobody asked for. Bounded, so a
+    /// backend that ignores cancellation cannot freeze the window.
+    void drainBackgroundRequests();
 
     void finalizeStream(MessageStatus status, const QString& note);
     void touchActiveConversation();
@@ -237,12 +475,44 @@ private:
     void publishMetrics();
     void rebuildDiagnostics();
 
+    /// Monotonic milliseconds since the controller was created. Passed to the
+    /// presence engine and the idle loop rather than letting either read a
+    /// clock, so their behaviour is reproducible in tests.
+    [[nodiscard]] std::uint64_t nowMs() const noexcept;
+
+    /// Records what the assistant is doing and republishes presence.
+    void noteAssistant(core::AssistantAction action);
+    // Runs the declared idle tool if the registry permits it, and records what
+    // it did in the transcript. Private because the permission check lives
+    // inside; a caller cannot ask for the run to be forced.
+    void runIdleToolIfPermitted();
+    // Submits a background summary of the session. Only reached when the tool is
+    // permitted, a model is loaded, and the worker is free.
+    void startSessionSummary();
+
+    /// Offers an anticipatory line for this long, then lets the activity
+    /// whisper take the status line back.
+    void setWhisperOverride(const QString& text, int holdMs);
+
+    /// Asks the persona whether this moment deserves a line, and shows it if so.
+    void anticipate(core::PersonaTrigger trigger);
+
+    /// Any user or assistant action. Keeps the idle loop out of the way.
+    void noteActivity();
+
     std::unique_ptr<runtime::ModelBackend> m_backend;
 
     // The controller owns the thread so shutdown order is explicit: cancel the
     // work, stop the loop, wait for it, and only then destroy the worker.
     QThread m_generationThread;
     std::unique_ptr<QThread> m_modelLoadThread;
+    // Candidates still to try, most promising first, and the ones already
+    // refused. The second list exists so the final error can say which paths
+    // were tried and what each of them said, which is the difference between
+    // "your model is broken" and "the 4B model is broken but there is a 0.5B
+    // one beside it that works".
+    QStringList m_modelQueue;
+    QStringList m_modelAttempts;
     bool m_discardModelLoad = false;
     GenerationWorker* m_worker = nullptr;
 
@@ -276,6 +546,80 @@ private:
     // Voice state machine. Owns the response timeline and is the authority on
     // what the UI is allowed to offer next.
     core::VoiceSession m_voice;
+    // The persona the response being spoken was given, and whether one has been
+    // taken yet. Cleared when the response is delivered or its audio is stopped,
+    // so the next response picks up whatever the dials say then.
+    core::VoicePersona m_responseVoice;
+    bool m_responseVoiceTaken = false;
+
+    // The personality, the presence projection of it, and the loop that keeps
+    // the assistant company between turns. All three are portable core; this
+    // layer only polls them and translates the results into Qt properties.
+    core::Persona m_persona;
+    core::IdlePersona m_idle;
+    // The permission boundary for anything the loop does on its own. Held by
+    // value: it is small, and sharing one would let a tool grant itself a
+    // capability.
+    core::IdleToolRegistry m_idleTools;
+    // The local engines discovered at start-up, and which one is speaking.
+    std::unique_ptr<LocalVoiceEngines> m_localVoices;
+    QString m_speechEngine;
+    // Non-zero while a permissioned tool is using the worker. Tracked apart from
+    // the prewarm id so a backend swap can tell "busy answering someone" from
+    // "busy thinking on its own".
+    quint64 m_toolRequestId = 0;
+    // The text a permissioned tool produced, accumulated from its own tokens.
+    // It cannot come out of the streaming path, which only keeps the active
+    // request, and it cannot be read back off the transcript, whose last row
+    // belongs to whoever spoke last.
+    QString m_toolOutput;
+    // Why the last idle tool did not run, shown in place of the task detail. A
+    // tool that is refused without saying so is a tool the user cannot debug.
+    QString m_idleToolNotice;
+    core::Presence m_presence;
+    // Optional. Null only if the allocation fails; a build with no speech engine
+    // still constructs one, and it simply reports itself unavailable.
+    std::unique_ptr<SpeechSynthesizer> m_speech;
+    // The recognizer and the session that drives it. The recognizer stays a
+    // plain runtime type -- no QObject, no Qt types in the portable layer -- so
+    // the app owns it and the session borrows it. The type is the interface
+    // rather than the scripted one because which implementation it is depends
+    // on the machine: a Windows box with a microphone gets the SAPI adapter,
+    // and everything else gets the preview recognizer.
+    std::unique_ptr<runtime::SpeechRecognizer> m_recognizer;
+    std::unique_ptr<ListenSession> m_listen;
+    // True from the first clause of a response until the last one is spoken.
+    // Distinct from m_generating, because generation finishes long before the
+    // audio does, and the two states gate different things: the worker, and the
+    // spoken cursor.
+    bool m_speaking = false;
+    QString m_speechError;
+    QString m_listenError;
+    bool m_hasPendingSegment = false;
+    std::size_t m_pendingSegmentEnd = 0;
+    int m_openingPauseMs = 0;
+    bool m_waitingForSpeechBoundary = false;
+    bool m_deferredSpeechRestart = false;
+    QElapsedTimer m_clock;
+    QTimer m_idleTimer;
+    // In-flight GPU prewarm from the idle loop, or 0 when none is running. The
+    // loop is silent while this is set, so a second warmup cannot stack behind
+    // the first.
+    quint64 m_warmupRequestId = 0;
+
+    QString m_statusWhisperOverride;
+    qint64 m_whisperOverrideUntilMs = 0;
+    QString m_acknowledgement;
+    QString m_ambientThought;
+    // Kept apart rather than pre-joined into one label, because whether the
+    // detail may be shown is a property of the current settings, not of the
+    // task. Projecting it when the label is read means a change to those
+    // settings takes effect at once instead of leaving the previous
+    // projection on screen until the next task happens to run.
+    QString m_idleTaskKind;
+    QString m_idleTaskDetail;
+    bool m_inputPending = false;
+    bool m_showIdleThoughts = false;
     core::ResponseId m_activeResponse = core::kInvalidResponseId;
     core::GenerationId m_activeGeneration = core::kInvalidGenerationId;
     quint64 m_nextRequestId = 1;

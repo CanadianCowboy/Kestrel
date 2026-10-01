@@ -1,16 +1,26 @@
 #include "runtime/backendregistry.h"
+#include "runtime/modeldiscovery.h"
+#include "core/pathtext.h"
+#include "runtime/chatformat.h"
 #include "runtime/cudadevice.h"
 #include "runtime/engineartifact.h"
 #include "runtime/llamacppbackend.h"
 #include "runtime/mockbackend.h"
-#include "runtime/tensorrtbackend.h"
+#include "runtime/ortgenaibackend.h"
+#include "runtime/sapirecognizer.h"
+#include "runtime/speechrecognizer.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <string>
+#include <utility>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -39,6 +49,47 @@ runtime::CudaProbe makeProbe(bool runtimeAvailable, std::vector<runtime::CudaDev
     probe.selectedDeviceIndex =
         runtime::resolveSelectedDeviceIndex(probe.devices, -1);
     return probe;
+}
+
+// A one-turn request, which is what most of these tests want to say. Written as
+// a helper so the assertions below read as behaviour rather than as brace
+// nesting, and so a future change to the request shape touches one place.
+runtime::GenerationRequest ask(std::string text, float temperature = 0.7F,
+                               int maxTokens = 32) {
+    return runtime::GenerationRequest(
+        {runtime::ChatMessage{runtime::Role::User, std::move(text)}}, temperature, maxTokens);
+}
+
+void testModelDiscoveryAndPlainContinuation() {
+    const auto root = std::filesystem::temp_directory_path() / "kestrel_discovery_regression";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "onnx/decoder");
+    std::filesystem::create_directories(root / "empty");
+    const auto unicodeName = core::pathFromUtf8("\xe6\xa8\xa1\xe5\x9e\x8b.GGUF");
+    { std::ofstream(root / unicodeName, std::ios::binary) << "gguf"; }
+    { std::ofstream(root / "zero.gguf", std::ios::binary); }
+    { std::ofstream(root / "onnx/genai_config.json") << "{}"; }
+    { std::ofstream(root / "onnx/decoder/model.ONNX", std::ios::binary) << "graph"; }
+    { std::ofstream(root / "empty/genai_config.json"); }
+    { std::ofstream(root / "empty/model.onnx") << "graph"; }
+    const auto candidates = runtime::discoverModels(root);
+    assert(candidates.size() == 2);
+    assert(candidates.front().path == core::pathText(root / "onnx"));
+    assert(candidates.back().path == core::pathText(root / unicodeName));
+    assert(runtime::discoverModels(root / "missing").empty());
+    std::filesystem::remove_all(root);
+
+    const std::vector<runtime::ChatMessage> history{
+        {runtime::Role::System, "Instruction"}, {runtime::Role::User, "Question"},
+        {runtime::Role::Assistant, "Partial"}};
+    assert(runtime::renderPlainChat(history, false) == "Instruction\n\nuser: Question\nassistant: Partial");
+    assert(runtime::renderPlainChat(history, true).ends_with("Partial\nassistant:"));
+    auto emptyAssistant = history;
+    emptyAssistant.back().content.clear();
+    assert(runtime::renderPlainChat(emptyAssistant, false)
+           == "Instruction\n\nuser: Question\nassistant:");
+    assert(runtime::renderPlainChat({{runtime::Role::Assistant, ""}}, false) == "assistant:");
+    assert(runtime::selectBackend(runtime::BackendKind::Mock)->kind() == runtime::BackendKind::Mock);
 }
 
 void testVersionAndByteFormatting() {
@@ -261,105 +312,34 @@ void testEngineCompatibility() {
            == "incompatible");
 }
 
-void testTensorRtBackendValidatesEngine() {
-    runtime::TensorRTBackend backend;
-    std::string error;
-
-    assert(!backend.loadModel("", error));
-    assert(error.find("No engine path") != std::string::npos);
-
-    assert(!backend.loadModel("definitely_not_here.plan", error));
-    assert(error.find("not found") != std::string::npos);
-
-    // Generating without a loaded engine must fail cleanly, not crash.
-    bool completed = false;
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
-                     [&completed](bool success, std::string_view) { completed = !success; });
-
-    assert(completed);
-
-    const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / "kestrel_trt_backend_test";
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
-
-    const std::string emptyEngine = (dir / "empty.plan").string();
-    { std::ofstream file(emptyEngine, std::ios::binary); }
-    assert(!backend.loadModel(emptyEngine, error));
-    assert(error.find("empty") != std::string::npos);
-
-    const std::string goodEngine = (dir / "good.plan").string();
-    { std::ofstream file(goodEngine, std::ios::binary); file << "engine bytes"; }
-
-    // A build record that contradicts the current GPU must stop the load.
-    const runtime::CudaProbe probe = runtime::probeCuda();
-    if (probe.hasDevice()) {
-        runtime::EngineBuildRecord hostile;
-        hostile.tensorrtVersion = 10400;
-        hostile.cudaVersion = 12040;
-        hostile.computeMajor = 3;
-        hostile.computeMinor = 5;
-        hostile.gpuName = "Definitely Not This GPU";
-        const bool wrote = runtime::writeEngineBuildRecord(goodEngine, hostile, error);
-        assert(wrote);
-        const bool loadedIncompatible = backend.loadModel(goodEngine, error);
-        assert(!loadedIncompatible);
-        assert(error.find("Rebuild the engine") != std::string::npos);
-        assert(!backend.status().modelLoaded);
-    }
-
-    // No record at all is loadable: absence of metadata is not a defect.
-    std::filesystem::remove(runtime::engineSidecarPath(goodEngine));
-    const bool loaded = backend.loadModel(goodEngine, error);
-    assert(loaded);
-    assert(error.empty());
-    assert(backend.status().modelLoaded);
-    assert(backend.status().modelName == "good.plan");
-    assert(backend.lastCompatibility().verdict == runtime::EngineCompatibility::Unknown);
-    assert(backend.lastCompatibility().summary.find("build record") != std::string::npos);
-
-    // Generation is still refused, but with the reason the adapter owns.
-    std::string generateError = "unset";
-    backend.generate({"hi", 0.7F, 16}, [](std::string_view) {},
-                     [&generateError](bool, std::string_view message) {
-                         generateError = std::string(message);
-                     });
-    assert(!generateError.empty());
-    assert(generateError.find("TensorRT") != std::string::npos);
-
-    // Cancellation is a real flag, not a no-op, and is safe when idle.
-    backend.cancel();
-    backend.cancel();
-
-    std::filesystem::remove_all(dir);
-}
-
 void testBackendSelectionAndDiagnostics() {
     const auto backend = runtime::selectBackend(runtime::BackendKind::Mock);
     assert(backend != nullptr);
     assert(backend->status().available);
 
-    // An unavailable preference must fall through rather than return a
-    // backend that cannot run.
-    const auto fallback = runtime::selectBackend(runtime::BackendKind::TensorRT);
-    assert(fallback != nullptr);
-    assert(fallback->status().available);
-
     assert(runtime::toString(runtime::BackendKind::Mock) == "mock");
     assert(runtime::toString(runtime::BackendKind::LlamaCpp) == "llamacpp");
-    assert(runtime::toString(runtime::BackendKind::TensorRT) == "tensorrt");
+    assert(runtime::toString(runtime::BackendKind::OrtGenAI) == "onnx-genai");
 
     const auto diagnostics = runtime::runtimeDiagnostics(runtime::probeCuda());
     assert(!diagnostics.empty());
     bool sawCudaRow = false;
+    bool sawGenAiRow = false;
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         assert(!row.label.empty());
         assert(!row.value.empty());
         if (row.label == "CUDA toolkit") {
             sawCudaRow = true;
         }
+        if (row.label == "ONNX Runtime GenAI") {
+            sawGenAiRow = true;
+        }
     }
     assert(sawCudaRow);
+    // The Windows-native backend must be visible in the report whether or not it
+    // is compiled in. A backend that only appears once it is linked is a
+    // backend nobody can discover before deciding to build it.
+    assert(sawGenAiRow);
     std::printf("  diagnostics rows: %zu\n", diagnostics.size());
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         std::printf("    [%s] %s: %s\n", row.ok ? " ok " : "warn", row.label.c_str(),
@@ -433,7 +413,7 @@ void testLlamaCppBackendReportsUnavailableWithoutSdk() {
 
     bool completed = false;
     bool refused = false;
-    backend.generate(runtime::GenerationRequest{"hi", 0.7F, 16}, nullptr,
+    backend.generate(ask("hi", 0.7F, 16), nullptr,
                      [&completed, &refused](bool success, std::string_view) {
                          // Without a loaded model every build must refuse. Note
                          // the callback runs while the backend holds its own
@@ -491,10 +471,9 @@ void testSharedSystemPromptPrefix() {
     mock.resetContextUsage();
     const std::size_t afterPrefixOnly = mock.status().contextUsed;
     assert(afterPrefixOnly == 0);
-    // The reply has to be collected to be charged for, so the exact figure can
-    // be stated: prefix, the turn's own prompt, and what came back.
+    // Account for the rendered request, the shared prefix, and delivered text.
     std::string reply;
-    mock.generate(runtime::GenerationRequest{"hello", 0.7F, 32},
+    mock.generate(ask("hello", 0.7F, 32),
                   [&reply](std::string_view token) { reply.append(token); },
                   [](bool, std::string_view) {});
     assert(!reply.empty());
@@ -502,18 +481,50 @@ void testSharedSystemPromptPrefix() {
     // Exact, not a lower bound. A duplicate charge of the prefix is precisely
     // the bug worth catching here, and ">=" would sail straight past it.
     assert(mock.status().contextUsed
-           == mock.countTokens(prefix) + mock.countTokens("hello") + mock.countTokens(reply));
+           == mock.countTokens(prefix)
+              + mock.countTokens(runtime::renderPlainChat(ask("hello").messages, true))
+              + mock.countTokens(reply));
+    reply.clear();
+    mock.generate(ask("a second turn", 0.7F, 8),
+                  [&reply](std::string_view token) { reply.append(token); },
+                  [](bool, std::string_view) {});
+    assert(mock.status().contextUsed
+           == mock.countTokens(prefix)
+              + mock.countTokens(runtime::renderPlainChat(ask("a second turn").messages, true))
+              + mock.countTokens(reply));
 }
 
-/// Exercises the real llama.cpp generation path.
+/// One environment variable, as a string the caller owns.
 ///
+/// getenv is deprecated on Windows because the pointer it returns aliases an
+/// environment block the caller does not own, and MSVC says so at /W4 on every
+/// use. The secure variant is the documented replacement there and is a
+/// different signature, so the two cannot share a line; this file is compiled
+/// both with and without Qt, so it cannot reach for QString either.
+std::string environmentOrEmpty(const char* name) {
+#ifdef _WIN32
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr) {
+        return {};
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+#endif
+}
+
+/// Exercises the real llama.cpp generation path.///
 /// Skipped unless KESTREL_TEST_GGUF points at a GGUF file, so CI does not need
 /// a multi-hundred-megabyte model download to run the suite. When it is set,
 /// this is the only test that proves the backend actually generates rather than
 /// merely linking.
 void testLlamaCppGeneratesFromRealModel() {
-    const char* modelPath = std::getenv("KESTREL_TEST_GGUF");
-    if (modelPath == nullptr || *modelPath == '\0') {
+    const std::string modelPath = environmentOrEmpty("KESTREL_TEST_GGUF");
+    if (modelPath.empty()) {
         std::printf("  skip  real GGUF generation (set KESTREL_TEST_GGUF to run)\n");
         return;
     }
@@ -535,7 +546,7 @@ void testLlamaCppGeneratesFromRealModel() {
 
 
     if (!backend.loadModel(modelPath, error)) {
-        std::printf("  FAIL  could not load %s: %s\n", modelPath, error.c_str());
+        std::printf("  FAIL  could not load %s: %s\n", modelPath.c_str(), error.c_str());
         std::abort();
     }
 
@@ -564,7 +575,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string generated;
     bool completed = false;
     bool success = false;
-    backend.generate(runtime::GenerationRequest{"Continue this sentence in one short paragraph:\n\n\"The Kestrel flew", 0.7F, 32},
+    backend.generate(ask("Continue this sentence in one short paragraph: The Kestrel flew", 0.7F, 32),
                      [&generated](std::string_view token) { generated.append(token); },
                      [&](bool ok, std::string_view) {
                          success = ok;
@@ -614,7 +625,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string firstTurn;
     std::string firstError;
     bool firstOk = false;
-    backend.generate(runtime::GenerationRequest{"Name one bird.", 0.7F, 16},
+    backend.generate(ask("Name one bird.", 0.7F, 16),
                      [&firstTurn](std::string_view token) { firstTurn.append(token); },
                      [&firstOk, &firstError](bool ok, std::string_view error) {
                          firstOk = ok;
@@ -638,7 +649,7 @@ void testLlamaCppGeneratesFromRealModel() {
     std::string secondTurn;
     std::string secondError;
     bool secondOk = false;
-    backend.generate(runtime::GenerationRequest{"Name a different bird.", 0.7F, 16},
+    backend.generate(ask("Name a different bird.", 0.7F, 16),
                      [&secondTurn](std::string_view token) { secondTurn.append(token); },
                      [&secondOk, &secondError](bool ok, std::string_view error) {
                          secondOk = ok;
@@ -658,9 +669,390 @@ void testLlamaCppGeneratesFromRealModel() {
     backend.clearSharedPrefix();
     assert(backend.systemPrompt().empty());
     assert(backend.cachedPrefixTokens() == 0);
+    bool continued = false;
+    std::string continuation;
+    backend.generate(runtime::GenerationRequest({
+        {runtime::Role::User, "Count from one to ten, separated by commas."},
+        {runtime::Role::Assistant, "1, 2,"}}, 0.0F, 16, false),
+        [&](std::string_view token) { continuation.append(token); },
+        [&](bool ok, std::string_view) { continued = ok; });
+    assert(continued && !continuation.empty());
+    std::printf("  assistant continuation: %.60s\n", continuation.c_str());
+}
+
+// Real generation through ONNX Runtime GenAI, on a real model, on this machine's
+// GPU. The same shape as the llama.cpp test above and for the same reason: the
+// project's central claim is that it runs a language model locally, and the only
+// way that claim is ever checked is by running one.
+//
+// Gated on KESTREL_TEST_ONNX_MODEL pointing at a GenAI model directory, because
+// a model is gigabytes and cannot be vendored. What this asserts beyond the
+// llama.cpp version is specific to this backend:
+//
+//   * the model is a *directory*, and a path that is not one is refused with a
+//     message that says so -- a caller handing over a .gguf gets a useful
+//     sentence rather than a bare failure;
+//   * the context length is the smaller of what the model declares and what
+//     this machine's VRAM affords. Qwen3.5 declares 262144, which is not a
+//     setting on an 8 GB card, and a backend that took the declared number at
+//     face value would fail at load time with an out-of-memory error and no
+//     explanation;
+//   * a system prompt reaches the model, and the backend is honest that it does
+//     not keep the prefix resident between turns.
+void testOrtGenAiGeneratesFromRealModel() {
+    const std::string modelPath = environmentOrEmpty("KESTREL_TEST_ONNX_MODEL");
+    if (modelPath.empty()) {
+        std::printf("  skip  real ONNX GenAI generation (set KESTREL_TEST_ONNX_MODEL to run)\n");
+        return;
+    }
+
+    runtime::OrtGenAiBackend backend;
+    std::string error;
+
+    // Same assertion as the llama.cpp backend, and for the same reason: a
+    // backend that reports itself unavailable until it has already loaded a
+    // model is one the registry skips and the UI hides.
+    if (!backend.status().available) {
+        std::printf("  FAIL  a linked ONNX Runtime GenAI backend reported itself unavailable\n");
+        std::abort();
+    }
+    assert(!backend.status().modelLoaded);
+
+    // A file is not a GenAI model, and saying so precisely is the difference
+    // between a caller fixing its path and a caller filing a bug.
+    {
+        runtime::OrtGenAiBackend rejecting;
+        std::string rejected;
+        if (rejecting.loadModel(modelPath + "/definitely-not-here", rejected)) {
+            std::printf("  FAIL  a nonexistent model path was accepted\n");
+            std::abort();
+        }
+        assert(rejected.find("folder") != std::string::npos
+               || rejected.find("genai_config") != std::string::npos);
+    }
+
+    if (!backend.loadModel(modelPath, error)) {
+        std::printf("  FAIL  could not load %s: %s\n", modelPath.c_str(), error.c_str());
+        std::abort();
+    }
+
+    const runtime::RuntimeStatus loaded = backend.status();
+    assert(loaded.modelLoaded);
+    assert(loaded.contextLimit > 0);
+    // A context of zero or one would let the assertions below pass while the
+    // model could not answer a real question.
+    assert(loaded.contextLimit >= 1024);
+    // The KV figure must be a real allocation, not zero, or "how long a context
+    // can I afford" has no answer.
+    assert(loaded.kvCacheBytes > 0);
+    std::printf("  onnx model: %s, ctx=%d, %s KV\n", loaded.modelName.c_str(),
+                static_cast<int>(loaded.contextLimit),
+                runtime::formatBytes(loaded.kvCacheBytes).c_str());
+
+    // The tokenizer must be real, and must distinguish two equal-length strings
+    // the way a real vocabulary does and a chars-per-token ratio cannot.
+    const std::string sentence = "The quick brown fox jumps over the lazy dog";
+    const std::size_t exact = backend.countTokens(sentence);
+    assert(exact > 0);
+    const std::string shorter = "The quick brown fox jumps over cat";
+    const std::string run(shorter.size(), 'a');
+    assert(backend.countTokens(run) != backend.countTokens(shorter));
+
+    std::string generated;
+    bool completed = false;
+    bool success = false;
+    std::string failure;
+    backend.setSystemPrompt("You are Kestrel, a local desktop assistant. Answer briefly.");
+    backend.generate(ask("In one short sentence, what does a hawk do?", 0.7F, 48),
+                     [&generated](std::string_view token) { generated.append(token); },
+                     [&](bool ok, std::string_view errorText) {
+                         success = ok;
+                         failure = std::string(errorText);
+                         completed = true;
+                     });
+
+    assert(completed);
+    if (!success) {
+        std::printf("  FAIL  generation failed: %s\n", failure.c_str());
+        std::abort();
+    }
+    // An empty response reporting itself as a success is the failure mode that
+    // matters here, and it is the one this asserts against.
+    assert(!generated.empty());
+    std::printf("  %zu prompt tokens, %zu chars generated\n", exact, generated.size());
+    std::printf("  sample: %.110s\n", generated.c_str());
+
+    // The context must have moved, must stay inside the window, and the byte
+    // figures must stay consistent with it.
+    const runtime::RuntimeStatus after = backend.status();
+    assert(after.contextUsed > 0);
+    assert(after.contextUsed <= after.contextLimit);
+    assert(after.kvCacheBytesUsed > 0);
+    assert(after.kvCacheBytesUsed <= after.kvCacheBytes);
+
+    // The system prompt is applied, and the backend does not claim a saving it
+    // has not made: this one re-decodes the prefix each turn rather than
+    // keeping it resident, so cachedPrefixTokens() must say zero. Reporting a
+    // token count there would be claiming a cache that does not exist.
+    assert(!backend.systemPrompt().empty());
+    assert(backend.cachedPrefixTokens() == 0);
+
+    // Cancellation must be honoured promptly and reported as a cancellation
+    // rather than as a silent success, because the barge-in path depends on it.
+    //
+    // On a thread, with the cancel coming from inside the token callback. The
+    // synchronous version of this test cancelled a generate() that had already
+    // returned, so the only assertion left was one that could not fail: a
+    // backend that ignored cancellation entirely would have passed it. What is
+    // being claimed is that cancelling mid-turn stops the turn, and that can
+    // only be observed while a turn is actually running.
+    {
+        std::mutex mutex;
+        std::string partial;
+        std::size_t tokensSeen = 0;
+        const auto request = ask("Count slowly from one to two hundred.", 0.7F, 256);
+        bool done = false;
+        bool wasSuccessful = true;
+        bool cancelIssued = false;
+
+        std::thread worker([&] {
+            backend.generate(
+                request,
+                [&](std::string_view token) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        partial.append(token);
+                        ++tokensSeen;
+                        if (!cancelIssued) {
+                            // From the generating thread, which is the case that
+                            // matters: the app's cancel() arrives on the UI
+                            // thread while the worker is inside generate().
+                            cancelIssued = true;
+                            backend.cancel();
+                        }
+                    }
+                },
+                [&](bool ok, std::string_view) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    wasSuccessful = ok;
+                    done = true;
+                });
+        });
+        worker.join();
+
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(done);
+        assert(cancelIssued);
+        // A cancelled turn reports failure. The backend may have finished
+        // between the cancel and the next token, and then success is honest --
+        // but only if it actually produced something, and only after a cancel
+        // that a backend ignoring cancellation would never have seen land
+        // mid-turn. What must never happen is a full 256-token reply to a
+        // request that cancelled itself on its first token.
+        assert(!wasSuccessful || tokensSeen < static_cast<std::size_t>(request.maxTokens));
+    }
+}
+
+// Which recognizer the app uses depends on the machine, so the decision is
+// tested on its own rather than by looking for a microphone. Both branches are
+// asserted here, and neither of them needs audio hardware to run: the point is
+// the choice, not the listening.
+void testRecognizerSelectionFollowsTheMicrophone() {
+    std::printf("  selection: mic present -> platform adapter, mic absent -> mock\n");
+
+    // The rule itself, with no platform code involved at all.
+    assert(runtime::preferPlatformRecognizer(runtime::Microphone::Present));
+    assert(!runtime::preferPlatformRecognizer(runtime::Microphone::Absent));
+
+    // Whether this build has the adapter at all is a property of the build, not
+    // of the test, so it is read rather than assumed. A portable build compiles
+    // the stub, which reports unavailable, and must then hand back the mock
+    // rather than something that cannot listen.
+    const auto platform = runtime::makePlatformSpeechRecognizer();
+    assert(platform != nullptr);
+    const bool platform_usable = platform->available();
+
+    const auto with_microphone = runtime::makeRecognizerFor(runtime::Microphone::Present);
+    assert(with_microphone != nullptr);
+    assert(with_microphone->available());
+    const bool gave_back_the_mock =
+        dynamic_cast<runtime::MockSpeechRecognizer*>(with_microphone.get()) != nullptr;
+    // Exactly one of the two, and which one follows from what the build can do
+    // -- never from luck about the machine running the test.
+    assert(gave_back_the_mock != platform_usable);
+    std::printf("  with a microphone: %s\n", with_microphone->detail().c_str());
+
+    const auto without_microphone = runtime::makeRecognizerFor(runtime::Microphone::Absent);
+    assert(without_microphone != nullptr);
+    assert(dynamic_cast<runtime::MockSpeechRecognizer*>(without_microphone.get()) != nullptr);
+    std::printf("  without one:       %s\n", without_microphone->detail().c_str());
+}
+
+// The mock is not a placeholder behind the fallback; the barge-in tests drive
+// partial results through it, so the branch chosen when there is no microphone
+// has to keep producing them.
+void testMockRecognizerStillStreamsPartials() {
+    std::printf("  the fallback recognizer still streams partial words\n");
+
+    auto recognizer = runtime::makeRecognizerFor(runtime::Microphone::Absent);
+    assert(recognizer != nullptr);
+
+    std::vector<runtime::RecognitionResult> seen;
+    std::string end_reason;
+    std::string failure;
+    const bool started = recognizer->start(
+        [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
+        [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
+            end_reason = runtime::toString(reason);
+        },
+        failure);
+    assert(started);
+    assert(failure.empty());
+    assert(recognizer->listening());
+
+    auto* mock = dynamic_cast<runtime::MockSpeechRecognizer*>(recognizer.get());
+    assert(mock != nullptr);
+    for (int i = 0; i < 10 && recognizer->listening(); ++i) {
+        mock->emitNextPartial();
+    }
+
+    assert(!seen.empty());
+    // Partial before final, or a consumer that renders words as they arrive has
+    // nothing to render.
+    assert(!seen.front().isFinal);
+    assert(seen.back().isFinal);
+    assert(!seen.back().text.empty());
+    assert(seen.back().text.size() > seen.front().text.size());
+    assert(end_reason == runtime::toString(runtime::RecognitionEnd::Silence));
+    assert(!recognizer->listening());
+    std::printf("  %zu results, \"%s\"\n", seen.size(), seen.back().text.c_str());
+
+    // A stop mid-phrase is a cancellation, and reports no phrase. A recognizer
+    // that handed back a half-sentence on cancel would submit words the user
+    // did not finish saying.
+    const bool restarted = recognizer->start(
+        [&seen](const runtime::RecognitionResult& result) { seen.push_back(result); },
+        [&end_reason](runtime::RecognitionEnd reason, std::string_view) {
+            end_reason = runtime::toString(reason);
+        },
+        failure);
+    assert(restarted);
+    mock->emitNextPartial();
+    const std::size_t before_stop = seen.size();
+    recognizer->stop();
+    assert(end_reason == runtime::toString(runtime::RecognitionEnd::Cancelled));
+    const auto& cancelled = seen.back();
+    assert(!cancelled.isFinal);
+    assert(cancelled.text.empty());
+    assert(seen.size() == before_stop + 1);
+    assert(!recognizer->listening());
 }
 
 /// Runs portable runtime checks and optional GGUF integration checks; assertions abort on failure.
+/// Runs the real platform recognizer and reports what the engine actually did.
+///
+/// Gated on KESTREL_TEST_DICTATE, because it opens the microphone for real and
+/// a CI machine has none. With it set this is the only thing in the project
+/// that proves the speech path runs rather than merely compiles -- which is the
+/// distinction that mattered here, since the adapter built cleanly for a long
+/// time while containing no grammar and so could never recognise a word.
+///
+/// The interesting assertion is not the text. It is that a session *ends* with
+/// a reason the adapter chose, rather than silently: before the grammar existed
+/// this path had nothing to raise SPEI_RECOGNITION and nothing to wait for, and
+/// the only honest outcome is reported as such.
+void testPlatformRecognizerRunsWhenAsked() {
+    const std::string flag = environmentOrEmpty("KESTREL_TEST_DICTATE");
+    if (flag.empty()) {
+        std::printf("  skip  live dictation (set KESTREL_TEST_DICTATE to run)\n");
+        return;
+    }
+
+    auto recognizer = runtime::makePlatformSpeechRecognizer();
+    assert(recognizer != nullptr);
+    if (!recognizer->available()) {
+        std::printf("  FAIL  the platform recognizer reported itself unavailable: %s\n",
+                    recognizer->detail().c_str());
+        std::abort();
+    }
+    std::printf("  recognizer: %s\n", recognizer->detail().c_str());
+
+    std::mutex mutex;
+    std::vector<std::string> results;
+    std::string ending;
+    runtime::RecognitionEnd end = runtime::RecognitionEnd::Failed;
+    bool sawEnd = false;
+
+    // The deadline is the recognizer's own, not this test's: a session that
+    // runs to its 30s phrase deadline and reports why is a pass, and one that
+    // returns in a few milliseconds with an error is a pass that found a fault.
+    const int seconds = flag == "quick" ? 8 : 35;
+
+    std::string error;
+    const bool started = recognizer->start(
+        [&](const runtime::RecognitionResult& result) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (result.isFinal) {
+                results.push_back(result.text);
+            }
+        },
+        [&](runtime::RecognitionEnd reason, std::string_view detail) {
+            std::lock_guard<std::mutex> lock(mutex);
+            end = reason;
+            ending = std::string(detail);
+            sawEnd = true;
+        },
+        error);
+
+    if (!started) {
+        std::printf("  FAIL  start() refused: %s\n", error.c_str());
+        std::abort();
+    }
+    assert(recognizer->listening());
+
+    for (int i = 0; i < seconds * 10; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (sawEnd) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    recognizer->stop();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!sawEnd) {
+        std::printf("  FAIL  the session never ended after %d seconds\n", seconds);
+        std::abort();
+    }
+    const char* reason = "unknown";
+    switch (end) {
+    case runtime::RecognitionEnd::Silence: reason = "silence (phrase completed)"; break;
+    case runtime::RecognitionEnd::NoAudio: reason = "no audio"; break;
+    case runtime::RecognitionEnd::Cancelled: reason = "cancelled"; break;
+    case runtime::RecognitionEnd::Failed: reason = "failed"; break;
+    }
+    std::printf("  session ended: %s -- %s\n", reason, ending.c_str());
+    for (const std::string& text : results) {
+        std::printf("  heard: \"%s\"\n", text.c_str());
+    }
+    std::printf("  final phrases: %zu\n", results.size());
+    // A session that ends by failing is a finding, not a pass: the grammar now
+    // exists, so the engine has something to listen with, and a failure here
+    // names the step that failed in its own detail string.
+    //
+    // Abort rather than assert, and the reason is NDEBUG. A Release or
+    // RelWithDebInfo build defines it, the assertion compiles away, and the
+    // test prints the failure above and then returns success. The pattern the
+    // rest of this test already uses.
+    if (end == runtime::RecognitionEnd::Failed) {
+        std::printf("  FAIL  the session failed: %s\n", ending.c_str());
+        std::abort();
+    }
+}
+
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
     // checks ran. A lost buffer turns a five-second diagnosis into a guess.
@@ -674,18 +1066,22 @@ int main() {
         test();                                  \
     } while (false)
 
+    KESTREL_RUN(testModelDiscoveryAndPlainContinuation);
     KESTREL_RUN(testVersionAndByteFormatting);
     KESTREL_RUN(testDeviceFormatting);
     KESTREL_RUN(testDeviceSelection);
     KESTREL_RUN(testProbeIsSafeWithoutDevices);
     KESTREL_RUN(testEngineSidecarRoundTrip);
     KESTREL_RUN(testEngineCompatibility);
-    KESTREL_RUN(testTensorRtBackendValidatesEngine);
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
+    KESTREL_RUN(testRecognizerSelectionFollowsTheMicrophone);
+    KESTREL_RUN(testMockRecognizerStillStreamsPartials);
     KESTREL_RUN(testBackendDrivenTokenCounting);
     KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);
     KESTREL_RUN(testLlamaCppGeneratesFromRealModel);
+    KESTREL_RUN(testOrtGenAiGeneratesFromRealModel);
+    KESTREL_RUN(testPlatformRecognizerRunsWhenAsked);
 #undef KESTREL_RUN
 
     std::printf("runtime tests passed\n");

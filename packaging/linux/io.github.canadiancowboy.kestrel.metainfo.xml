@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.canadiancowboy.kestrel</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!--
+    The LICENSE file is MIT with an additive express patent grant, which is not
+    an SPDX identifier, so it is named with a LicenseRef rather than claimed as
+    plain MIT. That would understate the patent terms in any software centre
+    that reads this.
+  -->
+  <project_license>LicenseRef-Kestrel-MIT-Patent</project_license>
+  <name>Kestrel</name>
+  <summary>Chat privately with local models on your own machine</summary>
+  <description>
+    <p>
+      Kestrel is a local-first desktop workspace for talking to models that run on
+      your own hardware. Prompts, responses, and model files stay on the machine
+      unless an external integration is deliberately enabled.
+    </p>
+    <p>
+      It can drive a GGUF model through llama.cpp, with or without an NVIDIA GPU,
+      and reports the device and backend it actually found rather than assuming one.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.canadiancowboy.kestrel.desktop</launchable>
+  <url type="homepage">https://github.com/CanadianCowboy/Kestrel</url>
+  <url type="bugtracker">https://github.com/CanadianCowboy/Kestrel/issues</url>
+  <developer id="io.github.canadiancowboy">
+    <name>JoshLynes</name>
+  </developer>
+  <provides>
+    <binary>kestrel</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

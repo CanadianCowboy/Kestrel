@@ -34,18 +34,24 @@ Item {
 
     /// "user" or "assistant", as spelled by MessageModel::AuthorRole.
     ///
-    /// These are deliberately not `required`. A ListView delegate fills
-    /// same-named properties from the model's roles either way, and leaving
-    /// them optional is what lets this component be instantiated on its own --
-    /// which is how the geometry test measures it, and how the in-flight state
-    /// looks, where the reply is still an empty string.
-    property string author: ""
+    /// These are `required`, and that is the only reason a message ever reaches
+    /// the screen. A ListView delegate is given the model's roles through its
+    /// *required* properties and nothing else: a plain `property string author`
+    /// is initialised to its default and never sees the role at all. The bubble
+    /// was extracted out of the delegate with plain properties on the belief
+    /// that same-named properties are filled "either way", and every message
+    /// rendered as an empty string -- the chat went invisible again, for the
+    /// second time, from a cause that reads like a layout problem.
+    ///
+    /// The geometry test did not catch it because it sets these properties
+    /// itself, so it measured a bubble that the app never produces.
+    required property string author
     /// The message body, still growing while the response streams in.
-    property string content: ""
+    required property string content
     /// "streaming", "complete", "stopped", or "failed".
-    property string status: "streaming"
+    required property string status
     /// Detail for a failed or stopped response, usually the reason.
-    property string note: ""
+    required property string note
 
     readonly property bool fromAssistant: author === "assistant"
     /// Bubbles cap at 78% of the row so the side they sit on stays readable.

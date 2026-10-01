@@ -1,6 +1,6 @@
 # Kestrel
 
-Kestrel is a local-first personal AI desktop agent for Windows systems with NVIDIA GPUs. It is designed to provide a private, focused workspace for chatting with local models and eventually performing explicitly authorized agent tasks such as working with files, code, and developer tools.
+Kestrel is a local-first personal AI desktop application, with Windows and NVIDIA GPU support as its primary optimization target. It provides a private workspace for chatting with local models, persistent conversations, local speech options, and explicitly permissioned idle tools.
 
 The project prioritizes:
 
@@ -10,14 +10,14 @@ The project prioritizes:
 - **A maintainable C++ foundation:** application state, runtime integration, and UI are separated so contributors can work independently.
 - **Safe extensibility:** tools and automation must be explicit, inspectable, cancellable, and disabled by default until configured.
 
-> **Project status:** Kestrel is an early scaffold. The C++ core, mock streaming backend, backend contracts, tests, and initial Qt/QML shell exist. CUDA device discovery and engine-artifact validation are in place and reported to the UI. Native model execution, persistent conversations, live throughput telemetry, and agent tools are still under development.
+> **Project status:** Kestrel has a working Qt/QML desktop app, persistent local conversations, streaming generation, a model picker, runtime diagnostics, and opt-in local tools. Native inference is available through optional llama.cpp (GGUF) and ONNX Runtime GenAI integrations; a mock preview backend keeps dependency-light builds usable. Speech input and synthesis work through separate adapters, with important real-time voice capabilities still on the roadmap.
 
 ## Vision
 
 Kestrel aims to become a personal local AI environment with three layers:
 
 1. **Conversation:** a fast, private chat interface with streaming output, history, model controls, and useful context handling.
-2. **Intelligence runtime:** a native inference layer that uses CUDA and TensorRT on supported NVIDIA hardware.
+2. **Intelligence runtime:** local inference through pluggable runtimes, with CUDA acceleration where supported.
 3. **Agent capabilities:** carefully permissioned tools for files, code, local applications, and other workflows.
 
 The UI should remain simple even as the capabilities grow. Advanced runtime settings, tool permissions, diagnostics, and model management belong in secondary panels—not in the main conversation flow.
@@ -29,10 +29,10 @@ The UI should remain simple even as the capabilities grow. Advanced runtime sett
 - **Desktop UI:** Qt 6 and QML
 - **Primary platform:** Windows 10/11 x64
 - **Primary accelerator:** NVIDIA CUDA
-- **Target inference direction:** native TensorRT C++ runtime, with model conversion/build tooling kept separate from the desktop application
+- **Inference today:** optional llama.cpp for GGUF and ONNX Runtime GenAI for compatible ONNX model folders; CUDA discovery is optional and degrades to a stub
 - **Testing:** CTest with small dependency-light C++ tests
 
-Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA supplies the GPU programming and math ecosystem; a model runtime is still required. The current direction is to use TensorRT for optimized execution and CUDA libraries such as the CUDA runtime, cuBLAS/cuBLASLt, and NVRTC where appropriate. TensorRT-LLM may be used later for model-specific optimization or engine generation, but it is not required by the current scaffold.
+Kestrel does not treat CUDA as an inference engine by itself. CUDA supplies device and acceleration facilities; a model runtime is still required. The current inference adapters are llama.cpp (GGUF) and optional ONNX Runtime GenAI (compatible ONNX model folders). TensorRT is **not** an interactive inference backend in this baseline: the separate engine tool validates/records compatibility metadata and does not convert models or run generation.
 
 ## Repository layout
 
@@ -48,6 +48,9 @@ Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA
 │   ├── core/
 │   │   ├── conversation.h
 │   │   ├── conversation.cpp    # Conversation and message domain model
+│   │   ├── persona.*           # Tone profile, presence line, anticipatory lines
+│   │   ├── presence.*          # What Kestrel and the user last did, for the UI
+│   │   ├── idlepersona.*       # The sandboxed loop that runs between turns
 │   │   ├── voicesession.h
 │   │   └── voicesession.cpp    # Voice response timeline state machine
 │   ├── runtime/
@@ -58,12 +61,14 @@ Kestrel intentionally does not treat CUDA as an inference engine by itself. CUDA
 │   │   ├── engineartifact.*    # Engine build records and compatibility checks
 │   │   ├── backendregistry.*   # Backend selection and runtime diagnostics
 │   │   ├── mockbackend.*       # Development/demo streaming backend
-│   │   ├── llamacppbackend.*   # Placeholder legacy/experimental adapter boundary
-│   │   └── tensorrtbackend.*   # TensorRT adapter boundary
+│   │   ├── llamacppbackend.*   # Optional GGUF inference adapter
+│   │   ├── ortgenaibackend.*   # Optional ONNX Runtime GenAI adapter
+│   │   └── chatformat.*        # Structured message and fallback template helpers
 │   └── ui/
 │       └── Main.qml            # Initial soft-glass desktop workspace
 └── tests/
     ├── core_tests.cpp          # Core behavior tests
+    ├── app_tests.cpp           # Qt threading, send path, and presence tests
     └── runtime_tests.cpp       # Device discovery, engine records, backend selection
 ```
 
@@ -74,10 +79,10 @@ The intended dependency direction is:
 ```text
 QML UI → AppController → core domain + ModelBackend
                                   ↓
-                    Mock / TensorRT / future backends
+                    Mock / llama.cpp / ONNX Runtime GenAI
 ```
 
-- `core` should contain application concepts and business rules, not Qt UI details or vendor-specific CUDA calls.
+- `core` should contain application concepts and business rules, not Qt UI details or vendor-specific runtime calls.
 - `runtime` owns model loading, generation, cancellation, and runtime metrics behind `ModelBackend`.
 - `app` adapts the core and runtime layers to Qt/QML properties and invokable methods.
 - `ui` displays state and sends user intent. QML should not call CUDA, TensorRT, or model APIs directly.
@@ -86,12 +91,11 @@ QML UI → AppController → core domain + ModelBackend
 ### Vendor headers
 
 `src/runtime/cudadiscovery_cuda.cpp` is the **only** translation unit permitted to
-include a CUDA header, and `src/runtime/tensorrtbackend.cpp` is the only one
-permitted to include TensorRT headers. Everything else—including
-`src/runtime/cudadevice.h`, `AppController`, and QML—sees device facts through
-portable structs. CMake swaps `cudadiscovery_cuda.cpp` for
-`cudadiscovery_stub.cpp` when no CUDA Toolkit is found, so a build without CUDA
-still compiles, runs, and explains itself.
+include a CUDA header. The SAPI adapter is similarly isolated in
+`src/runtime/sapirecognizer_win32.cpp`. Everything else—including the portable
+runtime interfaces, `AppController`, and QML—uses project-owned types. CMake
+swaps the CUDA implementation for a portable stub when the toolkit is absent,
+so a build without CUDA still compiles, runs, and explains itself.
 
 Keep that boundary intact. Widening vendor headers into portable files makes the
 project unbuildable on contributor machines that lack the SDKs, which is the
@@ -101,7 +105,8 @@ opposite of what Kestrel wants.
 
 ### Required for the core and tests
 
-- Windows 10/11 x64 or another CMake-supported development platform
+- Windows 10/11 x64, or a current Linux distribution (Ubuntu 24.04 or newer;
+  22.04 works once CMake is upgraded, as noted below)
 - CMake 3.24 or newer
 - A compiler with C++20 support
 - Ninja or another supported CMake generator
@@ -182,8 +187,6 @@ ctest --test-dir build --build-config Debug --output-on-failure
 | `KESTREL_BUILD_UI` | `ON` | Build the Qt/QML application when Qt is available |
 | `KESTREL_BUILD_TESTS` | `ON` | Build and register the core and runtime tests |
 | `KESTREL_ENABLE_CUDA` | `ON` | Compile real CUDA device discovery. Degrades to the portable stub when no toolkit is found, so it is safe to leave on |
-| `KESTREL_ENABLE_TENSORRT` | `OFF` | Link the TensorRT SDK. Opt-in because the SDK is not vendored |
-| `KESTREL_TENSORRT_ROOT` | *(empty)* | Path to an unpacked TensorRT SDK (must contain `include/NvInfer.h`) |
 | `KESTREL_ENABLE_LLAMA_CPP` | `ON` | Link llama.cpp for GGUF inference. Degrades to an unavailable backend when not found |
 | `KESTREL_LLAMA_CPP_ROOT` | *(empty)* | Path to a llama.cpp install or build tree (must contain `include/llama.h`) |
 
@@ -194,14 +197,15 @@ llama.cpp would produce subtly wrong tokens rather than a link error.
 ### Checking the detected runtime
 
 The desktop binary can report what it actually found without opening a window,
-which is the quickest way to confirm a build picked up the GPU you expect:
+which is the quickest way to confirm the selected model backend and optional
+voice integrations:
 
 ```powershell
 .\build\kestrel.exe --print-runtime
 ```
 
-It prints the active backend, the probed device, and a diagnostics table that
-also explains why an unavailable backend is unavailable.
+It prints the active backend, GPU probe, speech/dictation availability, and
+a diagnostics table that explains why an optional integration is unavailable.
 
 ### Smoke-testing a real model
 
@@ -246,6 +250,136 @@ Visual Studio provides the MSVC compiler and Windows SDK. Standalone CMake and N
 If `cl.exe`, `rc.exe`, or `mt.exe` cannot be found, open a Visual Studio Developer Command Prompt/PowerShell or initialize the Visual Studio build environment before invoking CMake. This is not a dependency on Visual Studio's bundled CMake or Ninja; it is required because MSVC and the Windows SDK use environment variables and library paths.
 
 For CUDA, verify the toolkit and driver independently before configuring a backend. A successful CMake build does not prove that a model runtime can load an engine or use the GPU.
+
+## Linux
+
+Linux is a supported build and install target. The portable core, the tests, and
+the desktop application all build there, and the runtime reports what it really
+found: a Linux box without an NVIDIA driver still gets working CPU inference
+through llama.cpp, and one without a CUDA toolkit still builds, because device
+discovery degrades to the portable stub.
+
+### Prerequisites
+
+The distribution packages cover the core build; the desktop target needs
+versions Ubuntu does not currently ship, so the two are listed separately.
+
+```bash
+sudo apt-get install -y build-essential ninja-build git pipx
+```
+
+For the core, tests, and the engine-build tool, any CMake 3.24 or newer:
+
+```bash
+sudo apt-get install -y cmake       # 3.28 on Ubuntu 24.04
+```
+
+Ubuntu 22.04 ships CMake 3.22, which is below the minimum, so upgrade it from
+Kitware's own APT repository:
+
+```bash
+sudo apt-get install -y ca-certificates gpg wget
+wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
+  | gpg --dearmor - \
+  | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] \
+  https://apt.kitware.com/ubuntu/ jammy main' \
+  | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+sudo apt-get update
+sudo apt-get install cmake
+```
+
+Substitute `noble` for `jammy` on 24.04. Nothing else in the core build needs
+changing.
+
+For the desktop application, Qt 6.6 or newer. No Ubuntu release ships it: 22.04
+has 6.2.4 and 24.04 has 6.4.2, so `apt install qt6-base-dev` will not do. Get it
+from qt.io or install the same build the CI uses:
+
+```bash
+pipx install aqtinstall
+aqt install-qt linux desktop 6.9.2 gcc_64 -O "$HOME/Qt"
+```
+
+`pipx`, not `pip install --user`: Ubuntu 23.10 and newer mark the system Python
+as externally managed, so pip refuses to install into it and aborts with
+`error: externally-managed-environment` before aqtinstall is ever downloaded.
+`pipx` keeps the tool in its own environment and links `aqt` into
+`~/.local/bin`; run `pipx ensurepath` once if that directory is not already on
+your `PATH`.
+
+That provides Qt Core, Qt Quick, and Qt Quick Controls 2. Without a Qt 6.6 or
+newer prefix, CMake skips the desktop target and builds the core and its tests,
+which is the same degradation a contributor without Qt gets on any platform.
+
+### Build, test, and install
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DKESTREL_BUILD_UI=ON \
+  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.2/gcc_64"
+cmake --build build
+ctest --test-dir build --output-on-failure
+sudo cmake --install build
+```
+
+The install places the application where a freedesktop session looks for it:
+
+| Installed path | Contents |
+| --- | --- |
+| `bin/kestrel` | the desktop application |
+| `share/applications/io.github.canadiancowboy.kestrel.desktop` | the launcher entry |
+| `share/icons/hicolor/scalable/apps/` | the application icon |
+| `share/metainfo/` | AppStream metadata, so the app appears in software centres |
+
+To try an install without touching the system, stage one into a prefix you
+control:
+
+```bash
+cmake --install build --prefix "$HOME/.local"
+```
+
+`kestrel-engine-build` is deliberately not installed. It writes engine records
+next to an engine and is a maintainer tool, so it stays in the build tree rather
+than on an end user's `PATH`.
+
+### Linking llama.cpp
+
+llama.cpp is the portable inference path and the one most likely to be present
+on a Linux workstation. Build it as shared libraries and install it to a prefix:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cmake -S llama.cpp -B llama.cpp/build -G Ninja -DBUILD_SHARED_LIBS=ON
+cmake --build llama.cpp/build
+cmake --install llama.cpp/build --prefix "$HOME/.local"
+```
+
+Then configure Kestrel against that prefix:
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DKESTREL_BUILD_UI=ON \
+  -DKESTREL_LLAMA_CPP_ROOT="$HOME/.local"
+```
+
+llama.cpp splits its shared objects across `libllama.so`, `libggml.so`,
+`libggml-base.so`, `libggml-cpu.so`, and one more per enabled backend, so CMake
+links whichever of those the prefix actually contains and records the prefix in
+the binary's rpath. Without that rpath the installed binary would start and then
+fail to load `libllama.so`, because the Linux loader searches the system
+directories only.
+
+When llama.cpp is not found, the GGUF backend reports itself unavailable and the
+mock backend stays usable. That is the documented degradation, not a failure.
+
+### Display servers
+
+Both X11 and Wayland work. Two platform details are deliberate: `main.cpp` pins
+the Basic Quick Controls style everywhere, because the hand-drawn QML is
+discarded by a native style, and it announces Kestrel's desktop file id so the
+taskbar shows the application's name and icon instead of the bare executable
+name.
 
 ## Development workflow
 
@@ -307,19 +441,92 @@ cmake --build build
 
 Voice is a first-class part of Kestrel's conversation experience, not a separate assistant mode. The goal is a native, local voice loop with effectively immediate interaction: speech should begin quickly, the user should be able to interrupt naturally, and Kestrel should never force the user to wait for an answer to finish before accepting new information.
 
+### Setting up a local voice
+
+Kestrel speaks through Qt's text-to-speech when it is available, but the voices a stock Windows install offers were recorded before neural speech existed, and no better one can be added as a *system* voice because none of the good engines are SAPI. So Kestrel can run its own local model instead, and prefers it when it finds one.
+
+The model is not vendored: it is a per-machine download, a few hundred megabytes, and something a contributor chooses for their own hardware. When it is absent, Kestrel falls back to the platform voice and says so rather than pretending to have none.
+
+From the repository root:
+
+```bash
+# 1. An interpreter with the model bindings. A venv keeps it off the system.
+py -m venv .kestrel-voice
+./.kestrel-voice/Scripts/python.exe -m pip install kokoro-onnx soundfile numpy
+
+# 2. The model (325 MB) and its voice table (28 MB).
+mkdir -p .kestrel-voice/models
+curl -L -o .kestrel-voice/models/kokoro-v1.0.onnx \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o .kestrel-voice/models/voices-v1.0.bin \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
+
+That is the development setup for the optional Kokoro voice driver. On Windows, Kestrel searches beside the executable and its parent for `.kestrel-voice/Scripts/python.exe`, the model, and the driver script. Runtime status may say that the voice is loading; it does not guarantee that a cold model load will succeed.
+
+```bash
+build/kestrel.exe --print-runtime
+#   voice        : unavailable (the Kokoro voice is still loading)
+#   dictation    : unavailable (preview recognizer (no microphone))
+```
+
+The exact report depends on build options and local files. The driver process starts asynchronously, so the initial status can say that Kokoro is still loading. The app holds an answer briefly for an installed voice; if the engine fails or exceeds the bounded startup window, the answer remains available as text. `--print-runtime` reports once at startup and does not wait for the model to become ready.
+
+Speech playback is incremental by clause, not full-duplex. `VOICE PROFILE` switches among voices exposed by the selected local engine; an unknown name is refused rather than deferred to a later synthesis failure.
+
+`.kestrel-voice/` is git-ignored. Override the location with `KESTREL_VOICE_PYTHON`, the model directory with `KESTREL_VOICE_MODEL_DIR`, and the default voice with `KESTREL_VOICE`.
+
+Kokoro is the currently wired local neural TTS engine. The driver is an optional subprocess, and model/dependency setup and licensing obligations are described in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Piper is not wired into the current baseline.
+
+### Speech input
+
+Dictation uses SAPI 5, the desktop engine that has shipped with Windows since
+2000: `CLSID_SpSharedRecognizer`, an `ISpRecoContext`, and the default capture
+device. It is an ordinary COM class, so it activates with `CoCreateInstance`, and
+every call is a vtable call through an interface declared in the Windows SDK's
+`sapi.h` — no Speech SDK install, and no `sapi.lib`. The only library it links
+is `winmm`, for the device count in the microphone probe.
+
+The Windows Runtime path is not an alternative. `Windows.Media.SpeechRecognition`
+exposes the `ISpeechRecognizer` ABI interface but no projected runtime class, so
+there is no activation factory to create and no `GetSpeechRecognizerAsync` to
+call, and its desktop flavour has no interim-text event either.
+
+Which recognizer Kestrel uses is decided at startup from a cheap capture-device
+count, so nothing has to be opened to ask the question:
+
+| Machine has | Recognizer | Reports itself as |
+| --- | --- | --- |
+| a capture device | SAPI 5, on a worker thread of its own | `Windows SAPI 5 recognizer, N capture device(s), finished phrases only` |
+| no capture device, or no usable SAPI adapter | the scripted preview recognizer | `preview recognizer (no microphone)` |
+
+`KESTREL_SPEECH_INPUT` forces either branch: `auto` (the default) probes,
+`mock` always uses the scripted preview recognizer, and `platform` asks for SAPI
+and reports what the engine says rather than what a device count guessed. The
+test suite pins itself to `mock`, but the preview recognizer is deliberately
+reported as **not** a real microphone.
+
+SAPI reports completed phrases, not streaming partial words. Current playback
+interrupts at a clause boundary, not at an arbitrary word, and the pipeline has
+no VAD or acoustic echo cancellation. It is therefore an adapter baseline, not
+a claim of natural low-latency full-duplex voice. See
+[src/runtime/sapirecognizer.h](src/runtime/sapirecognizer.h) for the current STT contract.
+
 ### Voice goals
 
-- **Local-first audio path:** microphone capture, voice activity detection, speech recognition, response generation, and speech synthesis should run locally whenever the required models and hardware support it.
-- **Near-zero perceived latency:** the system should begin recognizing speech and responding as early as possible, while avoiding unnecessary buffering, blocking calls, or full-response waits.
-- **Native desktop integration:** audio capture and playback should use a native C++ pipeline appropriate for the target platform rather than routing conversation through a browser or remote service.
-- **Natural turn-taking:** users should be able to speak while Kestrel is responding, just as they would interrupt a person.
+- **Modular and customizable:** capture, VAD, STT, turn management, inference, TTS, playback, and acoustic echo cancellation should remain replaceable components rather than one hard-coded runtime choice.
+- **Local-first audio:** microphone capture, recognition, response generation, and synthesis should run locally when suitable models and hardware are available.
+- **Low perceived latency:** recognize and respond incrementally without UI-blocking work or unnecessary full-response waits.
+- **Natural turn-taking:** eventually support interruption finer than the current clause boundary, with echo-aware full-duplex behavior where the selected components permit it.
+
+The present app does not yet implement this advanced target: SAPI provides completed phrases, playback uses clause segments, and there is no VAD/AEC stage. Keep runtime choices open until target hardware, languages, licensing, and measured latency are known. See the [proposed extensible voice runtime design](docs/VOICE_RUNTIME_DESIGN.md) for the architecture and phased roadmap.
 - **Transparent state:** listening, thinking, speaking, paused, interrupted, and error states should be visible without making the interface feel busy.
 
 “Zero latency” is an interaction goal rather than a physically literal guarantee. Contributors should optimize measured time-to-first-audio, time-to-first-token, and interruption response time, and document hardware and model conditions when reporting results.
 
 ### Interruption and barge-in behavior
 
-When the user begins speaking while Kestrel is speaking, Kestrel must stop or pause audio playback immediately instead of finishing the current sentence. The interruption path should:
+The desired advanced behavior is to detect a user interruption during playback and stop or pause at the earliest safe audio boundary. The current implementation only accepts a request through the listening path and stops playback at a clause boundary; full-duplex echo-aware detection is not implemented. The future interruption path should:
 
 1. Detect the user's speech while synthesized audio is playing.
 2. Stop or pause playback at the earliest safe audio boundary.
@@ -544,15 +751,77 @@ queued call until generation had already finished, which is exactly too late.
 `ModelBackend` documents this contract: a backend must poll its cancellation
 flag between tokens, and must make `cancel()` safe to call from another thread.
 
-Because there is no audio engine yet, `VoiceSession` drives the visible
-timeline and playback is treated as delivered as soon as generation finishes.
-That is the text-only fallback the state machine defines for exactly this
-situation. Pause stops delivery while preserving the response for `resume()`,
+Voice pacing is decided in `VoiceSession` rather than in the interface, because
+the same decisions apply whether audio is synthesized locally or handed to a
+platform voice later. `planSpeech` splits generated text into clause-sized
+segments with the micro-pause that belongs between them, and `nextSpeechSegment`
+returns the next unspoken clause with absolute offsets into the response — which
+is what lets speech begin before generation finishes. A `VoicePersona` (voice id,
+rate, pitch, warmth, and three pause lengths) makes the pacing a value rather than
+a hardcoded constant.
+
+`VoiceSession` drives the visible timeline, and audio is delivered clause by
+clause as each one finishes rather than in one lump when generation ends. Where
+there is no engine -- a build without Qt TextToSpeech, a machine with no voice
+installed, or a local engine that is still loading when the reply is finished --
+the same timeline runs with playback treated as delivered immediately, which is
+the text-only fallback the state machine defines for exactly that situation. The
+two paths are the same code with a different backend behind it, not two
+behaviours.
+
+Pause stops delivery while preserving the response for `resume()`,
 which reopens generation for whatever text was still owed; sending a new
 message mid-response is a barge-in, which abandons the interrupted response
 and hands the timeline to the new prompt. The pause/resume control is only
 shown when the state machine says the transition is legal, so it can never be a
 button that silently does nothing.
+
+## Assistant presence and idle autonomy
+
+Kestrel is a presence, not a request box. Three portable pieces in `src/core/`
+carry that, and none of them is allowed to reach outside the process.
+
+**`Persona`** holds the tone profile and five dials (`focus`, `curiosity`,
+`initiative`, `calmness`, `presenceIntensity`). It produces the assistant-presence
+line that goes into the shared system prompt, the short acknowledgement said the
+moment a request is accepted, the one-line status whisper, and the anticipatory
+lines ("Would you like me to continue?", "Task complete."). The presence line is
+built from the fixed tone profile rather than the drifting dials, so it is
+byte-identical on every turn and the backend's cached prefix survives; the dials
+move, the rules do not.
+
+**`Presence`** records what the user did, what the assistant did, the voice and
+generation states, and the mood as plain booleans. The UI animates on that
+snapshot instead of on raw events, so a pulse means the same thing whether it
+came from a keystroke, a barge-in, or the idle loop. Time is injected by the
+owner rather than read from a clock, which keeps the easing deterministic.
+
+**`IdlePersona`** is the loop that runs when nobody is talking. It stays completely
+silent while a turn is generating, the voice is live, or something is typed and
+unsent; it drifts the dials over time and weights its own work by them, so
+personality is arithmetic rather than prompt text. Because the dials also decay
+every cycle, the loop is a cycle and not a ramp: an assistant that only ever
+gained curiosity and initiative would eventually become someone nobody wants to
+talk to.
+
+The safety boundary is stated as data in `IdlePolicy`, and it is deliberately
+narrower than it looks:
+
+- The task set is closed, and every entry is a string, a number, or an enum.
+  There is no "run a command" or "call an API" member, because a loop that can be
+  handed arbitrary work stops being a screensaver and starts being an unattended
+  agent.
+- There is no network or filesystem permission to grant, because the loop has no
+  way to reach either.
+- `ModelWarmup` is the only task that leaves pure computation, and it is off
+  until the user turns it on. Its tokens are discarded; the point is warm caches.
+- Idle thoughts are internal. They are populated always and displayed only when
+  the user asks to see them.
+
+Contributors adding to this layer must keep it that way. Anything that needs the
+network, the filesystem, or a destructive action is an agent tool, and it belongs
+behind `ModelBackend`-style permission, in the timeline, with confirmation — not
+in the idle loop.
 
 ## Safety and privacy principles
 
@@ -581,12 +850,13 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 ### Runtime
 
 - [x] Add CUDA device discovery and capability reporting
-- [x] Integrate TensorRT headers and libraries through CMake options
-- [x] Validate engine artifacts against the live device before deserializing
+- [x] Add optional TensorRT SDK discovery and engine-artifact compatibility records
+- [x] Validate recorded engine metadata against the live device
+- [ ] Implement TensorRT model conversion and interactive inference (not currently available)
 - [x] Implement asynchronous token generation and cancellation
 - [x] Expose GPU memory and throughput metrics to the UI
-- [x] Define and document the model conversion workflow
-- [x] Provide the offline engine-build tool and build record
+- [x] Document the intended model preparation workflow
+- [x] Provide the offline engine metadata/compatibility tool (does not convert models)
 - [x] Link llama.cpp for GGUF inference behind an auto-degrading option
 - [x] Make context accounting backend-driven so a loaded model reports exact counts
 - [x] Run the full build and test matrix in CI on Windows, Linux, and macOS
@@ -596,22 +866,23 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 
 ### Application
 
-- [ ] Persist conversations and settings locally
-- [ ] Add engine selection and configuration
+- [x] Persist conversations and profile settings locally
+- [x] Select and load compatible model backends (GGUF and ONNX Runtime GenAI)
+- [ ] Add advanced inference engine configuration and benchmarking
 - [ ] Improve markdown and code rendering
-- [ ] Add search, rename, delete, and conversation management
-- [ ] Add robust loading, error, and recovery states
+- [x] Add search, rename, delete, and conversation management
+- [x] Add bounded model loading, errors, preview fallback, and recovery states
 
 ### Agent capabilities
 
-- [ ] Define a permissioned tool interface
-- [ ] Add inspectable tool activity events
+- [x] Define a permissioned idle-tool interface
+- [x] Record permissioned idle-tool results in the conversation transcript
 - [ ] Add filesystem/code tools behind explicit user approval
 - [ ] Add configurable sandboxing and policy controls
 
 ## Contributing
 
-Contributions are welcome, especially in the areas of CUDA/TensorRT integration, Qt/QML interaction design, testing, documentation, and safety-oriented tool boundaries.
+Contributions are welcome, especially in the areas of runtime adapters, advanced local voice, Qt/QML interaction design, testing, documentation, and safety-oriented tool boundaries.
 
 Before opening a change:
 
@@ -622,7 +893,7 @@ Before opening a change:
 - State which optional dependencies were available during validation.
 - Keep unrelated formatting or generated files out of the change.
 
-For runtime changes, include the relevant GPU, driver, CUDA, TensorRT, compiler, and model/engine versions in the development notes. Do not include personal paths or sensitive data.
+For runtime changes, include the relevant GPU, driver, CUDA, runtime, compiler, and model versions in the development notes. TensorRT engine tooling is metadata-only in the current baseline. Do not include personal paths or sensitive data.
 
 ### Pull request workflow
 

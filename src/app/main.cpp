@@ -1,5 +1,11 @@
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QEventLoop>
+#include <QImage>
+#include <QQuickItem>
+#include <QQuickItemGrabResult>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -8,10 +14,70 @@
 #include <QTimer>
 #include <QUrl>
 
+#include <algorithm>
+#include <utility>
+
 #include "app/appcontroller.h"
+#include "core/pathtext.h"
 #include "runtime/backendregistry.h"
+#include "runtime/modeldiscovery.h"
+#include "ui/layoutaudit.h"
+
+#ifdef _WIN32
+#  include <windows.h>
+#endif
 
 namespace {
+
+#ifdef _WIN32
+// Points the C streams at the console that launched us, if they have nowhere
+// to go already.
+//
+// The executable is built for the GUI subsystem, which is the whole reason a
+// user double-clicking it does not get a black terminal window behind the app.
+// The cost of that is that a process with no console of its own can have an
+// invalid stdout, and --print-runtime is only worth having if its output can be
+// read.
+//
+// The existing handle is checked first and left alone when it is good, which is
+// the case that matters most: a launch that redirects stdout to a pipe or a
+// file already works, and re-opening it onto the console tears that redirect
+// loose and prints the report somewhere nobody is reading. Attaching rather
+// than allocating a console keeps the same property -- a redirected launch has
+// no parent console to attach to, and adding one would only give the report
+// somewhere to go that it was not going before.
+void attachToLaunchConsole() {
+    // Each stream is checked on its own. Treating them as one is wrong in a way
+    // that is easy to hit: a launcher that captures stderr to a log file and
+    // leaves stdout alone gives a valid stderr and an invalid stdout, and a
+    // single early return on stdout would leave the report going nowhere while
+    // a single freopen pair would tear the log redirect loose and send every
+    // later error to the console instead. Both streams are therefore reopened
+    // only when that stream is the broken one.
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    const bool stdoutBroken = out == nullptr || out == INVALID_HANDLE_VALUE;
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    const bool stderrBroken = err == nullptr || err == INVALID_HANDLE_VALUE;
+
+    if (!stdoutBroken && !stderrBroken) {
+        return;
+    }
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        return;
+    }
+    // A failure here means the console is attached but that stream was already
+    // usable after all, which is the normal case for a redirected launch, so
+    // there is nothing to report and nothing to do about it.
+    if (stdoutBroken) {
+        static_cast<void>(freopen("CONOUT$", "w", stdout));
+    }
+    if (stderrBroken) {
+        static_cast<void>(freopen("CONOUT$", "w", stderr));
+    }
+}
+#else
+void attachToLaunchConsole() {}
+#endif
 
 // Dumps runtime and device state, then exits without opening a window.
 //
@@ -30,6 +96,43 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
     }
     const QString value = arguments.at(index + 1);
     return value.startsWith(QStringLiteral("--")) ? QString() : value;
+}
+
+// The models this launch will try, in order, as URLs the controller can load.
+//
+// The ranking and the rules about what counts as a candidate live in
+// runtime::discoverModels, beside backendregistry and for the same reason:
+// they are decisions about the filesystem rather than about how this program
+// starts, and a rule that can only be reached from a GUI entry point cannot be
+// tested. What is left here is the part that is genuinely this file's -- two
+// sources, in order.
+//
+//   1. KESTREL_MODEL, for a model kept anywhere on the machine. This is what a
+//      developer sets, because build trees and model stores are separate.
+//   2. A "models" directory beside the executable. This is what the packaged
+//      app uses, and it is why the packager ships that directory: dropping a
+//      model in it is the whole installation step.
+//
+// An explicit --model or KESTREL_MODEL is a single candidate and is never
+// second-guessed. A choice the user made is not a guess to be improved on.
+QStringList modelCandidatesFor(const QString& explicitPath) {
+    if (!explicitPath.isEmpty()) {
+        return {QUrl::fromLocalFile(QFileInfo(explicitPath).absoluteFilePath()).toString()};
+    }
+
+    const QString fromEnvironment = qEnvironmentVariable("KESTREL_MODEL", QString());
+    if (!fromEnvironment.isEmpty()) {
+        return {QUrl::fromLocalFile(QFileInfo(fromEnvironment).absoluteFilePath()).toString()};
+    }
+
+    const QString modelDirectory =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/models");
+    QStringList urls;
+    for (const kestrel::runtime::ModelCandidate& candidate :
+         kestrel::runtime::discoverModels(kestrel::core::pathFromUtf8(modelDirectory.toStdString()))) {
+        urls.append(QUrl::fromLocalFile(QString::fromStdString(candidate.path)).toString());
+    }
+    return urls;
 }
 
 // Sends one message through the real window and reports whether a reply came
@@ -175,6 +278,13 @@ int printRuntime(const kestrel::app::AppController& controller) {
     out << "  gpu summary  : " << controller.gpuSummary() << "\n";
     out << "  capability   : " << controller.computeCapability() << "\n";
     out << "  device count : " << controller.gpuDeviceCount() << "\n";
+    // Voice and dictation are optional the same way the compute backends are,
+    // so they are reported for the same reason: the answer must be readable
+    // without launching the window and watching the panel.
+    out << "  voice        : " << (controller.ttsAvailable() ? "available" : "unavailable")
+        << " (" << controller.ttsVoice() << ")\n";
+    out << "  dictation    : " << (controller.sttAvailable() ? "available" : "unavailable")
+        << " (" << controller.sttDetail() << ")\n";
     out << "  diagnostics  :\n";
     for (const QVariant& row : controller.runtimeDiagnostics()) {
         const QVariantMap entry = row.toMap();
@@ -209,28 +319,50 @@ int main(int argc, char* argv[]) {
     // them, and it must be selected before the QML is loaded.
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
+#ifdef KESTREL_DESKTOP_FILE_ID
+    // A freedesktop desktop environment has to be told which .desktop file
+    // describes this window. Without it the taskbar entry falls back to the
+    // executable name, the window carries a generic icon, and the window menu
+    // has no application name to offer "Quit" and "About" under.
+    //
+    // fromLatin1, not QStringLiteral: QStringLiteral token-pastes its argument
+    // onto u"", so it cannot be handed a macro that expands to a string literal.
+    QGuiApplication::setDesktopFileName(QString::fromLatin1(KESTREL_DESKTOP_FILE_ID));
+#endif
+
     kestrel::app::AppController controller;
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    const QString modelArgument = valueAfter(arguments, QStringLiteral("--model"));
+    const QStringList modelCandidates =
+        modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
-    if (reportRuntime && modelArgument.isEmpty()) {
+    if (reportRuntime && modelCandidates.isEmpty()) {
+        attachToLaunchConsole();
         return printRuntime(controller);
     }
-    if (!modelArgument.isEmpty()) {
+    if (!modelCandidates.isEmpty()) {
         if (reportRuntime) {
             QObject::connect(&controller, &kestrel::app::AppController::modelLoadFinished,
                              &app, [&] { app.exit(printRuntime(controller)); },
                              Qt::QueuedConnection);
         }
-        // The controller loads on a worker and publishes the result on the UI
-        // thread. Start once the event loop can receive that completion.
-        QTimer::singleShot(0, &controller, [&controller, modelArgument] {
-            controller.loadModelFromUrl(QUrl::fromLocalFile(modelArgument).toString());
+        // One call, and the controller walks the list itself. That used to be
+        // a retry loop wired to modelLoadFinished from here, and it never ran:
+        // queued connections are delivered in the order they were made, so the
+        // --print-runtime handler above -- already connected, and already
+        // calling app.exit -- was still ahead of the retry by the time the first
+        // candidate failed. The fallback shipped without ever having been
+        // observed to work.
+        //
+        // The controller publishes modelLoadFinished once, when the sequence is
+        // over, so this file has nothing to get wrong about ordering.
+        QTimer::singleShot(0, &controller, [&controller, modelCandidates] {
+            controller.loadModelFromUrls(modelCandidates);
         });
     }
     if (reportRuntime) {
+        attachToLaunchConsole();
         return app.exec();
     }
 
@@ -259,7 +391,15 @@ int main(int argc, char* argv[]) {
     engine.loadFromModule(QStringLiteral("Kestrel"), QStringLiteral("Main"));
 
     if (engine.rootObjects().isEmpty()) {
-        QTextStream(stderr) << "Kestrel failed to load its QML scene.\n";
+        // No window exists, so this is the only place a reason can be given.
+        // It goes to the launching console if there is one -- a shell launch
+        // gets the full QML error -- and is otherwise lost, which is the same
+        // as every other silent start-up failure the platform hides. Putting a
+        // dialog here instead would mean linking QtWidgets, a whole module and
+        // its runtime, for a path that only runs on a broken build.
+        attachToLaunchConsole();
+        QTextStream(stderr) << "Kestrel failed to load its QML scene.\n"
+                            << "Run with QT_LOGGING_RULES='qt.qml.*=true' for the parse errors.\n";
         return 1;
     }
 
@@ -267,7 +407,7 @@ int main(int argc, char* argv[]) {
     // not just the controller. The timeout is generous because a real model's
     // first token can take a while on a cold context.
     if (arguments.contains(QStringLiteral("--smoke-test"))) {
-        return runSmokeTest(controller, 120000, !modelArgument.isEmpty());
+        return runSmokeTest(controller, 120000, !modelCandidates.isEmpty());
     }
 
     // Development aid: KESTREL_SCREENSHOT=<path.png> captures the composed
@@ -279,20 +419,121 @@ int main(int argc, char* argv[]) {
     // happened in it, so capturing the app doing its actual job -- a
     // conversation on screen, with bubbles sized and wrapped -- needs to wait
     // for the model rather than guess. Default unchanged.
+    //
+    // The capture goes through the root item rather than QQuickWindow's own
+    // grabWindow(). grabWindow() renders through the window's surface, and the
+    // offscreen platform has no swap chain to render into, so it does not
+    // return there. An item grab goes through the scene graph's own image path,
+    // which works on every platform, display-less included.
+    //
+    // The quit is armed rather than immediate because an item grab is
+    // asynchronous, and the deadline is the second failure this mode had: a
+    // capture that never arrives must end in a process that exits rather than
+    // one that sits there holding a model load open. Qt's own way of failing
+    // here is not an exit at all -- with no platform plugin it puts up a modal
+    // dialog -- so the packaging step copies the offscreen plugin and says so
+    // if it cannot.
+    //
+    // Every one of those exits is nonzero, because the exit status is the only
+    // thing the packaging check reads. A capture that quietly produced no file
+    // and reported success is worse than one that failed: the check goes on to
+    // measure the missing file, or, if the file was left from a previous run,
+    // to pass on yesterday's picture.
     const QString screenshotPath = qEnvironmentVariable("KESTREL_SCREENSHOT");
     if (!screenshotPath.isEmpty()) {
+        const auto fail = [&app](const char* what) {
+            QTextStream(stderr) << "Kestrel could not " << what << "\n";
+            app.exit(1);
+        };
         // qEnvironmentVariableIntValue's second parameter is a bool* for
         // "was it set", not a default value, so the fallback is spelled out.
         bool delayGiven = false;
         const int requested = qEnvironmentVariableIntValue("KESTREL_SCREENSHOT_DELAY_MS", &delayGiven);
         const int delayMs = delayGiven ? requested : 1600;
-        QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath] {
-            if (auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0))) {
-                if (!window->grabWindow().save(screenshotPath)) {
-                    QTextStream(stderr) << "Kestrel could not write " << screenshotPath << "\n";
-                }
+        auto* watchdog = new QTimer(&app);
+        watchdog->setSingleShot(true);
+        QObject::connect(watchdog, &QTimer::timeout, &app,
+                         [&app] { app.exit(1); }); // the grab never arrived
+        watchdog->start(delayMs + 15000);
+        QTimer::singleShot(delayMs, &app, [&engine, &app, screenshotPath, fail] {
+            auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0));
+            if (window == nullptr || window->contentItem() == nullptr) {
+                fail("find a window to capture");
+                return;
             }
-            app.quit();
+            const QSharedPointer<QQuickItemGrabResult> grab = window->contentItem()->grabToImage();
+            // grabToImage returns null when the grab cannot even be started,
+            // and then there is no ready signal to connect to and nothing else
+            // that would ever end this process.
+            if (grab.isNull()) {
+                fail("start a capture of the window");
+                return;
+            }
+            QObject::connect(grab.data(), &QQuickItemGrabResult::ready, &app,
+                             [grab, screenshotPath, &app] {
+                                 const QImage image = grab->image();
+                                 if (image.isNull() || !image.save(screenshotPath)) {
+                                     QTextStream(stderr) << "Kestrel could not write "
+                                                         << screenshotPath << "\n";
+                                     app.exit(1);
+                                     return;
+                                 }
+                                 app.quit();
+                             });
+        });
+    }
+
+    // Development aid: KESTREL_LAYOUT_CHECK=1 asks the scene graph where every
+    // layout put its cells, prints anything wrong, and exits. KESTREL_LAYOUT_CHECK_DELAY_MS
+    // sets how long to wait first, and it has to be a delay rather than a
+    // connection: the panels that are the point of this are built lazily, and a
+    // layout that has not run yet has no geometry to be wrong about.
+    //
+    // The diagnostics panel is opened first, because the audit only judges what
+    // the user can see and that panel is closed by default. Judging it while
+    // closed would pass on the exact defect this exists to catch, so the panel
+    // is opened the way a user opens it.
+    //
+    // The exit status is the answer, because a check whose result is only in
+    // its output is a check the packaging step has to be trusted to read. This
+    // is the counterpart to KESTREL_SCREENSHOT above, and it exists because
+    // that one could not see the defect this found: a panel can be a correct
+    // size, correctly laid out at the top level, and have its rows drawn on top
+    // of each other, and a picture of that is a picture with more contrast in
+    // it than before.
+    if (qEnvironmentVariableIsSet("KESTREL_LAYOUT_CHECK")) {
+        controller.setDiagnosticsOpen(true);
+        bool waitGiven = false;
+        const int requested = qEnvironmentVariableIntValue("KESTREL_LAYOUT_CHECK_DELAY_MS", &waitGiven);
+        const int waitMs = waitGiven ? requested : 2000;
+        // A deadline, because the alternative to ending is a process that sits
+        // there holding a model load open with nothing watching it.
+        auto* expired = new QTimer(&app);
+        expired->setSingleShot(true);
+        QObject::connect(expired, &QTimer::timeout, &app, [&app] { app.exit(2); });
+        expired->start(waitMs + 15000);
+        QTimer::singleShot(waitMs, &app, [&engine, &app] {
+            auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().value(0));
+            if (window == nullptr || window->contentItem() == nullptr) {
+                QTextStream(stderr) << "Kestrel could not find a window to audit\n";
+                app.exit(2);
+                return;
+            }
+            const QVector<kestrel::ui::LayoutProblem> problems =
+                kestrel::ui::auditLayouts(window->contentItem());
+            QTextStream out(stdout);
+            if (problems.isEmpty()) {
+                out << "layout check: ok, no cell is collapsed or overlapping\n";
+                out.flush();
+                app.exit(0);
+                return;
+            }
+            out << "layout check: " << problems.size() << " problem(s)\n";
+            for (const auto& problem : problems) {
+                out << "  " << problem.where << ": " << problem.what << "\n";
+            }
+            out.flush();
+            app.exit(1);
         });
     }
 

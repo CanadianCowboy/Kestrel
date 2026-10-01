@@ -1,8 +1,13 @@
 #include "runtime/llamacppbackend.h"
 
+#include "core/pathtext.h"
+#include "runtime/cudadevice.h"
+#include "runtime/chatformat.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #ifdef KESTREL_HAS_LLAMA_CPP
@@ -59,6 +64,85 @@ int tokenizeInto(const llama_vocab* vocab,
     return written;
 }
 
+// Bytes of KV cache one token occupies for `model`, or zero when the model's
+// shape is not something the arithmetic can be trusted for.
+//
+// One K row and one V row per layer per cached token, each
+// (embedding / heads) * kvHeads elements. Under grouped-query attention those
+// rows are far narrower than the model's embedding, which is the only reason a
+// long context is affordable at all on a card this size.
+std::size_t kvBytesPerTokenFor(const llama_model* model) {
+    const int32_t layers = llama_model_n_layer(model);
+    const int32_t heads = llama_model_n_head(model);
+    const int32_t headsKv = llama_model_n_head_kv(model);
+    const int32_t embd = llama_model_n_embd(model);
+    if (layers <= 0 || heads <= 0 || headsKv <= 0 || embd <= 0 || embd % heads != 0) {
+        // Without a clean head dimension any figure here would be invented.
+        return 0;
+    }
+    const auto rowElements = static_cast<int64_t>(embd / heads) * headsKv;
+    return static_cast<std::size_t>(layers) * (ggml_row_size(GGML_TYPE_F16, rowElements)
+                                              + ggml_row_size(GGML_TYPE_F16, rowElements));
+}
+
+// How much of the device's memory the KV cache may take, once the weights are
+// resident.
+//
+// Two thirds, after a fixed 512 MB is set aside. The shortfall is not slack for
+// its own sake: the CUDA context itself costs a few hundred megabytes before a
+// single byte of cache exists, and a cache sized to exactly the remaining bytes
+// does not fail politely -- it fails at context creation, with an
+// out-of-memory error that names no setting the user can change.
+constexpr double kKvBudgetShare = 0.66;
+constexpr std::size_t kFixedOverheadBytes = 512ULL * 1024ULL * 1024ULL;
+
+// The context to create for `model` on this machine.
+//
+// Three numbers, in order of authority: what the model was trained for, what
+// this machine can hold, and a floor for a machine that can be asked neither.
+int chooseContextLength(const llama_model* model) {
+    const int trained = llama_n_ctx_train(model);
+    const int ceiling = trained > 0 ? trained : 8192;
+
+    const std::size_t perToken = kvBytesPerTokenFor(model);
+    if (perToken == 0) {
+        return std::min(ceiling, 8192);
+    }
+
+    const CudaProbe probe = probeCuda();
+    const CudaDeviceInfo* device = probe.selectedDevice();
+    if (device == nullptr || device->totalMemoryBytes == 0) {
+        // No GPU to budget against. System RAM is the next honest thing to size
+        // against, and llama.cpp will place the KV there, but it is not known
+        // cheaply and a wrong guess is expensive; 8192 is safe everywhere.
+        return std::min(ceiling, 8192);
+    }
+
+    const std::size_t total = device->totalMemoryBytes;
+    // The weights are already resident by the time this runs, so the honest
+    // budget is what is left. Approximated from the model's own file rather
+    // than re-read, because the file is megabytes to gigabytes and the load has
+    // just been through it.
+    const std::size_t weights = static_cast<std::size_t>(
+        std::max<int64_t>(llama_model_size(model), 0));
+    const std::size_t spare = total > weights + kFixedOverheadBytes
+                                  ? total - weights - kFixedOverheadBytes
+                                  : 0;
+    const auto affordable = static_cast<std::size_t>(
+        static_cast<double>(spare) * kKvBudgetShare) / perToken;
+    if (affordable < 1024) {
+        // The model does not fit with a usable context. 1024 is still a context
+        // -- enough for a system prompt and a short reply -- and the caller
+        // will see a small window reported rather than a load that failed for a
+        // reason nobody could act on.
+        return 1024;
+    }
+    // Rounded down to a multiple of 1024 so the reported figure reads as a
+    // deliberate choice rather than the residue of a division.
+    const int budgeted = static_cast<int>((affordable / 1024) * 1024);
+    return std::min(ceiling, budgeted);
+}
+
 } // namespace
 
 struct LlamaCppBackend::Impl {
@@ -77,6 +161,7 @@ struct LlamaCppBackend::Impl {
     // this text, since only generate() can safely reconcile the two.
     std::vector<llama_token> prefixTokens;
     bool prefixDirty = true;
+    bool prefixSharingUnsupported = false;
 };
 
 // Initialises the process-global llama.cpp library once and starts this
@@ -120,8 +205,8 @@ RuntimeStatus LlamaCppBackend::status() const {
     return m_status;
 }
 
-/// Releases the previous model/context and loads a GGUF with a fresh 4096-token context.
-/// Returns false with an error on failure; serializes access with m_mutex.
+/// Releases the previous model/context and loads a GGUF with a context sized to
+/// the machine. Returns false with an error on failure; serializes access with m_mutex.
 bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -157,9 +242,19 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     }
 
     llama_context_params contextParams = llama_context_default_params();
-    // The training context is not a sensible default for chat; size the KV
-    // cache to something a desktop agent can actually hold.
-    contextParams.n_ctx = 4096;
+    // The context used to be a literal 4096 with the comment "the training
+    // context is not a sensible default for chat". True as far as it went, and
+    // it left the question of what *is* sensible unanswered -- so every model
+    // got the same 4K window regardless of the machine, and a conversation
+    // longer than that silently lost its oldest turns. Qwen3.5 declares
+    // 262144; the useful range on real hardware is set by VRAM, not by the
+    // model card, so the number is derived from the device rather than chosen.
+    //
+    // Fallback when there is no device to reason about: 8192, which holds a
+    // system prompt and a long conversation on any machine Kestrel runs on and
+    // is still small enough for an 8 GB card with a 4B model resident.
+    const int contextLength = chooseContextLength(model);
+    contextParams.n_ctx = contextLength;
 
     llama_context* context = llama_init_from_model(model, contextParams);
     if (context == nullptr) {
@@ -178,6 +273,7 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     // has to be decoded again against it.
     m_impl->prefixTokens.clear();
     m_impl->prefixDirty = true;
+    m_impl->prefixSharingUnsupported = false;
     m_contextUsed = 0;
     refreshStatus();
     return true;
@@ -189,7 +285,13 @@ void LlamaCppBackend::refreshStatus() {
     const bool loaded = m_impl != nullptr && m_impl->model != nullptr && m_impl->context != nullptr;
     m_status.modelLoaded = loaded;
     if (loaded) {
-        const auto path = std::filesystem::u8path(m_impl->modelPath);
+        // u8path is deprecated in C++20, so the conversion it performs lives in
+        // core::pathFromUtf8 now. What matters is not the spelling but what the
+        // comment claimed: the bytes are UTF-8, and a narrow std::string
+        // constructor would read them as the ANSI code page instead, so a model
+        // under a folder name the code page cannot spell would be reported
+        // here under a mangled name.
+        const std::filesystem::path path = core::pathFromUtf8(m_impl->modelPath);
         // core::pathText rather than filename().string(): a model file under a
         // user name the ANSI code page cannot spell throws from string() on
         // Windows, and this is the line that decides what the UI calls the model.
@@ -266,6 +368,7 @@ void LlamaCppBackend::setSystemPrompt(std::string_view text) {
     if (m_impl != nullptr) {
         m_impl->prefixTokens.clear();
         m_impl->prefixDirty = true;
+        m_impl->prefixSharingUnsupported = false;
     }
 }
 
@@ -324,6 +427,10 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
         return 0;
     }
     llama_memory_t memory = llama_get_memory(m_impl->context);
+    if (m_impl->prefixSharingUnsupported) {
+        llama_memory_clear(memory, /* data */ true);
+        return 0;
+    }
 
     if (m_impl->prefixDirty) {
         // The prefix changed (or this is the first turn): nothing in the cache
@@ -331,7 +438,14 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
         llama_memory_clear(memory, /* data */ true);
         m_impl->prefixTokens.clear();
         if (!m_systemPrompt.empty()) {
-            tokenizeInto(llama_model_get_vocab(m_impl->model), m_systemPrompt, m_impl->prefixTokens);
+            // The cached prefix is the *rendered* system turn, not the raw
+            // text. Rendering the system message alone through the same
+            // template the conversation will use is what makes the two
+            // byte-identical, which is the whole basis of reusing it.
+            const std::vector<ChatMessage> systemOnly{
+                ChatMessage{Role::System, m_systemPrompt}};
+            const std::string rendered = renderChat(systemOnly, /* addAssistantCue */ false);
+            tokenizeInto(llama_model_get_vocab(m_impl->model), rendered, m_impl->prefixTokens);
             const auto prefixSize = static_cast<int32_t>(m_impl->prefixTokens.size());
             if (prefixSize > 0) {
                 llama_batch batch = llama_batch_init(prefixSize, 0, 1);
@@ -362,7 +476,7 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
             }
         }
         m_impl->prefixDirty = false;
-    } else if (!m_impl->prefixTokens.empty()) {
+    } else {
         // The prefix is unchanged, so keep its KV entries and drop only what
         // the previous turn appended after them.
         llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(m_impl->prefixTokens.size()), -1);
@@ -370,11 +484,75 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
     return m_impl->prefixTokens.size();
 }
 
-/// Decodes the shared prefix and per-turn prompt, then streams sampled tokens until done.
-/// Calls onComplete for success, cancellation, or failure while holding m_mutex; callbacks must not re-enter.
+bool LlamaCppBackend::hasChatTemplate() const {
+    if (m_impl == nullptr || m_impl->model == nullptr) {
+        return false;
+    }
+    return llama_model_chat_template(m_impl->model, nullptr) != nullptr;
+}
+
+std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>& messages,
+                                        bool addAssistantCue) const {
+    if (m_impl == nullptr || m_impl->model == nullptr) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    const char* tmpl = llama_model_chat_template(m_impl->model, nullptr);
+    if (tmpl == nullptr) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+
+    if (!addAssistantCue && !messages.empty() && messages.back().role == Role::Assistant) {
+        // Rendering a completed assistant turn adds its end-of-turn marker even
+        // with add_ass=false. Resume must leave that turn open instead: render
+        // the preceding history with an assistant header, then append the exact
+        // partial text that has already been delivered.
+        std::vector<ChatMessage> history(messages.begin(), messages.end() - 1);
+        return renderChat(history, true) + messages.back().content;
+    }
+
+    // The strings must outlive the render call, so they are kept in one place
+    // rather than referenced from temporaries.
+    std::vector<std::string> roles;
+    std::vector<std::string> contents;
+    roles.reserve(messages.size());
+    contents.reserve(messages.size());
+    for (const ChatMessage& message : messages) {
+        roles.emplace_back(toString(message.role));
+        contents.push_back(message.content);
+    }
+    std::vector<llama_chat_message> native;
+    native.reserve(messages.size());
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        native.push_back(llama_chat_message{roles[i].c_str(), contents[i].c_str()});
+    }
+
+    // Ask for the rendered size first. A null buffer is the documented way to
+    // ask, and the return is the total byte count, not an error.
+    const int32_t needed = llama_chat_apply_template(tmpl, native.data(), native.size(),
+                                                     addAssistantCue, nullptr, 0);
+    if (needed < 0) {
+        // llama.cpp does not recognise this template. Falling back is right:
+        // an unsupported template is not a reason to refuse to answer.
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    std::vector<char> buffer(static_cast<std::size_t>(needed) + 1);
+    const int32_t written = llama_chat_apply_template(tmpl, native.data(), native.size(),
+                                                      addAssistantCue, buffer.data(),
+                                                      static_cast<int32_t>(buffer.size()));
+    if (written < 0) {
+        return renderPlainChat(messages, addAssistantCue);
+    }
+    return std::string(buffer.data(), static_cast<std::size_t>(written));
+}
+
+/// Streams a model-formatted conversation; callbacks must not re-enter this backend.
 void LlamaCppBackend::generate(const GenerationRequest& request,
                                TokenCallback onToken,
                                CompletionCallback onComplete) {
+    if (request.messages.empty()) {
+        onComplete(false, "No messages to answer");
+        return;
+    }
     m_cancelled.store(false, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -391,16 +569,48 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // turn this decodes the prefix; on every turn after it the prefix's KV
     // entries are already resident and are reused rather than recomputed.
     bool prefixFailed = false;
-    const std::size_t prefixLength = applySystemPrefix(prefixFailed);
+    std::size_t prefixLength = applySystemPrefix(prefixFailed);
     if (prefixFailed) {
         onComplete(false, "llama.cpp could not decode the system prompt into the context");
         return;
     }
 
-    // Tokenize only this turn's prompt. The prefix is already in the context,
-    // so including it here would both redo the work and double-count it.
+    // Render the conversation the way this model was trained to be talked to.
+    std::vector<ChatMessage> allMessages;
+    if (!m_systemPrompt.empty()) {
+        allMessages.emplace_back(Role::System, m_systemPrompt);
+    }
+    allMessages.insert(allMessages.end(), request.messages.begin(), request.messages.end());
+    const std::string prompt = renderChat(allMessages, request.addAssistantCue);
+
+    // The prefix is only reusable if the rendered conversation literally starts
+    // with the text that was decoded as the prefix. That is true for every
+    // template that appends turns, and it is checked rather than assumed: a
+    // template which interleaves system text would otherwise silently corrupt
+    // the cache on every single turn.
+    std::size_t skipPrefix = 0;
+    if (prefixLength > 0) {
+        const std::vector<ChatMessage> systemOnly{
+            ChatMessage{Role::System, m_systemPrompt}};
+        const std::string renderedPrefix =
+            renderChat(systemOnly, /* addAssistantCue */ false);
+        if (prompt.compare(0, renderedPrefix.size(), renderedPrefix) == 0) {
+            skipPrefix = renderedPrefix.size();
+        } else {
+            // This template cannot reuse the standalone system turn. Decode
+            // the complete rendering into an empty cache, not after a second
+            // copy of the system prompt.
+            llama_memory_clear(llama_get_memory(context), true);
+            m_impl->prefixTokens.clear();
+            m_impl->prefixDirty = false;
+            m_impl->prefixSharingUnsupported = true;
+            prefixLength = 0;
+        }
+    }
+
     std::vector<llama_token> tokens;
-    if (tokenizeInto(vocab, request.prompt, tokens, /* addSpecial */ prefixLength == 0) <= 0) {
+    if (tokenizeInto(vocab, std::string_view(prompt).substr(skipPrefix), tokens,
+                     /* addSpecial */ prefixLength == 0) <= 0) {
         onComplete(false, "llama.cpp could not tokenize the prompt");
         return;
     }
@@ -608,7 +818,15 @@ std::size_t LlamaCppBackend::kvCacheBytes() const {
     return 0;
 }
 
-/// Returns zero without modifying state because no llama.cpp context exists.
+std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>& messages,
+                                       bool addAssistantCue) const {
+    return renderPlainChat(messages, addAssistantCue);
+}
+
+bool LlamaCppBackend::hasChatTemplate() const {
+    return false;
+}
+
 std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
     prefixFailed = false;
     return 0;
