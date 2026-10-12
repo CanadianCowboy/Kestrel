@@ -156,6 +156,11 @@ class AppController final : public QObject {
     Q_PROPERTY(QString partialTranscript READ partialTranscript NOTIFY listeningChanged)
     // Why listening stopped without a phrase, empty otherwise.
     Q_PROPERTY(QString listenError READ listenError NOTIFY listeningChanged)
+    Q_PROPERTY(bool linuxDictationSettings READ linuxDictationSettings CONSTANT)
+    Q_PROPERTY(QString dictationModelPath READ dictationModelPath NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QString dictationAudioDevice READ dictationAudioDevice NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QStringList dictationMicrophones READ dictationMicrophones NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QString dictationSettingsError READ dictationSettingsError NOTIFY dictationSettingsChanged)
 
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
 
@@ -277,6 +282,15 @@ public:
     [[nodiscard]] QString sttDetail() const;
     [[nodiscard]] QString partialTranscript() const;
     [[nodiscard]] QString listenError() const;
+    [[nodiscard]] bool linuxDictationSettings() const noexcept;
+    [[nodiscard]] QString dictationModelPath() const { return m_dictationModelPath; }
+    [[nodiscard]] QString dictationAudioDevice() const { return m_dictationAudioDevice; }
+    [[nodiscard]] QStringList dictationMicrophones() const { return m_dictationMicrophones; }
+    [[nodiscard]] QString dictationSettingsError() const { return m_dictationSettingsError; }
+    // Accepts a local FileDialog URL or a path. Empty model disables dictation.
+    // Refuses an active/unwinding session rather than blocking the UI on teardown.
+    Q_INVOKABLE bool applyDictationSettings(const QString& model, const QString& device);
+    Q_INVOKABLE void refreshDictationMicrophones();
 
     void setIdleLoopEnabled(bool enabled);
     void setIdlePrewarmEnabled(bool enabled);
@@ -380,6 +394,7 @@ signals:
     void ttsChanged();
     /// Notifies observers that listening state or the partial transcript changed.
     void listeningChanged();
+    void dictationSettingsChanged();
 
 private:
     // Worker callbacks, delivered on the UI thread by queued connections.
@@ -393,6 +408,7 @@ private:
 
     // Listen session callbacks. The final phrase is handed to sendMessage, so
     // there is exactly one way a turn starts no matter how the user said it.
+    void replaceSpeechRecognizer(std::unique_ptr<runtime::SpeechRecognizer> recognizer);
     void onUtteranceFinal(const QString& text, double confidence);
     void onListeningEnded(const QString& reason);
 
@@ -588,6 +604,10 @@ private:
     // and everything else gets the preview recognizer.
     std::unique_ptr<runtime::SpeechRecognizer> m_recognizer;
     std::unique_ptr<ListenSession> m_listen;
+    QString m_dictationModelPath;
+    QString m_dictationAudioDevice = QStringLiteral("default");
+    QStringList m_dictationMicrophones;
+    QString m_dictationSettingsError;
     // True from the first clause of a response until the last one is spoken.
     // Distinct from m_generating, because generation finishes long before the
     // audio does, and the two states gate different things: the worker, and the
@@ -595,6 +615,7 @@ private:
     bool m_speaking = false;
     QString m_speechError;
     QString m_listenError;
+    QString m_platformSpeechDetail;
     bool m_hasPendingSegment = false;
     std::size_t m_pendingSegmentEnd = 0;
     int m_openingPauseMs = 0;

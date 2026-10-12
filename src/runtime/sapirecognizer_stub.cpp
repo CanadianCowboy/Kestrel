@@ -26,7 +26,14 @@ bool SapiSpeechRecognizer::available() const {
 }
 
 std::string SapiSpeechRecognizer::detail() const {
-    return "this build has no SAPI speech recognition";
+#if defined(_WIN32)
+    return "SAPI speech recognition was not compiled in. Rebuild with Windows SDK "
+           "SAPI headers and winmm, or type your message instead.";
+#else
+    return "Native dictation is not implemented on this platform; SAPI is Windows-only. "
+           "Type your message instead. KESTREL_SPEECH_INPUT=mock is a scripted preview, "
+           "not microphone input.";
+#endif
 }
 
 bool SapiSpeechRecognizer::start(ResultCallback, EndCallback, std::string& error) {

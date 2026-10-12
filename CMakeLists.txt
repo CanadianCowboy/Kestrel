@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(KESTREL_BUILD_UI "Build the Qt/QML desktop application when Qt 6 is available" ON)
+option(KESTREL_REQUIRE_UI "Fail configuration instead of skipping a requested desktop build" OFF)
+if(KESTREL_REQUIRE_UI AND NOT KESTREL_BUILD_UI)
+    message(FATAL_ERROR "KESTREL_REQUIRE_UI requires KESTREL_BUILD_UI=ON")
+endif()
 option(KESTREL_BUILD_TESTS "Build Kestrel tests" ON)
 
 # Runtime accelerator options.
@@ -60,7 +64,21 @@ if(KESTREL_ENABLE_LLAMA_CPP)
         message(STATUS "Kestrel: llama.cpp found via its CMake package")
     elseif(KESTREL_LLAMA_CPP_ROOT AND EXISTS "${KESTREL_LLAMA_CPP_ROOT}/include/llama.h")
         set(KESTREL_LLAMA_CPP_ENABLED ON)
-        message(STATUS "Kestrel: llama.cpp headers found at ${KESTREL_LLAMA_CPP_ROOT}")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            file(GLOB _kestrel_llama_objects
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.so"
+                "${KESTREL_LLAMA_CPP_ROOT}/lib/libllama.so.*")
+            if(NOT _kestrel_llama_objects)
+                set(KESTREL_LLAMA_CPP_ENABLED OFF)
+                message(WARNING
+                    "Kestrel: llama.cpp headers exist but libllama.so is missing from "
+                    "${KESTREL_LLAMA_CPP_ROOT}/lib. Install llama.cpp shared libraries "
+                    "into that prefix and reconfigure. Continuing without GGUF inference.")
+            endif()
+        endif()
+        if(KESTREL_LLAMA_CPP_ENABLED)
+            message(STATUS "Kestrel: llama.cpp headers found at ${KESTREL_LLAMA_CPP_ROOT}")
+        endif()
     else()
         message(STATUS "Kestrel: llama.cpp not found; the GGUF backend will report unavailable")
     endif()
@@ -128,9 +146,9 @@ else()
 endif()
 
 # --- Platform speech recognition ---------------------------------------------
-# Exactly one of these two is compiled, for the same reason as CUDA discovery:
-# sapi.h is a Windows SDK header and belongs in a single translation unit, while
-# the app reports honestly on the platforms that do not have it.
+# Select one platform implementation. Native SDK headers stay in their own
+# adapter translation units: Windows SAPI, optional Linux whisper.cpp/ALSA,
+# and a portable unavailable adapter on other platforms.
 #
 # SAPI 5 rather than Windows.Media.SpeechRecognition. The latter's SDK
 # projection exposes the ISpeechRecognizer ABI interface but no projected runtime
@@ -150,6 +168,25 @@ if(WIN32)
     else()
         message(STATUS "Kestrel: SAPI 5 headers or winmm not found; "
                        "compiling the portable recognizer stub")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(KESTREL_SAPI_SPEECH_SOURCE
+        src/runtime/linuxspeechrecognizer.cpp src/runtime/linuxspeechplatform.cpp)
+    option(KESTREL_ENABLE_LINUX_SPEECH "Enable offline whisper.cpp dictation with ALSA capture" ON)
+    if(KESTREL_ENABLE_LINUX_SPEECH)
+        find_path(KESTREL_WHISPER_INCLUDE_DIR NAMES whisper.h)
+        find_path(KESTREL_GGML_INCLUDE_DIR NAMES ggml.h)
+        find_library(KESTREL_WHISPER_LIBRARY NAMES whisper)
+        find_library(KESTREL_GGML_LIBRARY NAMES ggml)
+        find_package(ALSA QUIET)
+        if(KESTREL_WHISPER_INCLUDE_DIR AND KESTREL_GGML_INCLUDE_DIR
+           AND KESTREL_WHISPER_LIBRARY AND KESTREL_GGML_LIBRARY AND ALSA_FOUND)
+            set(KESTREL_LINUX_SPEECH_ENABLED ON)
+            message(STATUS "Kestrel: whisper.cpp and ALSA found; offline Linux dictation enabled")
+        endif()
+    endif()
+    if(NOT KESTREL_LINUX_SPEECH_ENABLED)
+        message(STATUS "Kestrel: whisper.cpp/ALSA unavailable or disabled; Linux dictation will explain setup")
     endif()
 else()
     message(STATUS "Kestrel: not Windows; compiling the portable recognizer stub")
@@ -180,7 +217,8 @@ if(WIN32)
 elseif(APPLE)
     set(KESTREL_SECRET_STORE_SOURCE src/storage/secretstore_macos.cpp)
 else()
-    set(KESTREL_SECRET_STORE_SOURCE src/storage/secretstore_linux.cpp)
+    set(KESTREL_SECRET_STORE_SOURCE
+        src/storage/secretstore_linux.cpp src/storage/secrettoolprocess_linux.cpp)
 endif()
 
 add_library(kestrel_core
@@ -257,6 +295,15 @@ else()
 endif()
 
 target_compile_options(kestrel_core PRIVATE ${KESTREL_STRICT_FLAGS})
+find_package(Threads REQUIRED)
+target_link_libraries(kestrel_core PRIVATE Threads::Threads)
+if(KESTREL_LINUX_SPEECH_ENABLED)
+    target_compile_definitions(kestrel_core PRIVATE KESTREL_HAS_LINUX_SPEECH=1)
+    target_include_directories(kestrel_core PRIVATE
+        "${KESTREL_WHISPER_INCLUDE_DIR}" "${KESTREL_GGML_INCLUDE_DIR}")
+    target_link_libraries(kestrel_core PRIVATE
+        "${KESTREL_WHISPER_LIBRARY}" "${KESTREL_GGML_LIBRARY}" ALSA::ALSA)
+endif()
 
 if(APPLE)
     # SecItemAdd and friends live in Security, and the CF* string, data and
@@ -345,17 +392,9 @@ if(KESTREL_LLAMA_CPP_ENABLED)
                 "${_kestrel_llama_libdir}/libllama*.so.*"
                 "${_kestrel_llama_libdir}/libggml*.so.*")
             list(REMOVE_DUPLICATES _kestrel_llama_libs)
-            if(NOT _kestrel_llama_libs)
-                message(WARNING
-                    "Kestrel: ${KESTREL_LLAMA_CPP_ROOT} has headers but no llama.cpp "
-                    "shared libraries in ${_kestrel_llama_libdir}, so the link will fail. "
-                    "Point KESTREL_LLAMA_CPP_ROOT at a llama.cpp install or build tree, "
-                    "or set KESTREL_ENABLE_LLAMA_CPP=OFF to build without GGUF inference.")
-            else()
-                list(SORT _kestrel_llama_libs)
-                message(STATUS "Kestrel: linking llama.cpp from ${_kestrel_llama_libdir}: "
-                               "${_kestrel_llama_libs}")
-            endif()
+            list(SORT _kestrel_llama_libs)
+            message(STATUS "Kestrel: linking llama.cpp from ${_kestrel_llama_libdir}: "
+                           "${_kestrel_llama_libs}")
             target_link_libraries(kestrel_core PRIVATE ${_kestrel_llama_libs})
         endif()
     endif()
@@ -586,12 +625,6 @@ if(WIN32)
     endif()
 endif()
 
-# Explicit llama.cpp roots need an installed Linux search path as well as
-# Windows runtime staging. Keep these independent so neither platform loses it.
-if(KESTREL_LLAMA_CPP_ENABLED AND UNIX AND NOT APPLE AND KESTREL_LLAMA_CPP_ROOT)
-    set(_kestrel_llama_rpath "${KESTREL_LLAMA_CPP_ROOT}/lib")
-endif()
-
 if(KESTREL_BUILD_UI)
     find_package(Qt6 6.6 COMPONENTS Core Quick QuickControls2 QUIET)
     if(Qt6_FOUND)
@@ -666,6 +699,9 @@ if(KESTREL_BUILD_UI)
         qt_add_qml_module(kestrel
             URI Kestrel
             VERSION 1.0
+            # Keep generated QML separate from the extensionless Linux binary.
+            # Qt's default can create a directory named kestrel at its path.
+            OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/qml/Kestrel"
             QML_FILES
                 src/ui/Main.qml
                 src/ui/MessageBubble.qml
@@ -728,6 +764,8 @@ if(KESTREL_BUILD_UI)
             # Without this, every layer is tested except the one the user uses.
             add_executable(kestrel_app_tests
                 tests/app_tests.cpp
+                src/ui/layoutaudit.cpp
+                src/ui/layoutaudit.h
                 src/app/generationworker.cpp
                 src/app/generationworker.h
                 src/app/speechsynthesizer.cpp
@@ -745,7 +783,9 @@ if(KESTREL_BUILD_UI)
                 src/app/conversationentry.h
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
-            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui)
+            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+            target_compile_definitions(kestrel_app_tests PRIVATE
+                KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})
             if(TARGET Qt6::TextToSpeech)
                 target_link_libraries(kestrel_app_tests PRIVATE Qt6::TextToSpeech)
@@ -759,6 +799,18 @@ if(KESTREL_BUILD_UI)
                 target_compile_definitions(kestrel_app_tests PRIVATE KESTREL_HAS_QT_MULTIMEDIA=1)
             endif()
             add_test(NAME kestrel_app_tests COMMAND kestrel_app_tests)
+            set_tests_properties(kestrel_app_tests PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+            if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                # Exercise the CLI the way an SSH/headless user invokes it:
+                # without a display or an explicitly selected Qt platform.
+                add_test(NAME kestrel_headless_runtime
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        --unset=DISPLAY --unset=WAYLAND_DISPLAY --unset=QT_QPA_PLATFORM
+                        --unset=KESTREL_MODEL --unset=KESTREL_SPEECH_INPUT
+                        $<TARGET_FILE:kestrel> --print-runtime)
+                set_tests_properties(kestrel_headless_runtime PROPERTIES TIMEOUT 30)
+            endif()
             # Links kestrel_core, so it needs the llama.cpp runtime beside it for
             # the same reason the non-Qt tests do. kestrel_qml_tests below
             # deliberately does not: it links no kestrel_core.
@@ -845,7 +897,13 @@ if(KESTREL_BUILD_UI)
             endif()
         endif()
     else()
-        message(STATUS "Qt 6 not found; skipping the Kestrel desktop target")
+        if(KESTREL_REQUIRE_UI)
+            message(FATAL_ERROR
+                "Kestrel desktop requires Qt 6.6+ Core, Quick and QuickControls2. "
+                "Install the development modules and set CMAKE_PREFIX_PATH to your Qt prefix, "
+                "or configure with KESTREL_BUILD_UI=OFF and KESTREL_REQUIRE_UI=OFF for core only.")
+        endif()
+        message(STATUS "Qt 6.6+ Core/Quick/QuickControls2 not found; skipping the Kestrel desktop target")
     endif()
 endif()
 
@@ -891,6 +949,13 @@ if(KESTREL_BUILD_TESTS)
     target_link_libraries(kestrel_runtime_tests PRIVATE kestrel_core)
     target_compile_options(kestrel_runtime_tests PRIVATE ${KESTREL_STRICT_FLAGS})
     add_test(NAME kestrel_runtime_tests COMMAND kestrel_runtime_tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(kestrel_linux_keyring_tests tests/linux_keyring_tests.cpp)
+        target_link_libraries(kestrel_linux_keyring_tests PRIVATE kestrel_core)
+        target_compile_options(kestrel_linux_keyring_tests PRIVATE ${KESTREL_STRICT_FLAGS})
+        add_test(NAME kestrel_linux_keyring_tests COMMAND kestrel_linux_keyring_tests)
+        set_tests_properties(kestrel_linux_keyring_tests PROPERTIES TIMEOUT 20)
+    endif()
 
     add_executable(kestrel_storage_tests tests/storage_tests.cpp)
     target_link_libraries(kestrel_storage_tests PRIVATE kestrel_core)
@@ -986,33 +1051,48 @@ endif()
 if(UNIX AND NOT APPLE)
     include(GNUInstallDirs)
 
-    if(_kestrel_llama_rpath)
-        foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
-            if(TARGET ${_kestrel_rpath_target})
-                # Qt's setup gives an installed binary "$ORIGIN:$ORIGIN/../lib"
-                # so it can find the Qt libraries installed beside it. Append
-                # rather than replace: a binary that resolves llama.cpp but not
-                # Qt6Core is no more useful than one that resolves neither.
-                get_target_property(_kestrel_target_rpath
-                    ${_kestrel_rpath_target} INSTALL_RPATH)
-                if(_kestrel_target_rpath AND
-                   NOT _kestrel_target_rpath MATCHES "-NOTFOUND$")
-                    set(_kestrel_merged_rpath
-                        "${_kestrel_target_rpath}:${_kestrel_llama_rpath}")
+    foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
+        if(TARGET ${_kestrel_rpath_target})
+            # Preserve Qt's search paths and linked external SDK prefixes.
+            # Otherwise an app that runs in the build tree can lose Qt, llama
+            # or ONNX Runtime on install and die before it can report anything.
+            set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
+                INSTALL_RPATH "$ORIGIN" "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+            set_property(TARGET ${_kestrel_rpath_target} PROPERTY
+                INSTALL_RPATH_USE_LINK_PATH TRUE)
+            # CMake omits link paths inside the source/build tree from the
+            # automatic list. Local SDK prefixes can legitimately live there.
+            if(KESTREL_LLAMA_CPP_ENABLED)
+                if(TARGET llama)
+                    set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
+                        INSTALL_RPATH "$<TARGET_FILE_DIR:llama>")
                 else()
-                    set(_kestrel_merged_rpath
-                        "$ORIGIN:$ORIGIN/../lib:${_kestrel_llama_rpath}")
+                    set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
+                        INSTALL_RPATH "${KESTREL_LLAMA_CPP_ROOT}/lib")
                 endif()
-                set_target_properties(${_kestrel_rpath_target} PROPERTIES
-                    INSTALL_RPATH "${_kestrel_merged_rpath}")
             endif()
-        endforeach()
-    endif()
+            if(KESTREL_ORT_GENAI_ENABLED)
+                set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
+                    INSTALL_RPATH "${KESTREL_ORT_GENAI_ROOT}/lib")
+            endif()
+            if(KESTREL_LINUX_SPEECH_ENABLED)
+                get_filename_component(_kestrel_whisper_libdir "${KESTREL_WHISPER_LIBRARY}" DIRECTORY)
+                set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
+                    INSTALL_RPATH "${_kestrel_whisper_libdir}")
+            endif()
+        endif()
+    endforeach()
 
     # Only the desktop app is installed. kestrel-engine-build writes engine
     # records beside an engine and is a maintainer tool, so it stays in the
     # build tree rather than on an end user's PATH.
     if(TARGET kestrel)
+        foreach(_kestrel_qt_runtime Core Gui Qml Quick QuickControls2 TextToSpeech Multimedia)
+            if(TARGET Qt6::${_kestrel_qt_runtime})
+                set_property(TARGET kestrel APPEND PROPERTY
+                    INSTALL_RPATH "$<TARGET_FILE_DIR:Qt6::${_kestrel_qt_runtime}>")
+            endif()
+        endforeach()
         install(TARGETS kestrel
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
         install(FILES "packaging/linux/${KESTREL_DESKTOP_ID}.desktop"

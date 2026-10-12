@@ -6,6 +6,14 @@
 // taking effect while generation is still in flight.
 
 #include <QCoreApplication>
+#include <QGuiApplication>
+#include <QSettings>
+#include <QTemporaryDir>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QQuickWindow>
 #include <QElapsedTimer>
 #include <QDir>
 #include <QEventLoop>
@@ -24,6 +32,7 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#include "ui/layoutaudit.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
 #include "app/listensession.h"
@@ -34,6 +43,9 @@
 #endif
 #include "runtime/mockbackend.h"
 #include "runtime/modelbackend.h"
+#if defined(__linux__)
+#include "runtime/linuxspeechrecognizer.h"
+#endif
 
 namespace {
 
@@ -1681,9 +1693,176 @@ void testPreviewInputRequiresExplicitOptIn() {
     qunsetenv("KESTREL_SPEECH_INPUT");
     check(!controller.startListening(), "preview input requires explicit mock selection");
     check(controller.listenError() == controller.sttDetail(), "refusal reports speech detail");
+    check(controller.sttDetail().contains(QStringLiteral("preview"), Qt::CaseInsensitive),
+          "automatic fallback is identified as preview only");
+#if defined(__linux__)
+    check(controller.sttDetail().contains(QStringLiteral("Whisper"), Qt::CaseInsensitive),
+          "Linux dictation explains its offline Whisper setup");
+#endif
     check(!controller.listening(), "refusing preview input leaves listening stopped");
+    check(controller.messages()->rowCount() == 0, "refusal never invents a user message");
     qputenv("KESTREL_SPEECH_INPUT", "mock");
 }
+
+#if defined(__linux__)
+void testLinuxDictationSettings() {
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    QTemporaryFile model(QDir::tempPath() + QStringLiteral("/Whisper model XXXXXX.bin"));
+    check(model.open(), "a local model path with spaces is available");
+    const QString url = QUrl::fromLocalFile(model.fileName()).toString();
+    {
+        AppController controller;
+        check(controller.linuxDictationSettings(), "Linux exposes dictation settings even without SDKs");
+        check(controller.dictationMicrophones().contains(QStringLiteral("default")), "the default ALSA route is always selectable");
+        check(!controller.applyDictationSettings(QStringLiteral("https://example.com/model.bin"), QStringLiteral("default")),
+              "remote model URLs are refused without downloading");
+        check(!controller.applyDictationSettings(model.fileName() + QStringLiteral(".missing"), QStringLiteral("default")),
+              "missing local models are refused");
+        check(!controller.dictationSettingsError().isEmpty(), "invalid settings report an actionable error");
+        check(controller.startListening(), "preview session starts for the active-session guard");
+        check(!controller.applyDictationSettings(url, QStringLiteral("custom_capture")), "settings cannot discard an active phrase");
+        check(controller.listening(), "refused settings leave the active session alone");
+        controller.abandonListening();
+        const QByteArray before = qgetenv("KESTREL_AUDIO_DEVICE");
+        check(controller.applyDictationSettings(url, QStringLiteral("custom_capture")), "local file URLs and custom ALSA routes are accepted");
+        check(controller.dictationModelPath() == model.fileName(), "percent-encoded model URLs become local paths");
+        check(controller.dictationAudioDevice() == QStringLiteral("custom_capture"), "the custom microphone is selected");
+        check(controller.dictationSettingsError().isEmpty(), "successful apply clears validation errors");
+        check(qgetenv("KESTREL_AUDIO_DEVICE") == before, "desktop settings never mutate process-global environment");
+    }
+    {
+        AppController restored;
+        check(restored.dictationModelPath() == model.fileName(), "the model survives a new controller");
+        check(restored.dictationAudioDevice() == QStringLiteral("custom_capture"), "the microphone survives a new controller");
+        check(restored.dictationMicrophones().contains(QStringLiteral("custom_capture")), "a saved custom route remains selectable");
+        check(restored.applyDictationSettings(QString(), QString()), "clearing the model disables dictation");
+        check(!restored.sttAvailable(), "an empty model is not reported as ready");
+        check(restored.dictationAudioDevice() == QStringLiteral("default"), "an empty device restores the default route");
+    }
+    settings.clear();
+}
+
+void testLinuxDictationSettingsDialog() {
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setDiagnosticsOpen(true);
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the shipped Main.qml loads");
+    if (!scene) { return; }
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    auto* button = scene->findChild<QQuickItem*>(QStringLiteral("dictationSettingsButton"));
+    auto* dialog = scene->findChild<QObject*>(QStringLiteral("dictationSettingsDialog"));
+    auto* field = scene->findChild<QObject*>(QStringLiteral("dictationModelField"));
+    auto* device = scene->findChild<QObject*>(QStringLiteral("dictationDeviceField"));
+    auto* apply = scene->findChild<QObject*>(QStringLiteral("dictationApplyButton"));
+    check(window && button && dialog && field && device && apply, "the runtime panel exposes every dictation control");
+    if (!window || !button || !dialog || !field || !device || !apply) { return; }
+    QEventLoop layout;
+    QTimer::singleShot(100, &layout, &QEventLoop::quit);
+    layout.exec();
+    check(button->isVisible() && button->width() > 0 && button->height() > 0, "the settings entry is visible and laid out");
+    check(kestrel::ui::auditLayouts(window->contentItem()).isEmpty(), "adding settings does not collapse the runtime panel's other controls");
+    check(QMetaObject::invokeMethod(button, "clicked"), "the runtime settings button can be activated");
+    QCoreApplication::processEvents();
+    check(dialog->property("visible").toBool(), "activation opens the real settings dialog");
+    field->setProperty("text", QStringLiteral("/missing/whisper-model.bin"));
+    check(QMetaObject::invokeMethod(apply, "clicked"), "the dialog apply action can be activated");
+    check(!controller.dictationSettingsError().isEmpty(), "invalid dialog input reaches controller validation");
+    QTemporaryFile model(QDir::tempPath() + QStringLiteral("/UI Whisper XXXXXX.bin"));
+    check(model.open(), "a model path for the UI is available");
+    field->setProperty("text", QUrl::fromLocalFile(model.fileName()).toString());
+    device->setProperty("editText", QStringLiteral("ui_capture"));
+    check(QMetaObject::invokeMethod(apply, "clicked"), "valid settings can be applied through the dialog");
+    check(controller.dictationModelPath() == model.fileName() && controller.dictationAudioDevice() == QStringLiteral("ui_capture"),
+          "the actual QML controls select the model and microphone");
+    check(controller.dictationSettingsError().isEmpty(), "the dialog clears its previous validation error");
+    window->resize(980, 640);
+    QEventLoop resized;
+    QTimer::singleShot(100, &resized, &QEventLoop::quit);
+    resized.exec();
+    auto* popup = qobject_cast<QQuickItem*>(dialog->property("contentItem").value<QObject*>());
+    check(popup && popup->height() > 0 && popup->height() < window->height(), "dictation content fits the minimum desktop height");
+    const auto problems = kestrel::ui::auditLayouts(window->contentItem());
+    for (const auto& problem : problems) {
+        std::cout << problem.where.toStdString() << ": " << problem.what.toStdString() << '\n';
+    }
+    check(problems.isEmpty(), "the dialog and runtime panel have no collapsed or overlapping cells at minimum size");
+    settings.clear();
+}
+
+void testRealLinuxDictationThroughControllerWhenAsked() {
+    const QByteArray model = qgetenv("KESTREL_TEST_WHISPER_MODEL");
+    const QByteArray device = qgetenv("KESTREL_TEST_ALSA_DEVICE");
+    if (model.isEmpty() || device.isEmpty()) { return; }
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    qputenv("KESTREL_SPEECH_INPUT", "platform");
+    {
+        kestrel::app::AppController controller;
+        controller.setIdleLoopEnabled(false);
+        controller.setBackendForTesting(std::make_unique<kestrel::runtime::MockBackend>());
+        check(controller.applyDictationSettings(QUrl::fromLocalFile(QString::fromUtf8(model)).toString(), QString::fromUtf8(device)),
+              "desktop settings select real Whisper weights and prerecorded ALSA capture");
+        check(controller.sttAvailable(), "configured native offline dictation is available");
+        check(controller.startListening(), "controller starts real prerecorded ALSA/Whisper dictation");
+        QElapsedTimer deadline;
+        deadline.start();
+        while (controller.messages()->rowCount() == 0 && deadline.elapsed() < 15000) {
+            QEventLoop step;
+            QTimer::singleShot(10, &step, &QEventLoop::quit);
+            step.exec();
+        }
+        check(controller.messages()->rowCount() >= 2, "real dictated audio starts a conversation turn");
+        if (controller.messages()->rowCount() > 0) {
+            const QString heard = controller.messages()->data(controller.messages()->index(0, 0),
+                kestrel::app::MessageModel::ContentRole).toString();
+            check(heard.contains(QStringLiteral("country"), Qt::CaseInsensitive),
+                  "Whisper's recognized words reach the visible user message");
+        }
+        controller.abandonListening();
+        controller.stopGeneration();
+    }
+    settings.clear();
+    qputenv("KESTREL_SPEECH_INPUT", "mock");
+}
+
+void testLinuxRecognizerReachesListenSession() {
+    class RecordedCapture final : public kestrel::runtime::SpeechCapture {
+    public:
+        bool capture(std::vector<float>& samples, const kestrel::runtime::SpeechCancelled&,
+                     std::string&) override { samples.assign(16000, 0.1F); return true; }
+    };
+    class RecordedTranscriber final : public kestrel::runtime::SpeechTranscriber {
+    public:
+        bool transcribe(const std::vector<float>&, const kestrel::runtime::SpeechCancelled&,
+                        std::string& text, std::string&) override {
+            text = "local Linux phrase"; return true;
+        }
+    };
+    kestrel::runtime::LinuxSpeechRecognizer recognizer(
+        [] { return std::make_unique<RecordedCapture>(); },
+        [] { return std::make_unique<RecordedTranscriber>(); });
+    kestrel::app::ListenSession session(recognizer);
+    QString heard;
+    QEventLoop wait;
+    QObject::connect(&session, &kestrel::app::ListenSession::utteranceFinal, &wait,
+                     [&](const QString& text, double confidence) { heard = text; check(confidence == 0.0, "no invented Whisper confidence"); });
+    QObject::connect(&session, &kestrel::app::ListenSession::listeningEnded, &wait, &QEventLoop::quit);
+    QTimer::singleShot(2000, &wait, &QEventLoop::quit);
+    QString error;
+    check(session.startListening(error), "native Linux recognizer starts through ListenSession");
+    wait.exec();
+    check(heard == QStringLiteral("local Linux phrase"), "worker transcript reaches the Qt listening interface");
+    check(!session.listening(), "native phrase completion ends the UI listening session");
+}
+#endif
 
 #if KESTREL_HAS_QT_MULTIMEDIA
 class PendingSpeechBackend final : public kestrel::app::LocalModelSpeechBackend {
@@ -1808,7 +1987,13 @@ int main(int argc, char** argv) {
     // turns a five-second diagnosis into a guess about which test died.
     std::cout << std::unitbuf;
 
-    QCoreApplication app(argc, argv);
+    QTemporaryDir configuration;
+    if (!configuration.isValid()) { return 1; }
+    qputenv("XDG_CONFIG_HOME", configuration.path().toUtf8());
+    QGuiApplication app(argc, argv);
+    // Do not read or overwrite the developer's actual desktop preferences.
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, configuration.path());
 
     // Pin the recognizer. The app picks one for the machine it runs on -- SAPI 5
     // when there is a microphone, the scripted preview recognizer when there is
@@ -1844,6 +2029,12 @@ int main(int argc, char** argv) {
     testAHeldReplyGivesUpIfTheVoiceNeverArrives();
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testPreviewInputRequiresExplicitOptIn();
+#if defined(__linux__)
+    testLinuxRecognizerReachesListenSession();
+    testLinuxDictationSettings();
+    testLinuxDictationSettingsDialog();
+    testRealLinuxDictationThroughControllerWhenAsked();
+#endif
 #if KESTREL_HAS_QT_MULTIMEDIA
     testSpeakingAdoptsPendingPrefetch();
 #endif

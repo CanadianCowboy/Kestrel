@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef KESTREL_HAS_LLAMA_CPP
@@ -24,10 +25,27 @@ namespace {
 // with the model lifetime obvious.
 void ensureBackendInitialised() {
     static const bool initialised = [] {
+        // Shared Linux builds can ship CPU/CUDA implementations as plugins.
+        // Register those before llama initialises or tries to load a model.
+        ggml_backend_load_all();
         llama_backend_init();
         return true;
     }();
     (void)initialised;
+}
+
+// llama.cpp removed the vocabulary-size argument from its penalties factory.
+// Select by signature so existing SDK trees and current Linux packages both
+// compile, without spreading SDK-version conditionals outside this adapter.
+template <typename Factory>
+llama_sampler* makePenaltySampler(Factory factory, int32_t vocabularySize) {
+    if constexpr (std::is_invocable_r_v<llama_sampler*, Factory, int32_t, float, float, float>) {
+        return factory(/* last_n */ 64, /* repeat */ 1.0F, /* frequency */ 0.0F,
+                       /* presence */ 0.0F);
+    } else {
+        return factory(vocabularySize, /* last_n */ 64, /* repeat */ 1.0F,
+                       /* frequency */ 0.0F, /* presence */ 0.0F);
+    }
 }
 
 // Tokenizes `text` into `out`, returning the number of tokens written or 0.
@@ -101,7 +119,7 @@ constexpr std::size_t kFixedOverheadBytes = 512ULL * 1024ULL * 1024ULL;
 // Three numbers, in order of authority: what the model was trained for, what
 // this machine can hold, and a floor for a machine that can be asked neither.
 int chooseContextLength(const llama_model* model) {
-    const int trained = llama_n_ctx_train(model);
+    const int trained = llama_model_n_ctx_train(model);
     const int ceiling = trained > 0 ? trained : 8192;
 
     const std::size_t perToken = kvBytesPerTokenFor(model);
@@ -622,13 +640,9 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     llama_sampler_chain_params chainParams = llama_sampler_chain_default_params();
     chainParams.no_perf = true;
     llama_sampler* chain = llama_sampler_chain_init(chainParams);
-    // The penalty sampler needs the vocabulary size as its first argument.
     llama_sampler_chain_add(chain,
-                            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),
-                                                        /* penalty_last_n */ 64,
-                                                        /* penalty_repeat */ 1.0F,
-                                                        /* penalty_freq */ 0.0F,
-                                                        /* penalty_present */ 0.0F));
+                            makePenaltySampler(&llama_sampler_init_penalties,
+                                               llama_vocab_n_tokens(vocab)));
     if (request.temperature <= 0.0F) {
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     } else {

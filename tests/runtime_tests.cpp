@@ -9,6 +9,9 @@
 #include "runtime/ortgenaibackend.h"
 #include "runtime/sapirecognizer.h"
 #include "runtime/speechrecognizer.h"
+#if defined(__linux__)
+#include "runtime/linuxspeechrecognizer.h"
+#endif
 
 #include <cassert>
 #include <chrono>
@@ -1053,6 +1056,189 @@ void testPlatformRecognizerRunsWhenAsked() {
     }
 }
 
+#if defined(__linux__)
+class TestSpeechCapture final : public runtime::SpeechCapture {
+public:
+    explicit TestSpeechCapture(bool blocked, std::atomic<bool>* entered = nullptr)
+        : m_blocked(blocked), m_entered(entered) {}
+    bool capture(std::vector<float>& samples, const runtime::SpeechCancelled& cancelled,
+                 std::string&) override {
+        if (m_entered != nullptr) { *m_entered = true; }
+        while (m_blocked && !cancelled()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+        if (cancelled()) { return false; }
+        samples.assign(16000, 0.1F);
+        return true;
+    }
+private:
+    bool m_blocked;
+    std::atomic<bool>* m_entered;
+};
+
+class TestSpeechTranscriber final : public runtime::SpeechTranscriber {
+public:
+    bool transcribe(const std::vector<float>&, const runtime::SpeechCancelled&,
+                    std::string& text, std::string&) override {
+        text = "  local words  ";
+        return true;
+    }
+};
+
+void testLinuxSpeechSessions() {
+    runtime::LinuxSpeechRecognizer recognizer(
+        [] { return std::make_unique<TestSpeechCapture>(false); },
+        [] { return std::make_unique<TestSpeechTranscriber>(); });
+    std::mutex mutex;
+    std::string heard;
+    std::atomic<int> ends{0};
+    std::string error;
+    const auto onResult = [&](const runtime::RecognitionResult& result) {
+        std::lock_guard lock(mutex);
+        assert(result.isFinal && result.confidence == 0.0);
+        heard = result.text;
+    };
+    const auto onEnd = [&](runtime::RecognitionEnd reason, std::string_view) {
+        assert(reason == runtime::RecognitionEnd::Silence);
+        ++ends;
+    };
+    assert(recognizer.available());
+    assert(recognizer.idle());
+    assert(recognizer.start(onResult, onEnd, error));
+    for (int i = 0; i < 2000 && ends == 0; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    recognizer.stopAndWait();
+    assert(ends == 1);
+    assert(recognizer.idle());
+    { std::lock_guard lock(mutex); assert(heard == "local words"); }
+    // A blocking capture must be cancelled promptly without joining on stop().
+    std::atomic<bool> entered{false};
+    runtime::LinuxSpeechRecognizer blocked(
+        [&] { return std::make_unique<TestSpeechCapture>(true, &entered); },
+        [] { return std::make_unique<TestSpeechTranscriber>(); });
+    std::atomic<int> delivered{0};
+    assert(blocked.start([&](const auto&) { ++delivered; },
+                         [&](auto, auto) { ++delivered; }, error));
+    assert(!blocked.start(onResult, onEnd, error));
+    for (int i = 0; i < 2000 && !entered; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    assert(entered); // Cancellation must land during capture, not before dispatch.
+    assert(!blocked.idle());
+    const auto before = std::chrono::steady_clock::now();
+    blocked.stop();
+    assert(std::chrono::steady_clock::now() - before < std::chrono::milliseconds(100));
+    assert(blocked.start([&](const auto&) { ++delivered; },
+                         [&](auto, auto) { ++delivered; }, error));
+    blocked.stopAndWait();
+    assert(delivered == 0 && !blocked.listening() && blocked.idle());
+    assert(std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
+    // Stopped is not idle until the worker leaves its cancelled capture. The
+    // desktop must refuse a settings swap here rather than block on teardown.
+    class DrainingCapture final : public runtime::SpeechCapture {
+    public:
+        DrainingCapture(std::atomic<bool>& cancelledSeen, std::atomic<bool>& release)
+            : cancelledSeen(cancelledSeen), release(release) {}
+        bool capture(std::vector<float>&, const runtime::SpeechCancelled& cancelled,
+                     std::string&) override {
+            while (!cancelled()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            cancelledSeen = true;
+            while (!release) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            return false;
+        }
+        std::atomic<bool>& cancelledSeen;
+        std::atomic<bool>& release;
+    };
+    std::atomic<bool> cancelledSeen{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> dispatched{false};
+    runtime::LinuxSpeechRecognizer draining(
+        [&] { dispatched = true; return std::make_unique<DrainingCapture>(cancelledSeen, release); },
+        [] { return std::make_unique<TestSpeechTranscriber>(); });
+    assert(draining.start([&](const auto&) { ++delivered; }, [&](auto, auto) { ++delivered; }, error));
+    for (int i = 0; i < 2000 && !dispatched; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    assert(dispatched);
+    draining.stop();
+    for (int i = 0; i < 2000 && !cancelledSeen; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    assert(cancelledSeen && !draining.listening() && !draining.idle());
+    release = true;
+    draining.stopAndWait();
+    assert(draining.idle() && delivered == 0);
+    runtime::LinuxSpeechRecognizer unavailable({}, {}, "Install the offline model.");
+    assert(!unavailable.available());
+    assert(!unavailable.start(onResult, onEnd, error));
+    assert(error == "Install the offline model.");
+}
+
+void testRealWhisperAudioWhenAsked() {
+    const std::string model = environmentOrEmpty("KESTREL_TEST_WHISPER_MODEL");
+    if (model.empty()) { return; }
+    const std::string raw = environmentOrEmpty("KESTREL_TEST_SPEECH_PCM");
+    std::ifstream file(raw, std::ios::binary);
+    assert(file.is_open());
+    std::vector<float> samples;
+    char bytes[2];
+    while (file.read(bytes, 2)) {
+        const auto value = static_cast<std::int16_t>(static_cast<unsigned char>(bytes[0])
+            | (static_cast<unsigned>(static_cast<unsigned char>(bytes[1])) << 8));
+        samples.push_back(static_cast<float>(value) / 32768.0F);
+    }
+    const std::string captureDevice = environmentOrEmpty("KESTREL_TEST_ALSA_DEVICE");
+    if (!captureDevice.empty()) {
+        // Only an explicitly supplied test device is opened; the standard
+        // integration test never opens the user's default microphone.
+        auto capture = runtime::makeAlsaSpeechCapture(captureDevice);
+        assert(capture != nullptr);
+        std::vector<float> recorded;
+        std::string captureError;
+        assert(capture->capture(recorded, [] { return false; }, captureError));
+        assert(recorded.size() > 16000 && recorded.size() <= 240000);
+        std::printf("  ALSA fixture capture: %.2fs PCM, silence endpoint succeeded\n",
+                    static_cast<double>(recorded.size()) / 16000.0);
+    }
+    auto transcriber = runtime::makeWhisperTranscriber(model);
+    assert(transcriber != nullptr);
+    std::string text;
+    std::string error;
+    const auto before = std::chrono::steady_clock::now();
+    assert(transcriber->transcribe(samples, [] { return false; }, text, error));
+    assert(text.find("country") != std::string::npos);
+    assert(text.find("ask") != std::string::npos || text.find("Ask") != std::string::npos);
+    std::printf("  offline Whisper: %s\n  audio %.2fs, transcription %.3fs\n", text.c_str(),
+        static_cast<double>(samples.size()) / 16000.0,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count());
+    text.clear();
+    assert(!transcriber->transcribe(samples, [] { return true; }, text, error));
+    assert(text.empty());
+    assert(!transcriber->transcribe(std::vector<float>(31 * 16000), [] { return false; }, text, error));
+    assert(error.find("30 seconds") != std::string::npos);
+    auto badModel = runtime::makeWhisperTranscriber("/missing/kestrel-whisper-model.bin");
+    assert(!badModel->transcribe(samples, [] { return false; }, text, error));
+    assert(error.find("KESTREL_WHISPER_MODEL") != std::string::npos);
+    auto badCapture = runtime::makeAlsaSpeechCapture("kestrel-device-does-not-exist");
+    std::vector<float> captured;
+    assert(!badCapture->capture(captured, [] { return false; }, error));
+    assert(error.find("microphone") != std::string::npos);
+    // Exercise the production worker with prerecorded PCM rather than opening
+    // a real user's microphone during automated verification.
+    class RecordedCapture final : public runtime::SpeechCapture {
+    public:
+        explicit RecordedCapture(std::vector<float> audio) : audio(std::move(audio)) {}
+        bool capture(std::vector<float>& out, const runtime::SpeechCancelled&, std::string&) override {
+            out = audio; return true;
+        }
+        std::vector<float> audio;
+    };
+    runtime::LinuxSpeechRecognizer recognizer(
+        [samples] { return std::make_unique<RecordedCapture>(samples); },
+        [model] { return runtime::makeWhisperTranscriber(model); });
+    std::mutex mutex;
+    std::string heard;
+    std::atomic<bool> done{false};
+    assert(recognizer.start([&](const auto& result) { std::lock_guard lock(mutex); heard = result.text; },
+        [&](auto reason, auto) { assert(reason == runtime::RecognitionEnd::Silence); done = true; }, error));
+    for (int i = 0; i < 60000 && !done; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    recognizer.stopAndWait();
+    assert(done);
+    { std::lock_guard lock(mutex); assert(heard.find("country") != std::string::npos); }
+}
+#endif
+
 int main() {
     // Unbuffered, so a test that aborts on a failed assert still shows which
     // checks ran. A lost buffer turns a five-second diagnosis into a guess.
@@ -1076,6 +1262,10 @@ int main() {
     KESTREL_RUN(testBackendSelectionAndDiagnostics);
     KESTREL_RUN(testRecognizerSelectionFollowsTheMicrophone);
     KESTREL_RUN(testMockRecognizerStillStreamsPartials);
+#if defined(__linux__)
+    KESTREL_RUN(testLinuxSpeechSessions);
+    KESTREL_RUN(testRealWhisperAudioWhenAsked);
+#endif
     KESTREL_RUN(testBackendDrivenTokenCounting);
     KESTREL_RUN(testSharedSystemPromptPrefix);
     KESTREL_RUN(testLlamaCppBackendReportsUnavailableWithoutSdk);

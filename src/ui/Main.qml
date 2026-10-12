@@ -48,6 +48,9 @@ ApplicationWindow {
         // screenshot check could not see it because it looks for black bands
         // and this is text on text.
         implicitHeight: 18
+        // Layouts derive their minimum from their children, not an overridden
+        // implicitHeight. The hit-target wrapper has no minimum of its own.
+        Layout.minimumHeight: 18
         activeFocusOnTab: true
         Keys.onSpacePressed: function(event) {
             toggle.toggled()
@@ -731,9 +734,16 @@ ApplicationWindow {
                 NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
             }
 
-            ColumnLayout {
+            ScrollView {
+                id: diagnosticsScroll
                 anchors.fill: parent
                 anchors.margins: 18
+                clip: true
+                contentWidth: availableWidth
+
+            ColumnLayout {
+                width: diagnosticsScroll.availableWidth
+                height: implicitHeight
                 spacing: 14
 
                 RowLayout {
@@ -751,6 +761,16 @@ ApplicationWindow {
                         contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                         background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                     }
+                }
+
+                Button {
+                    objectName: "dictationSettingsButton"
+                    Layout.fillWidth: true
+                    visible: appController.linuxDictationSettings
+                    text: "Dictation settings…"
+                    onClicked: dictationSettingsDialog.open()
+                    contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                 }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: window.line; opacity: 0.7 }
@@ -1067,14 +1087,15 @@ ApplicationWindow {
                 ListView {
                     id: diagnosticList
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
+                    Layout.preferredHeight: contentHeight
+                    interactive: false
                     clip: true
                     spacing: 10
                     model: appController.runtimeDiagnostics
                     boundsBehavior: Flickable.StopAtBounds
                     delegate: ColumnLayout {
                         required property var modelData
-                        Layout.fillWidth: true
+                        width: diagnosticList.width
                         spacing: 2
                         RowLayout {
                             Layout.fillWidth: true
@@ -1106,6 +1127,113 @@ ApplicationWindow {
                 }
             }
         }
+        }
+    }
+
+    Dialog {
+        id: dictationSettingsDialog
+        objectName: "dictationSettingsDialog"
+        title: "Linux dictation"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(560, window.width - 48)
+        standardButtons: Dialog.Close
+        onOpened: {
+            dictationModel.text = appController.dictationModelPath
+            appController.refreshDictationMicrophones()
+            dictationDevice.editText = appController.dictationAudioDevice
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                text: "Offline whisper.cpp + ALSA. Select existing local weights; nothing is downloaded. Audio stays in memory."
+                color: window.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+            Label { text: "Whisper ggml model (.bin)"; color: window.ink }
+            RowLayout {
+                Layout.fillWidth: true
+                TextField {
+                    id: dictationModel
+                    objectName: "dictationModelField"
+                    Layout.fillWidth: true
+                    placeholderText: "Choose a local model; empty disables dictation"
+                    Accessible.name: "Whisper model path"
+                    selectByMouse: true
+                }
+                Button {
+                    objectName: "dictationBrowseButton"
+                    text: "Browse…"
+                    onClicked: dictationModelDialog.open()
+                }
+            }
+            Label { text: "Microphone / ALSA capture device"; color: window.ink }
+            RowLayout {
+                Layout.fillWidth: true
+                ComboBox {
+                    id: dictationDevice
+                    objectName: "dictationDeviceField"
+                    Layout.fillWidth: true
+                    editable: true
+                    model: appController.dictationMicrophones
+                    Accessible.name: "ALSA microphone device"
+                }
+                Button {
+                    text: "Refresh"
+                    onClicked: {
+                        const draft = dictationDevice.editText
+                        appController.refreshDictationMicrophones()
+                        dictationDevice.editText = draft
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Use default for the desktop audio route, or enter a custom ALSA name such as plughw:1,0. Refresh lists capture hints without opening the microphone."
+                color: window.muted
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+            Button {
+                objectName: "dictationApplyButton"
+                text: "Apply and save"
+                enabled: !appController.listening
+                onClicked: {
+                    if (appController.applyDictationSettings(dictationModel.text, dictationDevice.editText)) {
+                        dictationModel.text = appController.dictationModelPath
+                        dictationDevice.editText = appController.dictationAudioDevice
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: appController.listening
+                      ? "Stop dictation before changing its model or microphone."
+                      : "Saved choices take effect on the next recording and persist after restart. Model loading is checked when you start dictation."
+                color: window.muted
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+            Text {
+                objectName: "dictationSettingsStatus"
+                Layout.fillWidth: true
+                text: appController.dictationSettingsError.length > 0
+                      ? appController.dictationSettingsError : appController.sttDetail
+                color: appController.dictationSettingsError.length > 0 ? "#dc9292" : window.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+        }
+    }
+
+    FileDialog {
+        id: dictationModelDialog
+        title: "Choose a local Whisper ggml model"
+        nameFilters: ["Whisper ggml models (*.bin)", "All files (*)"]
+        onAccepted: dictationModel.text = selectedFile.toString()
     }
 
     // Native picker for a GGUF on disk. The URL is handed straight to the

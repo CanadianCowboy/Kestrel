@@ -102,8 +102,8 @@ private:
 
 [[nodiscard]] unsigned microphoneDeviceCount();
 
-// The platform recognizer, or a stand-in that reports unavailable when this
-// build cannot talk to SAPI. Never returns null: a caller that wants the real
+// The platform recognizer: Windows SAPI, optional Linux whisper.cpp/ALSA,
+// or a stand-in that reports unavailable. Never returns null: a caller that wants the real
 // one asks available() and detail(), which is how a missing optional
 // dependency degrades what the app can do rather than whether it starts.
 [[nodiscard]] std::unique_ptr<SpeechRecognizer> makePlatformSpeechRecognizer();

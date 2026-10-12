@@ -77,7 +77,7 @@ private:
 };
 
 // The platform's real store. Defined once per platform in
-// secretstore_windows.cpp and secretstore_posix.cpp.
+// secretstore_windows.cpp, secretstore_macos.cpp and secretstore_linux.cpp.
 [[nodiscard]] std::unique_ptr<SecretStore> makePlatformSecretStore();
 
 } // namespace kestrel::storage

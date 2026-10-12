@@ -11,12 +11,17 @@
 #include "runtime/backendregistry.h"
 #include "runtime/llamacppbackend.h"
 #include "runtime/ortgenaibackend.h"
+#include "runtime/sapirecognizer.h"
+#if defined(__linux__)
+#include "runtime/linuxspeechrecognizer.h"
+#endif
 
 #include <QClipboard>
 #include <QDateTime>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QSettings>
 #include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
@@ -248,7 +253,37 @@ AppController::AppController(QObject* parent)
         : requestedInput.compare(QLatin1String("platform"), Qt::CaseInsensitive) == 0
             ? runtime::SpeechInput::Platform
             : runtime::SpeechInput::Auto;
-    m_recognizer = runtime::makeBestSpeechRecognizer(preference);
+#if defined(__linux__)
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    m_dictationModelPath = settings.value(QStringLiteral("dictation/modelPath"),
+        qEnvironmentVariable("KESTREL_WHISPER_MODEL")).toString();
+    m_dictationAudioDevice = settings.value(QStringLiteral("dictation/audioDevice"),
+        qEnvironmentVariable("KESTREL_AUDIO_DEVICE", QStringLiteral("default"))).toString();
+    refreshDictationMicrophones();
+    // An explicit ALSA route need not appear in the hint list. Let capture
+    // report its own errors instead of silently selecting a preview device.
+    auto recognizer = preference == runtime::SpeechInput::Mock
+        ? runtime::makeBestSpeechRecognizer(preference)
+        : runtime::makeLinuxSpeechRecognizer(m_dictationModelPath.toStdString(),
+            m_dictationAudioDevice.toStdString(),
+            qEnvironmentVariable("KESTREL_WHISPER_LANGUAGE", QStringLiteral("en")).toStdString());
+    replaceSpeechRecognizer(std::move(recognizer));
+#else
+    replaceSpeechRecognizer(runtime::makeBestSpeechRecognizer(preference));
+#endif
+}
+
+void AppController::replaceSpeechRecognizer(std::unique_ptr<runtime::SpeechRecognizer> recognizer) {
+    // The old receiver must invalidate queued phrases before its adapter dies.
+    m_listen.reset();
+    m_recognizer = std::move(recognizer);
+    m_platformSpeechDetail.clear();
+    if (dynamic_cast<const runtime::MockSpeechRecognizer*>(m_recognizer.get()) != nullptr) {
+        // Cache the diagnostic once: a property getter must not repeatedly
+        // construct native adapters (and their platform handles) as QML reads it.
+        m_platformSpeechDetail = QString::fromStdString(
+            runtime::makePlatformSpeechRecognizer()->detail());
+    }
     m_listen = std::make_unique<ListenSession>(*m_recognizer, this);
     connect(m_listen.get(), &ListenSession::utteranceFinal,
             this, &AppController::onUtteranceFinal);
@@ -257,6 +292,83 @@ AppController::AppController(QObject* parent)
     connect(m_listen.get(), &ListenSession::partialChanged, this, [this] {
         emit listeningChanged();
     });
+}
+
+bool AppController::linuxDictationSettings() const noexcept {
+#if defined(__linux__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void AppController::refreshDictationMicrophones() {
+    m_dictationMicrophones = {QStringLiteral("default")};
+#if defined(__linux__)
+    for (const auto& device : runtime::linuxMicrophoneDevices()) {
+        const QString name = QString::fromStdString(device);
+        if (!m_dictationMicrophones.contains(name)) {
+            m_dictationMicrophones.append(name);
+        }
+    }
+#endif
+    if (!m_dictationMicrophones.contains(m_dictationAudioDevice)) {
+        m_dictationMicrophones.append(m_dictationAudioDevice);
+    }
+    emit dictationSettingsChanged();
+}
+
+bool AppController::applyDictationSettings(const QString& model, const QString& device) {
+    const auto refuse = [this](const QString& reason) {
+        m_dictationSettingsError = reason;
+        emit dictationSettingsChanged();
+        return false;
+    };
+#if defined(__linux__)
+    const auto* linuxRecognizer = dynamic_cast<const runtime::LinuxSpeechRecognizer*>(m_recognizer.get());
+    if (listening() || (linuxRecognizer != nullptr && !linuxRecognizer->idle())) {
+        return refuse(tr("Stop dictation and wait for the current recording or transcription to finish, then apply again."));
+    }
+    QString path = model.trimmed();
+    const QUrl url(path);
+    if (!path.isEmpty() && !url.scheme().isEmpty()) {
+        if (!url.isLocalFile()) {
+            return refuse(tr("Choose a local Whisper ggml model file, not a remote URL."));
+        }
+        path = url.toLocalFile();
+    }
+    if (!path.isEmpty()) {
+        const QFileInfo info(path);
+        if (!info.isFile() || !info.isReadable()) {
+            return refuse(tr("The Whisper model is not a readable file. Choose an existing local ggml model."));
+        }
+        path = info.absoluteFilePath();
+    }
+    const QString audioDevice = device.trimmed().isEmpty() ? QStringLiteral("default") : device.trimmed();
+    if (audioDevice.contains(QChar(0)) || path.contains(QChar(0))) {
+        return refuse(tr("Model paths and microphone names cannot contain a NUL character."));
+    }
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.setValue(QStringLiteral("dictation/modelPath"), path);
+    settings.setValue(QStringLiteral("dictation/audioDevice"), audioDevice);
+    settings.sync();
+    if (settings.status() != QSettings::NoError) {
+        return refuse(tr("Could not save dictation settings. Check permissions on your user configuration directory and retry."));
+    }
+    m_dictationModelPath = path;
+    m_dictationAudioDevice = audioDevice;
+    replaceSpeechRecognizer(runtime::makeLinuxSpeechRecognizer(path.toStdString(), audioDevice.toStdString(),
+        qEnvironmentVariable("KESTREL_WHISPER_LANGUAGE", QStringLiteral("en")).toStdString()));
+    m_dictationSettingsError.clear();
+    m_listenError.clear();
+    refreshDictationMicrophones();
+    emit listeningChanged();
+    return true;
+#else
+    static_cast<void>(model);
+    static_cast<void>(device);
+    return refuse(tr("These dictation settings are only available on Linux."));
+#endif
 }
 
 bool AppController::startListening() {
@@ -327,7 +439,16 @@ bool AppController::sttAvailable() const noexcept {
 }
 
 QString AppController::sttDetail() const {
-    return m_recognizer != nullptr ? QString::fromStdString(m_recognizer->detail()) : QString();
+    if (m_recognizer == nullptr) {
+        return tr("Speech input is unavailable. Type your message instead.");
+    }
+    if (dynamic_cast<const runtime::MockSpeechRecognizer*>(m_recognizer.get()) != nullptr
+        && qEnvironmentVariable("KESTREL_SPEECH_INPUT")
+               .compare(QLatin1String("mock"), Qt::CaseInsensitive) != 0) {
+        return m_platformSpeechDetail
+            + tr(" Automatic fallback is preview only; it cannot hear a microphone.");
+    }
+    return QString::fromStdString(m_recognizer->detail());
 }
 
 QString AppController::partialTranscript() const {

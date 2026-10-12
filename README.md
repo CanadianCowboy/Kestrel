@@ -27,7 +27,7 @@ The UI should remain simple even as the capabilities grow. Advanced runtime sett
 - **Language:** C++20
 - **Build:** CMake
 - **Desktop UI:** Qt 6 and QML
-- **Primary platform:** Windows 10/11 x64
+- **Desktop platforms:** Windows 10/11 x64 (primary optimization target) and native Linux (Qt 6.6+)
 - **Primary accelerator:** NVIDIA CUDA
 - **Inference today:** optional llama.cpp for GGUF and ONNX Runtime GenAI for compatible ONNX model folders; CUDA discovery is optional and degrades to a stub
 - **Testing:** CTest with small dependency-light C++ tests
@@ -261,8 +261,8 @@ discovery degrades to the portable stub.
 
 ### Prerequisites
 
-The distribution packages cover the core build; the desktop target needs
-versions Ubuntu does not currently ship, so the two are listed separately.
+Start with the native compiler and build tools. Ubuntu 26.04 provides a suitable
+Qt; Ubuntu 22.04/24.04 need a newer Qt installation for the desktop target.
 
 ```bash
 sudo apt-get install -y build-essential ninja-build git pipx
@@ -292,9 +292,27 @@ sudo apt-get install cmake
 Substitute `noble` for `jammy` on 24.04. Nothing else in the core build needs
 changing.
 
-For the desktop application, Qt 6.6 or newer. No Ubuntu release ships it: 22.04
-has 6.2.4 and 24.04 has 6.4.2, so `apt install qt6-base-dev` will not do. Get it
-from qt.io or install the same build the CI uses:
+For the desktop application, install Qt 6.6 or newer with the **development**
+packages for Core, Quick, and Quick Controls 2. On Ubuntu 26.04:
+
+```bash
+sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-wayland \
+  qml6-module-qtquick qml6-module-qtquick-controls \
+  qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
+  qml6-module-qtquick-templates qml6-module-qtquick-window \
+  qml6-module-qtqml-workerscript
+# Optional speech output/playback and secure-storage integration:
+sudo apt-get install -y qt6-speech-dev qt6-multimedia-dev \
+  qt6-speech-speechd-plugin speech-dispatcher libsecret-tools
+```
+
+Qt TextToSpeech also needs an installed speech engine/plugin; the development
+module alone does not supply a working voice. `secret-tool` needs a running,
+unlocked Secret Service keyring in the user's D-Bus session. Neither is required
+to build the desktop.
+
+Ubuntu 22.04 has Qt 6.2.4 and 24.04 has 6.4.2, both below the minimum. Get a
+newer Qt from qt.io or install the same build the CI uses:
 
 ```bash
 pipx install aqtinstall
@@ -308,20 +326,54 @@ as externally managed, so pip refuses to install into it and aborts with
 `~/.local/bin`; run `pipx ensurepath` once if that directory is not already on
 your `PATH`.
 
-That provides Qt Core, Qt Quick, and Qt Quick Controls 2. Without a Qt 6.6 or
-newer prefix, CMake skips the desktop target and builds the core and its tests,
-which is the same degradation a contributor without Qt gets on any platform.
+That provides Qt Core, Qt Quick, and Qt Quick Controls 2. Add aqt modules
+`qtspeech qtmultimedia` if you want those optional integrations. Without a
+suitable Qt prefix, plain CMake skips the desktop target; the Linux helper below
+sets `KESTREL_REQUIRE_UI=ON` so a requested desktop cannot silently become a
+core-only build.
 
 ### Build, test, and install
 
+From the checkout, with distribution Qt 6.6+ development packages installed:
+
 ```bash
-cmake -S . -B build -G Ninja \
-  -DKESTREL_BUILD_UI=ON \
-  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.2/gcc_64"
-cmake --build build
-ctest --test-dir build --output-on-failure
-sudo cmake --install build
+bash scripts/build-linux.sh
+./build-linux/kestrel --print-runtime
+./build-linux/kestrel
 ```
+
+For a separate Qt prefix, pass CMake options after `--`:
+
+```bash
+bash scripts/build-linux.sh -- -DCMAKE_PREFIX_PATH="$HOME/Qt/6.9.2/gcc_64"
+```
+
+The helper builds Release, runs every configured CTest suite, and installs only
+when explicitly asked. It never installs packages or runs sudo. It uses two
+build jobs by default; set `CMAKE_BUILD_PARALLEL_LEVEL` to change that.
+
+```bash
+bash scripts/build-linux.sh --install-prefix "$HOME/.local"
+# Or a dependency-light build with no desktop:
+bash scripts/build-linux.sh --core-only --build-dir build-linux-core -- \
+  -DKESTREL_ENABLE_CUDA=OFF
+```
+
+Equivalent native CMake commands:
+
+```bash
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DKESTREL_BUILD_UI=ON -DKESTREL_REQUIRE_UI=ON
+cmake --build build-linux --parallel 2
+ctest --test-dir build-linux --output-on-failure
+cmake --install build-linux --prefix "$HOME/.local"
+```
+
+This is a **native install**, not a self-contained portable bundle. Qt and any
+linked inference SDKs must remain installed at their configured locations.
+Installed loader paths retain those prefixes; no `LD_LIBRARY_PATH` override
+should be necessary. Add `$HOME/.local/bin` to `PATH` for a user-local install
+and ensure your desktop searches `$HOME/.local/share` for launchers.
 
 The install places the application where a freedesktop session looks for it:
 
@@ -336,7 +388,7 @@ To try an install without touching the system, stage one into a prefix you
 control:
 
 ```bash
-cmake --install build --prefix "$HOME/.local"
+cmake --install build-linux --prefix "$HOME/.local"
 ```
 
 `kestrel-engine-build` is deliberately not installed. It writes engine records
@@ -370,8 +422,23 @@ the binary's rpath. Without that rpath the installed binary would start and then
 fail to load `libllama.so`, because the Linux loader searches the system
 directories only.
 
-When llama.cpp is not found, the GGUF backend reports itself unavailable and the
-mock backend stays usable. That is the documented degradation, not a failure.
+When llama.cpp is not found, or an explicit Linux prefix has headers but no
+`libllama.so`, the GGUF backend reports itself unavailable and the mock backend
+stays usable. The mock is **UI preview**, not AI inference. CPU inference still
+requires linked llama.cpp and an actual GGUF model. Enable `-DGGML_CUDA=ON` when
+building llama.cpp if you want its CUDA backend; Kestrel's CUDA discovery option
+does not build or accelerate llama.cpp for you.
+
+A distribution package may use a different layout (for example, Ubuntu 26.04
+places llama headers and libraries in subdirectories). Prefer its exported
+CMake package when available; do not assume every `libllama-dev` package matches
+the explicit `include/llama.h` and `lib/libllama.so` prefix layout above.
+
+```bash
+./build-linux/kestrel --model /path/to/model.gguf --smoke-test
+```
+
+The smoke test refuses to pass against preview mode or an unloaded model.
 
 ### Display servers
 
@@ -380,6 +447,141 @@ the Basic Quick Controls style everywhere, because the hand-drawn QML is
 discarded by a native style, and it announces Kestrel's desktop file id so the
 taskbar shows the application's name and icon instead of the bare executable
 name.
+
+### Platform capabilities and fallbacks
+
+| Capability | Native Linux behavior | When unavailable |
+| --- | --- | --- |
+| Desktop | Qt Quick on Wayland or X11 | The build helper fails with Qt setup advice; `--core-only` is explicit |
+| Local inference | Optional llama.cpp GGUF; optional ONNX Runtime GenAI Linux SDK | Clearly labeled mock preview; no claim of real model output |
+| GPU discovery | Optional CUDA Toolkit/driver | Portable diagnostic stub; a CPU-capable model runtime can still operate |
+| Speech output | Optional Qt TextToSpeech/system engine, or a separately installed local voice | Text responses continue without audio |
+| Dictation | Optional offline whisper.cpp, ALSA capture and an explicitly configured local model | Typed input remains available; scripted preview requires `KESTREL_SPEECH_INPUT=mock` and never counts as a microphone |
+| Secure storage adapter | `secret-tool` and a Secret Service keyring | Reports unavailable; never silently writes an unencrypted fallback |
+
+Linux data paths use absolute `$XDG_DATA_HOME/kestrel`, or
+`$HOME/.local/share/kestrel`. Relative XDG values are ignored; if no absolute
+home/data root is usable, the path layer refuses persistence rather than writing
+into the current directory. The existence of a storage adapter does not by itself
+prove desktop conversation persistence is wired end to end.
+
+`--print-runtime` automatically uses Qt's offscreen platform when neither a
+Wayland nor X11 display is configured, so it works over SSH without opening a
+window. An explicit `QT_QPA_PLATFORM` selection is preserved. Normal interactive
+launches still need a display. For display-less rendering on machines without a
+usable graphics driver:
+
+```bash
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+  KESTREL_SCREENSHOT="$PWD/build-linux/window.png" ./build-linux/kestrel
+```
+
+Verification on Ubuntu 26.04 / GCC 15 / Qt 6.10.2 covered the native build,
+no-audio and core-only builds, installed runtime diagnostics without loader
+overrides, and installed rendering on Wayland, X11/XWayland, and offscreen.
+The llama.cpp adapter was verified against Ubuntu's b8681 SDK using the real
+`stories260K.gguf` fixture: tokenization, generation, shared-prefix reuse and
+continuation passed, and the installed desktop `--smoke-test` delivered a
+512-token reply to the UI (roughly 613–757 tokens/s across runs for this tiny 1.2 MB fixture, **not**
+a representative chat-model benchmark). The first download failed but a later
+retry succeeded; this supersedes the earlier unverified-generation result.
+
+Offline Whisper transcribed the 11-second upstream JFK sample with the
+`tiny.en-q5_1` model in about 0.50 seconds on this CPU. Both direct transcription
+and the production recognizer's worker/callback path were tested. A prerecorded
+ALSA → Whisper → AppController test also confirmed recognized words become the
+visible user message and start a conversation turn. The ALSA adapter captured 11.78 seconds through a prerecorded file device and ended
+on silence. Live microphone recording and CUDA hardware were not exercised. Keyring round trips
+and missing/locked/stalled behavior were tested with an isolated fake
+`secret-tool`; no real unlocked desktop keyring was modified.
+
+### Offline Linux dictation
+
+The optional SDK adapter keeps `whisper.h` and ALSA headers inside
+`src/runtime/linuxspeechplatform.cpp`. With Ubuntu 26.04 packages:
+
+```bash
+sudo apt-get install -y libwhisper-dev libasound2-dev
+bash scripts/build-linux.sh
+# Download a whisper.cpp ggml model separately; weights are not bundled.
+export KESTREL_WHISPER_MODEL="/absolute/path/to/ggml-tiny.en.bin"
+export KESTREL_WHISPER_LANGUAGE=en
+# Optional ALSA device override; 'default' normally uses the desktop audio stack:
+export KESTREL_AUDIO_DEVICE=default
+./build-linux/kestrel --print-runtime
+./build-linux/kestrel
+```
+
+For older distributions, install whisper.cpp shared libraries into a prefix and
+pass `-DCMAKE_PREFIX_PATH=/path/to/prefix`. Disable the adapter explicitly with
+`-DKESTREL_ENABLE_LINUX_SPEECH=OFF`. A build missing either SDK still compiles
+and explains what is absent. Model files remain external and are never
+automatically downloaded. whisper.cpp is MIT licensed; ALSA libasound is
+LGPL-2.1-or-later. Redistribution must retain their applicable license terms;
+this native install uses separately installed libraries rather than bundling them.
+
+On Linux desktops, open **Runtime → Dictation settings…** to choose an existing
+local Whisper `.bin` model and an ALSA capture device. The picker never downloads
+weights; **Refresh** only enumerates capture hints and does not open the
+microphone. `default` uses the desktop audio route, and a custom ALSA name can be
+typed when it is not listed. **Apply and save** persists both choices for the
+next recording; clear the model path to disable dictation. A chosen path is
+checked when saved, while the model itself is loaded on the dictation worker when
+recording begins. Settings cannot be replaced until an active or cancelling
+phrase has fully stopped. The same values can still be configured before launch
+with `KESTREL_WHISPER_MODEL` and `KESTREL_AUDIO_DEVICE`.
+
+The microphone opens only when the user starts listening. Capture stays in
+memory: mono 16 kHz PCM, a 15-second phrase limit and a 20-second capture
+deadline. Simple RMS gating ends a phrase after roughly 900 ms of quiet, with
+at least 300 ms of detected speech. This is completed-phrase dictation, not
+streaming interim text, neural VAD or full-duplex echo cancellation. Whisper
+runs CPU-only (up to four threads) to avoid competing with chat for GPU memory.
+`stop()` is nonblocking; cancelled-session transcripts are discarded and teardown
+waits for the worker. Whisper inference has an abort callback; initial SDK model
+loading can still delay teardown on unusually slow storage.
+
+For a reproducible **prerecorded** integration check without opening a microphone,
+convert a known 16 kHz mono signed-16 little-endian sample to headerless PCM and
+set:
+
+```bash
+KESTREL_TEST_WHISPER_MODEL=/path/to/ggml-tiny.en-q5_1.bin \
+KESTREL_TEST_SPEECH_PCM=/path/to/jfk.pcm \
+KESTREL_TEST_GGUF=/path/to/stories260K.gguf \
+ctest --test-dir build-linux --output-on-failure
+```
+
+The audio check expects the upstream whisper.cpp `samples/jfk.wav` phrase;
+convert it with `ffmpeg -i jfk.wav -ar 16000 -ac 1 -f s16le jfk.pcm`.
+Distribution GGML libraries may load CPU backends as plugins. Keep their plugin
+packages installed. For a locally extracted SDK, `GGML_BACKEND_PATH` is a path
+to a **shared-library file**, not a directory; only select a CPU plugin compatible
+with the machine. Kestrel does not replace the SDK's backend loader. llama.cpp and whisper.cpp
+both depend on GGML: use compatible SDK builds from the same package set, not a
+new llama.cpp with an older unrelated GGML selected through `CMAKE_PREFIX_PATH`.
+A final fallback rebuild exposed exactly that mixed-SDK link error after another
+local llama installation became discoverable; explicitly disabling inference
+for that fallback configuration restored its intended dependency-free build.
+
+### Keyring failure hardening
+
+Linux secret storage invokes `secret-tool` directly, without a shell. Private
+bytes travel on stdin, never in arguments or a scratch file. Each subprocess has
+a five-second deadline and an 8 MiB combined output limit. A storage operation
+may make several requests (availability probes and deletion verification), so
+its total bound can exceed five seconds. Timed-out process groups are terminated;
+closed input, oversized output and abnormal exits fail closed. Stderr is kept
+separate from the secret report, and profile values are not included in error
+messages. Successful operations clear stale errors; deletion is independently
+verified and an availability probe must read back the exact test bytes.
+
+A timeout can happen after the keyring accepted a write: Kestrel reports failure
+and does not claim the item was absent or removed. Unlock the keyring and retry.
+There is never a plaintext disk fallback. `kestrel_linux_keyring_tests` uses an
+isolated fake tool and covers missing executables, locked-service responses,
+inherited-pipe stalls, broken stdin, output flooding, binary round trips and
+verified deletion; it never touches the user's real keyring.
 
 ## Development workflow
 

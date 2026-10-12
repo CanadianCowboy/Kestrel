@@ -71,8 +71,8 @@ struct RecognitionResult {
 //   * stopAndWait() is teardown-only and must return after all callbacks from
 //     the previous session have left the recognizer.
 //
-// The platform adapter is SapiSpeechRecognizer, declared in
-// runtime/sapirecognizer.h. It reports available() honestly, so the app keeps
+// Platform adapters are Windows SapiSpeechRecognizer and optional Linux
+// whisper.cpp/ALSA. They report available() honestly, so the app keeps
 // working on a machine or a build where it cannot listen, and everything above
 // this contract -- the listen session, the barge-in path, the interface -- is
 // identical whichever recognizer is underneath it.
