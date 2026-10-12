@@ -71,9 +71,8 @@ struct ToneProfile {
     bool confident = true;
     bool concise = true;
     bool anticipatory = true;
-    // "Slightly witty". Off by default because a wry assistant that nobody
-    // asked for is a worse default than a plain one.
-    bool wry = false;
+    // A little dry wit is a Kestrel signature, used sparingly and kindly.
+    bool wry = true;
 };
 
 // Events the persona reacts to. These are meanings, not UI events: the app
@@ -143,9 +142,9 @@ public:
     /// presenceLine() plus the operating rules, as one prompt fragment.
     [[nodiscard]] std::string systemPromptFragment() const;
 
-    // The short cue said the moment a request is accepted, before any of the
-    // answer exists: "Understood." / "On it." / "Right away." Advances the
-    // rotation, so consecutive requests do not repeat the same cue.
+    // Kept as the voice-pipeline hook for a request cue. The default persona
+    // returns empty so spoken replies begin with their actual answer rather
+    // than a repeated acknowledgement.
     [[nodiscard]] std::string acknowledgement();
     /// The pause the voice should take after the cue, from the same profile
     // that paces clauses, so the gap between cue and answer is deliberate.
@@ -156,12 +155,12 @@ public:
     // when the dials are not in a state that justifies saying it.
     //
     // The rules, in one place so they are easy to argue with:
-    //   * a long answer is offered to continue,
+    //   * a long answer offers a specific continuation,
     //   * a correction is acknowledged rather than argued with,
-    //   * a finished task is reported as finished,
-    //   * a returning user is met rather than interrogated,
-    //   * an ordinary short answer only prompts the next step when initiative
-    //     is high enough to be worth the interruption,
+    //   * a finished task is reported simply,
+    //   * a returning user is welcomed without an interrogation,
+    //   * an ordinary short answer only offers a concrete next step at high
+    //     initiative and an intentionally low cadence,
     //   * pausing, resuming, and barge-in say nothing, because the UI already
     //     shows those states and a line would be noise on top of them.
     [[nodiscard]] std::optional<Anticipation> react(PersonaTrigger trigger,

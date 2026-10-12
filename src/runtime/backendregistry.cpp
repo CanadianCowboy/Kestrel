@@ -17,10 +17,10 @@ std::unique_ptr<ModelBackend> makeBackend(BackendKind kind) {
     case BackendKind::LlamaCpp: return std::make_unique<LlamaCppBackend>();
     case BackendKind::OrtGenAI: return std::make_unique<OrtGenAiBackend>();
     }
-    return std::make_unique<MockBackend>();
+    return nullptr;
 }
 
-// Preference order for an unspecified request: real accelerators first, mock last.
+// Preference order for an unspecified runtime: real inference backends only.
 //
 // ONNX Runtime GenAI ahead of llama.cpp because it is the Windows-native path:
 // it runs the CUDA execution provider directly, and it is the backend NVIDIA
@@ -41,8 +41,17 @@ std::unique_ptr<ModelBackend> makeBackend(BackendKind kind) {
 constexpr BackendKind kPreferenceOrder[] = {
     BackendKind::OrtGenAI,
     BackendKind::LlamaCpp,
-    BackendKind::Mock,
 };
+
+std::unique_ptr<ModelBackend> makeRuntimeBackend() {
+    for (const BackendKind kind : kPreferenceOrder) {
+        auto candidate = makeBackend(kind);
+        if (candidate->status().available) {
+            return candidate;
+        }
+    }
+    return makeBackend(BackendKind::LlamaCpp);
+}
 
 void append(std::vector<RuntimeDiagnostic>& out, std::string label, std::string value, bool ok) {
     out.push_back({std::move(label), std::move(value), ok});
@@ -120,15 +129,17 @@ std::unique_ptr<ModelBackend> selectBackend(BackendKind preferred) {
     if (preferred == BackendKind::Mock) {
         return makeBackend(BackendKind::Mock);
     }
-    if (preferred != BackendKind::Mock) {
-        auto requested = makeBackend(preferred);
-        if (requested->status().available) {
-            return requested;
-        }
+    if (preferred != BackendKind::LlamaCpp && preferred != BackendKind::OrtGenAI) {
+        return makeRuntimeBackend();
+    }
+
+    auto requested = makeBackend(preferred);
+    if (requested->status().available) {
+        return requested;
     }
 
     for (const BackendKind kind : kPreferenceOrder) {
-        if (kind == BackendKind::Mock) {
+        if (kind == preferred) {
             continue;
         }
         auto candidate = makeBackend(kind);
@@ -137,7 +148,9 @@ std::unique_ptr<ModelBackend> selectBackend(BackendKind preferred) {
         }
     }
 
-    return makeBackend(BackendKind::Mock);
+    return preferred == BackendKind::OrtGenAI
+        ? makeBackend(BackendKind::OrtGenAI)
+        : makeBackend(BackendKind::LlamaCpp);
 }
 
 } // namespace kestrel::runtime

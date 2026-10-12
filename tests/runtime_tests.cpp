@@ -319,6 +319,9 @@ void testBackendSelectionAndDiagnostics() {
     const auto backend = runtime::selectBackend(runtime::BackendKind::Mock);
     assert(backend != nullptr);
     assert(backend->status().available);
+    const auto defaultBackend = runtime::selectBackend();
+    assert(defaultBackend != nullptr);
+    assert(defaultBackend->kind() != runtime::BackendKind::Mock);
 
     assert(runtime::toString(runtime::BackendKind::Mock) == "mock");
     assert(runtime::toString(runtime::BackendKind::LlamaCpp) == "llamacpp");
@@ -328,6 +331,7 @@ void testBackendSelectionAndDiagnostics() {
     assert(!diagnostics.empty());
     bool sawCudaRow = false;
     bool sawGenAiRow = false;
+    bool sawMockRow = false;
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         assert(!row.label.empty());
         assert(!row.value.empty());
@@ -337,12 +341,16 @@ void testBackendSelectionAndDiagnostics() {
         if (row.label == "ONNX Runtime GenAI") {
             sawGenAiRow = true;
         }
+        if (row.label == "Backend: mock") {
+            sawMockRow = true;
+        }
     }
     assert(sawCudaRow);
     // The Windows-native backend must be visible in the report whether or not it
     // is compiled in. A backend that only appears once it is linked is a
     // backend nobody can discover before deciding to build it.
     assert(sawGenAiRow);
+    assert(!sawMockRow);
     std::printf("  diagnostics rows: %zu\n", diagnostics.size());
     for (const runtime::RuntimeDiagnostic& row : diagnostics) {
         std::printf("    [%s] %s: %s\n", row.ok ? " ok " : "warn", row.label.c_str(),

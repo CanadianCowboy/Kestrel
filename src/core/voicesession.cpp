@@ -1,6 +1,7 @@
 #include "core/voicesession.h"
 
 #include <algorithm>
+#include <cctype>
 #include <utility>
 
 namespace kestrel::core {
@@ -47,6 +48,12 @@ std::size_t clauseEndFrom(std::string_view text, std::size_t start) noexcept {
     for (std::size_t i = start; i < text.size(); ++i) {
         const char c = text[i];
         if (isSentenceTerminator(c)) {
+            // A decimal point is not a sentence boundary.
+            if (c == '.' && i > start && i + 1 < text.size()
+                && std::isdigit(static_cast<unsigned char>(text[i - 1]))
+                && std::isdigit(static_cast<unsigned char>(text[i + 1]))) {
+                continue;
+            }
             std::size_t end = i + 1;
             while (end < text.size()) {
                 if (isTrailingPunctuation(text[end])) {
@@ -66,7 +73,230 @@ std::size_t clauseEndFrom(std::string_view text, std::size_t start) noexcept {
     return text.size();
 }
 
+// Rebuild a small projection of the generated text, keeping each spoken byte's
+// source end offset. The raw transcript is never changed, and a split Markdown
+// construct is held until it closes instead of leaking code/URLs into speech.
+struct ReadableText {
+    std::string text;
+    std::vector<std::size_t> sourceEnds;
+    std::size_t consumed = 0;
+};
+
+ReadableText readableText(std::string_view source, bool complete) {
+    ReadableText out;
+    const auto emit = [&out](char c, std::size_t end) {
+        out.text += c;
+        out.sourceEnds.push_back(end);
+    };
+    bool fenced = false;
+    char fenceChar = 0;
+    std::size_t fenceLength = 0;
+    for (std::size_t i = 0; i < source.size();) {
+        const bool lineStart = i == 0 || source[i - 1] == '\n';
+        if (lineStart) {
+            std::size_t first = i;
+            while (first < source.size() && (source[first] == ' ' || source[first] == '\t')) {
+                ++first;
+            }
+            std::size_t run = first;
+            while (run < source.size() && (source[run] == '`' || source[run] == '~')
+                   && source[run] == source[first]) {
+                ++run;
+            }
+            const std::size_t lineEnd = source.find('\n', i);
+            const bool lineReady = lineEnd != std::string_view::npos || complete;
+            const std::size_t end = lineEnd == std::string_view::npos ? source.size() : lineEnd + 1;
+            if ((run - first >= 3 && !fenced)
+                || (fenced && first < source.size() && source[first] == fenceChar
+                    && run - first >= fenceLength)) {
+                if (!lineReady) { break; }
+                if (!fenced) {
+                    fenceChar = source[first];
+                    fenceLength = run - first;
+                }
+                fenced = !fenced;
+                i = end;
+                out.consumed = i;
+                emit('\n', i);
+                continue;
+            }
+            if (fenced || (first < source.size() && source[first] == '|')
+                || (first - i >= 4 && first < source.size())) {
+                if (!lineReady) { break; }
+                i = end;
+                out.consumed = i;
+                emit('\n', i);
+                continue;
+            }
+            if (first < source.size() && source[first] == '#') {
+                std::size_t marker = first;
+                while (marker < source.size() && source[marker] == '#') { ++marker; }
+                if (marker == source.size() && !complete) { break; }
+                if (marker < source.size() && isWhitespace(source[marker])) {
+                    i = marker + 1;
+                    out.consumed = i;
+                    continue;
+                }
+            }
+            if (first < source.size() && (source[first] == '-' || source[first] == '*'
+                                         || source[first] == '+' || source[first] == '>')) {
+                if (first + 1 == source.size() && !complete) { break; }
+                if (first + 1 < source.size() && isWhitespace(source[first + 1])) {
+                    i = first + 2;
+                    out.consumed = i;
+                    continue;
+                }
+            }
+            std::size_t marker = first;
+            while (marker < source.size() && std::isdigit(static_cast<unsigned char>(source[marker]))) {
+                ++marker;
+            }
+            if (marker > first && marker < source.size()
+                && (source[marker] == '.' || source[marker] == ')')) {
+                if (marker + 1 == source.size() && !complete) { break; }
+                if (marker + 1 < source.size() && isWhitespace(source[marker + 1])) {
+                    i = marker + 2;
+                    out.consumed = i;
+                    continue;
+                }
+            }
+        }
+        if (source[i] == '`') {
+            std::size_t run = i;
+            while (run < source.size() && source[run] == '`') { ++run; }
+            const auto close = source.find(source.substr(i, run - i), run);
+            if (close == std::string_view::npos && !complete) { break; }
+            i = close == std::string_view::npos ? source.size() : close + run - i;
+            out.consumed = i;
+            continue;
+        }
+        if (source[i] == '[' || (source[i] == '!' && i + 1 < source.size() && source[i + 1] == '[')) {
+            const bool image = source[i] == '!';
+            const std::size_t label = i + (image ? 2 : 1);
+            const auto close = source.find(']', label);
+            if (close == std::string_view::npos && !complete) { break; }
+            if (close != std::string_view::npos) {
+                if (close + 1 == source.size() && !complete) { break; }
+                if (close + 1 < source.size() && source[close + 1] == '(') {
+                    const auto targetEnd = source.find(')', close + 2);
+                    if (targetEnd == std::string_view::npos && !complete) { break; }
+                    if (!image) {
+                        for (std::size_t j = label; j < close; ++j) { emit(source[j], j + 1); }
+                    }
+                    i = targetEnd == std::string_view::npos ? source.size() : targetEnd + 1;
+                    out.consumed = i;
+                    continue;
+                }
+                const auto citation = source.substr(label, close - label);
+                if (citation.starts_with('^') || (!citation.empty()
+                    && citation.find_first_not_of("0123456789, -") == std::string_view::npos)) {
+                    i = close + 1;
+                    out.consumed = i;
+                    continue;
+                }
+            }
+        }
+        // Hold complete words so a URL, filename or path split across tokens
+        // cannot have its first half spoken before the rest identifies it.
+        if (!isWhitespace(source[i]) && (i == 0 || isWhitespace(source[i - 1]))) {
+            std::size_t end = i;
+            while (end < source.size() && !isWhitespace(source[end])) { ++end; }
+            if (end == source.size() && !complete) { break; }
+            auto word = source.substr(i, end - i);
+            while (!word.empty() && (word.back() == '.' || word.back() == ','
+                                     || word.back() == ')' || word.back() == '>')) {
+                word.remove_suffix(1);
+            }
+            if (word.starts_with("http://") || word.starts_with("https://") || word.starts_with("www.")
+                || word.find('/') != std::string_view::npos || word.find('\\') != std::string_view::npos
+                || word.ends_with(".yaml") || word.ends_with(".yml") || word.ends_with(".json")
+                || word.ends_with(".py") || word.ends_with(".txt") || word.ends_with(".h")) {
+                i = end;
+                out.consumed = i;
+                continue;
+            }
+        }
+        if (source[i] == '*' || source[i] == '~'
+            || (source[i] == '_' && (i == 0 || !std::isalnum(static_cast<unsigned char>(source[i - 1]))))) {
+            ++i;
+            out.consumed = i;
+            continue;
+        }
+        emit(source[i], i + 1);
+        out.consumed = ++i;
+    }
+    return out;
+}
+
+std::optional<SpeechSegment> readableSegment(const VoiceResponse& response, std::size_t base,
+                                             const VoicePersona& persona, int openingPause) {
+    const ReadableText readable = readableText(response.generatedText(), response.generationComplete());
+    std::size_t first = 0;
+    while (first < readable.text.size()
+           && (readable.sourceEnds[first] <= base || isWhitespace(readable.text[first]))) { ++first; }
+    const auto remainder = std::string_view(readable.text).substr(first);
+    if (remainder.empty()) {
+        if (readable.consumed > base) {
+            return SpeechSegment{{}, base, readable.consumed, 0, base == 0};
+        }
+        return std::nullopt;
+    }
+    const auto end = clauseEndFrom(remainder, 0);
+    const char last = remainder[end - 1];
+    if (!response.generationComplete() && end == remainder.size()
+        && !isSentenceTerminator(last) && !isClauseSoftBreak(last)
+        && !isTrailingPunctuation(last)) {
+        return std::nullopt;
+    }
+    const int pause = openingPause != 0 ? openingPause
+        : base == 0 ? persona.leadInMs
+                    : pauseAfterClause(response.generatedText(), base, persona);
+    return SpeechSegment{std::string(remainder.substr(0, end)),
+                         first == 0 ? 0 : readable.sourceEnds[first - 1],
+                         readable.sourceEnds[first + end - 1], pause, base == 0};
+}
+
 } // namespace
+
+SpokenIntent classifySpokenIntent(std::string_view text) {
+    std::string normalized;
+    for (const unsigned char c : text) {
+        // The rule vocabulary is explicitly English/ASCII. Never discard an
+        // unrecognized Unicode word and mistake the remaining "okay" for intent.
+        if (c >= 128) { return SpokenIntent::Ambiguous; }
+        if (std::isalnum(c)) {
+            normalized += static_cast<char>(std::tolower(c));
+        } else if ((isWhitespace(static_cast<char>(c)) || c == '-') && !normalized.empty() && normalized.back() != ' ') {
+            normalized += ' ';
+        }
+    }
+    if (!normalized.empty() && normalized.back() == ' ') { normalized.pop_back(); }
+    if (normalized.starts_with("kestrel ")) { normalized.erase(0, 8); }
+    if (normalized.starts_with("please ")) { normalized.erase(0, 7); }
+    if (normalized.ends_with(" please")) { normalized.resize(normalized.size() - 7); }
+    constexpr std::string_view acknowledgements[] = {
+        "ok", "okay", "yeah", "yes", "yep", "mm hm", "mhm", "mmhmm", "uh huh", "got it", "right", "i see",
+        "okay thanks", "ok thanks", "that makes sense", "makes sense", "im listening", "i am listening",
+        "keep going", "go on", "understood", "sure", "alright", "all right", "thank you", "thanks"
+    };
+    if (std::find(std::begin(acknowledgements), std::end(acknowledgements), normalized)
+        != std::end(acknowledgements)) { return SpokenIntent::Acknowledgement; }
+    if (normalized == "pause" || normalized == "pause speech" || normalized == "pause audio"
+        || normalized == "hold on" || normalized == "wait a moment" || normalized == "wait") {
+        return SpokenIntent::Pause;
+    }
+    if (normalized == "resume" || normalized == "resume speech" || normalized == "resume audio"
+        || normalized == "continue speaking") { return SpokenIntent::Resume; }
+    if (normalized == "stop" || normalized == "stop speaking" || normalized == "stop audio"
+        || normalized == "be quiet" || normalized == "quiet") { return SpokenIntent::StopAudio; }
+    if (normalized == "cancel" || normalized == "cancel answer" || normalized == "cancel response"
+        || normalized == "stop generating" || normalized == "cancel generation") { return SpokenIntent::Cancel; }
+    return SpokenIntent::Ambiguous;
+}
+
+bool isListeningAcknowledgement(std::string_view text) {
+    return classifySpokenIntent(text) == SpokenIntent::Acknowledgement;
+}
 
 const char* toString(ResponseState state) noexcept {
     switch (state) {
@@ -415,34 +645,7 @@ std::optional<SpeechSegment> VoiceSession::nextSpeechSegment(ResponseId id,
     if (response == nullptr) {
         return std::nullopt;
     }
-    const std::string_view remainder = response->unspokenText();
-    if (remainder.empty()) {
-        return std::nullopt;
-    }
-
-    const std::size_t base = response->spokenOffset();
-    // A zero opening pause means "continue what was already being said", not
-    // "start abruptly". Each call replans from the remainder, so without this
-    // every clause after the first would be spoken with no gap at all.
-    int leadIn = openingPauseMs;
-    if (leadIn == 0) {
-        leadIn = base == 0
-                     ? m_voicePersona.leadInMs
-                     : pauseAfterClause(response->generatedText(), base, m_voicePersona);
-    }
-
-    // Plan against the remainder so offsets are relative to it, then shift them
-    // back onto the response timeline: the caller advances the spoken cursor
-    // with endOffset and the accounting stays exact.
-    const std::vector<SpeechSegment> planned = planSpeech(remainder, m_voicePersona, leadIn);
-    if (planned.empty()) {
-        return std::nullopt;
-    }
-    SpeechSegment segment = planned.front();
-    segment.isFirst = base == 0;
-    segment.startOffset += base;
-    segment.endOffset += base;
-    return segment;
+    return readableSegment(*response, response->spokenOffset(), m_voicePersona, openingPauseMs);
 }
 
 std::optional<SpeechSegment> VoiceSession::peekSpeechSegment(ResponseId id) const {
@@ -450,31 +653,11 @@ std::optional<SpeechSegment> VoiceSession::peekSpeechSegment(ResponseId id) cons
     if (response == nullptr) {
         return std::nullopt;
     }
-    // The next segment is planned from everything still unspoken. Once that
-    // segment has been taken, the remainder is what follows it -- so the peek
-    // plans against the remainder minus the first planned segment, which is
-    // exactly the text the caller is about to be handed.
-    const std::string_view remainder = response->unspokenText();
-    if (remainder.empty()) {
+    const auto first = nextSpeechSegment(id);
+    if (!first.has_value()) {
         return std::nullopt;
     }
-    const std::size_t base = response->spokenOffset();
-    const std::vector<SpeechSegment> planned = planSpeech(
-        remainder, m_voicePersona, pauseAfterClause(
-                                 response->generatedText(), base, m_voicePersona));
-    if (planned.size() < 2) {
-        return std::nullopt;
-    }
-
-    SpeechSegment ahead = planned[1];
-    // Every planned offset is relative to the remainder, so the shift onto the
-    // response timeline is the same one applied to the segment that does get
-    // spoken. Adding the first segment's length as well would double-count it:
-    // planned[1] already starts after it.
-    ahead.startOffset += base;
-    ahead.endOffset += base;
-    ahead.isFirst = false;
-    return ahead;
+    return readableSegment(*response, first->endOffset, m_voicePersona, 0);
 }
 
 const VoiceResponse* VoiceSession::find(ResponseId id) const noexcept {

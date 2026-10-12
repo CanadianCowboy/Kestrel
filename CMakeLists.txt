@@ -674,6 +674,8 @@ if(KESTREL_BUILD_UI)
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
+            src/app/echocancelsession.cpp
+            src/app/echocancelsession.h
             # The layout audit is compiled into the app as well as into
             # kestrel_qml_tests: the test asserts the detector works, and the app
             # runs it over the real window. It links no kestrel_core -- it is Qt
@@ -776,6 +778,8 @@ if(KESTREL_BUILD_UI)
                 src/app/listensession.h
                 src/app/appcontroller.cpp
                 src/app/appcontroller.h
+                src/app/echocancelsession.cpp
+                src/app/echocancelsession.h
                 src/app/messagemodel.cpp
                 src/app/messagemodel.h
                 src/app/conversationmodel.cpp
@@ -1053,11 +1057,16 @@ if(UNIX AND NOT APPLE)
 
     foreach(_kestrel_rpath_target kestrel kestrel-engine-build)
         if(TARGET ${_kestrel_rpath_target})
-            # Preserve Qt's search paths and linked external SDK prefixes.
+            # Prefer the app's installed runtime libraries before any same-named
+            # SDK in a developer's home prefix. Otherwise a newer llama.cpp
+            # pulled from ~/.local/lib can satisfy the SONAME but abort while
+            # loading a model because its GGUF ABI differs from the one used at
+            # build time.
+            set_property(TARGET ${_kestrel_rpath_target} PROPERTY
+                INSTALL_RPATH "$ORIGIN")
+            # Preserve Qt's and the selected inference runtime's search paths.
             # Otherwise an app that runs in the build tree can lose Qt, llama
             # or ONNX Runtime on install and die before it can report anything.
-            set_property(TARGET ${_kestrel_rpath_target} APPEND PROPERTY
-                INSTALL_RPATH "$ORIGIN" "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
             set_property(TARGET ${_kestrel_rpath_target} PROPERTY
                 INSTALL_RPATH_USE_LINK_PATH TRUE)
             # CMake omits link paths inside the source/build tree from the

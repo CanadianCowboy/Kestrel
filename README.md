@@ -726,6 +726,73 @@ The present app does not yet implement this advanced target: SAPI provides compl
 
 “Zero latency” is an interaction goal rather than a physically literal guarantee. Contributors should optimize measured time-to-first-audio, time-to-first-token, and interruption response time, and document hardware and model conditions when reporting results.
 
+### Current spoken-reply controls
+
+Replies automatically stream readable clauses when the voice is ready at the
+start of the turn. A missing or loading voice delivers text immediately; becoming
+ready later does not unexpectedly read an earlier silent reply. Speech removes
+Markdown decoration and omits fenced/inline code, URLs, common file paths,
+reference markers, and pipe-table rows. Ordinary prose and list items retain their
+wording. The full original answer remains in chat.
+
+With **Summarize long spoken answers** enabled (the default), a real local model
+can adapt only the unspoken remainder: after at least 300 source bytes have been
+consumed and the answer exceeds 1,200 bytes with at least 600 bytes left, playback
+waits at a clause boundary for generation to finish and runs a separate summary
+pass (maximum 160 tokens, 6,000 source characters). The opening is not sent again.
+Larger remainders and failed/empty summaries fall back to the original text with
+an honest diagnostic. Mock preview never pretends to summarize. This adds model
+latency and may omit/misstate information; important written detail remains in chat.
+Audio pause/stop and conversation changes also control/cancel the adaptation.
+
+- **Pause / Resume:** let the active clause finish, then hold audio while text
+  generation continues. Resume starts at the next unconsumed clause.
+- **Skip:** cut the current clause and move to the next available clause.
+- **Stop audio / Escape:** stop speech and finish the written answer silently.
+- **Composer cancel:** cancel both generation and speech.
+- **Progress:** consumed source text divided by text generated so far, including
+  omitted/skipped content. It is not audio duration and can change as text grows.
+
+Listening is still explicitly started with the microphone control. During a live
+or paused spoken answer, short English acknowledgments such as “okay” and “got
+it” do not create another turn. Whole-phrase English commands include **pause**,
+**resume audio**, **stop speaking** (audio only), and **cancel generation** (both).
+“Please” and a “Kestrel” prefix are accepted; negated/longer phrases are not matched
+by substring. Other recognized phrases hold the old answer and its generation;
+the user chooses **Send new request** or **Resume held answer**. Summaries are held
+as audio rather than revised chat. These are conservative rules, not semantic
+intent classification. A held conversation resumes from its preceding consumed
+clause and may replay the clause that was in flight. Replay and always-on awareness
+remain deferred.
+
+#### Experimental Linux echo-canceled capture
+
+The default microphone route can start an app-owned `pipewire` client using
+`libpipewire-module-echo-cancel` and `aec/libspa-aec-webrtc`. It observes the real
+default output monitor as playback reference (including Qt/platform TTS), then
+captures the verified clean source via ALSA's PipeWire plugin for Whisper. Requires
+`pipewire-bin`, the WebRTC SPA AEC plugin, the ALSA PipeWire plugin, and a local
+Whisper model. No cloud processing, system defaults, permanent audio configuration,
+or microphone recordings are created. Capture starts only after pressing mic and
+is stopped on completion, cancellation, route loss/default change, or exit.
+
+Virtual defaults, missing/mismatched reference routes, multiple playback outputs,
+and custom ALSA capture are not claimed safe. Unsafe simultaneous playback/capture
+is refused with an actionable message rather than silently using raw audio. The
+**Echo-canceled listening** setting allows disabling the experiment; use headphones
+or pause speech for non-AEC routes. Polling detects route changes, so this is not a
+hard real-time safety guarantee. Recognition still returns completed phrases.
+
+Live checks are opt-in: `KESTREL_TEST_ECHO_LIVE=1` checks route lifecycle;
+`KESTREL_TEST_ECHO_ACOUSTIC=1` additionally plays a synthetic stimulus and captures
+raw/clean PCM in memory for seven seconds; `KESTREL_TEST_WHISPER_MODEL=<path>` adds
+the real controller capture/cancel test. They report room-specific energy differences,
+not isolated ERLE, speech accuracy or double-talk certification. Do not label this
+as verified general-purpose full duplex without a controlled acoustic corpus.
+
+The diagnostics panel starts open on first launch. Its open/collapsed choice is
+saved locally and can be changed with the runtime badge or `Ctrl+D`.
+
 ### Interruption and barge-in behavior
 
 The desired advanced behavior is to detect a user interruption during playback and stop or pause at the earliest safe audio boundary. The current implementation only accepts a request through the listening path and stops playback at a clause boundary; full-duplex echo-aware detection is not implemented. The future interruption path should:

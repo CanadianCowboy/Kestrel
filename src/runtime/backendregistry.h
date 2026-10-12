@@ -26,11 +26,11 @@ struct RuntimeDiagnostic {
 
 // Picks a backend to run with.
 //
-// Returns the first constructed backend whose status reports available, so a
-// machine with TensorRT linked uses it and a machine without falls back to the
-// mock. `preferred` names a backend kind to try first; an unknown or empty
-// value keeps the default order. Never returns null: the mock backend is
-// always constructible, because a UI with no runtime still has to render.
-[[nodiscard]] std::unique_ptr<ModelBackend> selectBackend(BackendKind preferred = BackendKind::Mock);
+// Returns an available local inference backend, preferring the requested kind
+// and then trying the other real runtimes. Explicit Mock selection remains for
+// tests only. If no inference runtime is linked, returns the unavailable
+// llama.cpp adapter so callers receive an actionable runtime diagnostic rather
+// than silently generating canned text.
+[[nodiscard]] std::unique_ptr<ModelBackend> selectBackend(BackendKind preferred = BackendKind::LlamaCpp);
 
 } // namespace kestrel::runtime
