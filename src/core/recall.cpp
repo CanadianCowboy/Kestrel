@@ -106,6 +106,29 @@ const std::vector<Memory>& Recall::memories() const noexcept {
     return m_memories;
 }
 
+std::string Recall::contextBlock(std::size_t maxCharacters) const {
+    if (!m_enabled || m_memories.empty()) {
+        return {};
+    }
+    const std::string_view heading =
+        "Things the user asked you to remember. Use them only where they bear on the "
+        "question, and do not recite them:\n";
+    std::string lines;
+    for (auto memory = m_memories.rbegin(); memory != m_memories.rend(); ++memory) {
+        const std::string line = "- " + memory->text + "\n";
+        if (heading.size() + lines.size() + line.size() > maxCharacters) {
+            break;
+        }
+        lines += line;
+    }
+    if (lines.empty()) {
+        return {};
+    }
+    // The last line has no newline after it, so the block ends where its text does.
+    lines.pop_back();
+    return std::string(heading) + lines;
+}
+
 std::vector<Memory> Recall::search(std::string_view query) const {
     const std::string_view needle = trim(query);
     std::vector<Memory> matches;

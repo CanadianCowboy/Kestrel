@@ -2194,6 +2194,14 @@ std::vector<runtime::ChatMessage> AppController::buildMessages() const {
             messages.push_back(runtime::ChatMessage{role, message.content});
         }
     }
+    // Recalled material goes into the newest user turn of this request only. It
+    // is not in the transcript the user sees, and it is not in the shared system
+    // prompt, which is the cached prefix and must not change between turns.
+    constexpr std::size_t kRecallContextCharacters = 1200;
+    const std::string recalled = m_recall.contextBlock(kRecallContextCharacters);
+    if (!recalled.empty() && !messages.empty() && messages.back().role == runtime::Role::User) {
+        messages.back().content = recalled + "\n\n" + messages.back().content;
+    }
     // The shared system prompt is not added here. It is the backend's cached
     // prefix, and repeating it in the conversation would both undo the caching
     // and let the renderer place it somewhere the model was not trained to

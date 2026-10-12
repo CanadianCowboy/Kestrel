@@ -1317,6 +1317,36 @@ void testRecallRestoreKeepsIdsAndContinues() {
     assert(std::string(core::toString(core::MemoryKind::Summary)) == "summary");
 }
 
+// What the model is shown has to come from recall that is on and has something
+// in it. Off, or empty, it must add nothing to the user's turn.
+void testRecallContextIsEmptyUnlessOnAndStored() {
+    core::Recall recall;
+    assert(recall.contextBlock(10000).empty());
+    recall.setEnabled(true);
+    assert(recall.contextBlock(10000).empty());
+    recall.remember(core::MemoryKind::Fact, "Prefers metric units.", "t");
+    assert(!recall.contextBlock(10000).empty());
+    assert(recall.contextBlock(0).empty());
+    recall.setEnabled(false);
+    assert(recall.contextBlock(10000).empty());
+}
+
+// Newest first, and when the budget runs out the oldest is the one left out.
+void testRecallContextDropsTheOldestFirst() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    recall.remember(core::MemoryKind::Fact, "old fact", "t1");
+    recall.remember(core::MemoryKind::Fact, "new fact", "t2");
+    const std::string everything = recall.contextBlock(10000);
+    assert(everything.find("old fact") != std::string::npos);
+    assert(everything.find("new fact") != std::string::npos);
+    assert(everything.find("new fact") < everything.find("old fact"));
+    const std::string fits = recall.contextBlock(everything.size() - 1);
+    assert(fits.find("new fact") != std::string::npos);
+    assert(fits.find("old fact") == std::string::npos);
+    assert(fits.size() < everything.size());
+}
+
 int main() {
     testPathTextRoundTrip();
     testConversationBasics();
@@ -1347,6 +1377,8 @@ int main() {
     testRecallForgetRemovesOneMemory();
     testRecallSearchIsCaseInsensitiveAndNewestFirst();
     testRecallRestoreKeepsIdsAndContinues();
+    testRecallContextIsEmptyUnlessOnAndStored();
+    testRecallContextDropsTheOldestFirst();
     testIdleStaysSilentWhileTheUserIsPresent();
     testIdleDefaultPolicyIsLocalOnly();
     testIdleOnlyProducesPermittedWork();

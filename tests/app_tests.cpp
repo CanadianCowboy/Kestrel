@@ -1143,6 +1143,44 @@ void testAnUnreadableProfileIsNeverOverwritten() {
           "and the bytes on disk are unchanged");
 }
 
+// The model is told what the user asked it to remember, in the user's turn. The
+// transcript the user reads is unchanged: it shows only what they typed.
+void testRecalledFactReachesTheModelButNotTheTranscript() {
+    std::cout << "a remembered fact reaches the model, not the transcript\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    kestrel::app::AppController controller;
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    controller.setRecallEnabled(true);
+    check(controller.rememberFact(QStringLiteral("Prefers metric units.")), "a fact is remembered");
+
+    auto backend = std::make_unique<SlowBackend>(3, 0);
+    SlowBackend* observed = backend.get();
+    controller.setBackendForTesting(std::move(backend));
+    controller.sendMessage(QStringLiteral("How far is it to the coast?"));
+    runTurnToCompletion(controller);
+
+    const auto requests = observed->requests();
+    check(!requests.empty(), "the model is asked");
+    if (!requests.empty() && !requests.front().messages.empty()) {
+        const auto& turn = requests.front().messages.back();
+        check(turn.role == kestrel::runtime::Role::User, "the newest message is the user's");
+        check(turn.content.find("Prefers metric units.") != std::string::npos,
+              "the model is told the remembered fact");
+        check(turn.content.find("How far is it to the coast?") != std::string::npos,
+              "and it still sees the question");
+    }
+
+    kestrel::app::MessageModel* messages = controller.messages();
+    check(messages->rowCount() >= 1, "the transcript has the user's message");
+    if (messages->rowCount() >= 1) {
+        const QString shown = messages->data(messages->index(0, 0),
+                                             kestrel::app::MessageModel::ContentRole).toString();
+        check(shown == QStringLiteral("How far is it to the coast?"),
+              "the transcript shows only what the user typed");
+    }
+}
+
 void testIdleToolNeedsPermissionBeforeItRuns() {
     std::cout << "an idle tool runs only once it is permitted\n";
 
@@ -2856,6 +2894,7 @@ int main(int argc, char** argv) {
     testForgetAndClearAreSaved();
     testBlankMemoryIsRefusedWithAReason();
     testAnUnreadableProfileIsNeverOverwritten();
+    testRecalledFactReachesTheModelButNotTheTranscript();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

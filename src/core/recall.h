@@ -64,6 +64,12 @@ public:
     // An empty query matches everything.
     [[nodiscard]] std::vector<Memory> search(std::string_view query) const;
 
+    // The recalled material for a user turn: the newest memories first, with the
+    // oldest dropped first when the block would exceed maxCharacters. Empty when
+    // recall is off or nothing is stored. The block says what it is, so the model
+    // uses it where it bears on the question instead of reciting it.
+    [[nodiscard]] std::string contextBlock(std::size_t maxCharacters) const;
+
 private:
     bool m_enabled = false;
     std::vector<Memory> m_memories;
