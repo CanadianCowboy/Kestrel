@@ -435,9 +435,11 @@ void testPersonaAcknowledgementIsNotAStockCue() {
 void testPersonaPromptHasKestrelCharacter() {
     const core::Persona persona;
     const std::string fragment = persona.systemPromptFragment();
-    assert(fragment.find("warm, perceptive, curious") != std::string::npos);
-    assert(fragment.find("dry wit sparingly") != std::string::npos);
-    assert(fragment.find("ask before consequential choices") != std::string::npos);
+    assert(fragment.find("precision of a ship's computer officer") != std::string::npos);
+    assert(fragment.find("humour is dry and understated") != std::string::npos);
+    assert(fragment.find("never claim feelings") != std::string::npos);
+    assert(fragment.find("say when you are certain") != std::string::npos);
+    assert(fragment.find("asking before consequential choices") != std::string::npos);
     assert(fragment.find("Offer a next step only when it genuinely helps") != std::string::npos);
 }
 
@@ -455,7 +457,7 @@ void testPersonaAnticipation() {
 
     const auto done = persona.react(core::PersonaTrigger::TaskCompleted);
     assert(done.has_value());
-    assert(done->text == "That's done.");
+    assert(done->text == "That is complete.");
 
     const auto back = persona.react(core::PersonaTrigger::UserReturned);
     assert(back.has_value());

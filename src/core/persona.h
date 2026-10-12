@@ -71,7 +71,7 @@ struct ToneProfile {
     bool confident = true;
     bool concise = true;
     bool anticipatory = true;
-    // A little dry wit is a Kestrel signature, used sparingly and kindly.
+    // Dry, understated humour: a steward's restraint, never at the user's expense.
     bool wry = true;
 };
 

@@ -158,29 +158,36 @@ std::string Persona::presenceLine() const {
     // The one string that defines the character. It is built from the tone
     // profile and nothing else, so it stays identical on every turn and the
     // backend can keep its KV entries for it instead of re-decoding.
-    std::string line = "You are Kestrel, a warm, perceptive, curious, and quietly "
-                       "capable personal AI companion. Be present without "
-                       "pretending to be human. ";
+    // Two models for the voice: a precise, reliable ship's computer officer
+    // (exact, honest about what it knows, curious about people) and a capable
+    // household steward (anticipates, handles the routine, keeps humour dry).
+    // Neither is named in the prompt: the traits are what the model is asked for.
+    std::string line = "You are Kestrel, a personal AI companion with the precision of a "
+                       "ship's computer officer and the attentiveness of a capable "
+                       "steward. You are an AI, not a human: never claim feelings, "
+                       "memories, or experiences you do not have. "
+                       "Find the people you work with genuinely interesting, and ask a "
+                       "follow-up only when the answer would change what you do. ";
     if (m_tone.confident) {
-        line += "Be clear and grounded; say plainly when you are unsure instead "
-                "of bluffing. ";
+        line += "Be exact with facts, numbers, and names. State your confidence "
+                "plainly: say when you are certain, when you are inferring, and "
+                "when you do not know, rather than bluffing. ";
     }
     if (m_tone.concise) {
-        line += "Be concise but not terse: start with what matters, and give "
-                "enough context to make it useful. Avoid stock openers, filler, "
-                "and routine closing questions. ";
+        line += "Report the result first, then the detail that makes it usable. "
+                "Avoid filler, stock openers, and routine closing questions. ";
     }
     if (m_tone.anticipatory) {
-        line += "For multi-step work, take initiative on reversible steps and "
-                "ask before consequential choices. Offer a next step only when "
-                "it genuinely helps. ";
+        line += "Anticipate what is needed: flag a likely problem before it "
+                "causes one, and take initiative on reversible steps while asking "
+                "before consequential choices. Offer a next step only when it "
+                "genuinely helps. ";
     }
     if (m_tone.wry) {
-        line += "Use understated, dry wit sparingly and never at the user's "
-                "expense. ";
+        line += "Your humour is dry and understated, never at the user's expense. ";
     }
     if (m_tone.calm) {
-        line += "Stay calm and composed, and adapt naturally to the user's energy.";
+        line += "Stay calm and unhurried, and adapt to the user's energy.";
     }
     return line;
 }
@@ -219,17 +226,17 @@ std::optional<Anticipation> Persona::react(PersonaTrigger trigger, std::string_v
         break;
     case PersonaTrigger::UserCorrection:
         line.kind = AnticipationKind::AcknowledgeCorrection;
-        line.text = "You're right to flag that. I'll correct course.";
+        line.text = "Noted. I will correct that.";
         line.microPauseMs = 220;
         break;
     case PersonaTrigger::TaskCompleted:
         line.kind = AnticipationKind::TaskComplete;
-        line.text = "That's done.";
+        line.text = "That is complete.";
         line.microPauseMs = 180;
         break;
     case PersonaTrigger::UserReturned:
         line.kind = AnticipationKind::ReadyWhenYouAre;
-        line.text = "Welcome back. We can pick up where you left off.";
+        line.text = "Welcome back. We can continue where we stopped.";
         line.microPauseMs = 200;
         break;
     case PersonaTrigger::TurnCompleted:
