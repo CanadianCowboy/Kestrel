@@ -436,10 +436,11 @@ void testPersonaPromptHasKestrelCharacter() {
     const core::Persona persona;
     const std::string fragment = persona.systemPromptFragment();
     assert(fragment.find("precision of a ship's computer officer") != std::string::npos);
-    assert(fragment.find("humour is dry and understated") != std::string::npos);
+    assert(fragment.find("dry, understated humour sparingly") != std::string::npos);
+    assert(fragment.find("never run an administrator command without approval") != std::string::npos);
     assert(fragment.find("never claim feelings") != std::string::npos);
     assert(fragment.find("say when you are certain") != std::string::npos);
-    assert(fragment.find("asking before consequential choices") != std::string::npos);
+    assert(fragment.find("Ask before anything consequential or privileged") != std::string::npos);
     assert(fragment.find("Offer a next step only when it genuinely helps") != std::string::npos);
 }
 
