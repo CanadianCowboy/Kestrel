@@ -21,6 +21,7 @@ ApplicationWindow {
     readonly property color muted: "#858c9a"
     readonly property color accent: "#b7e3cf"
     readonly property color accentInk: "#132019"
+    property string privilegedRequestId: ""
 
     QtObject {
         id: palette
@@ -1348,6 +1349,106 @@ ApplicationWindow {
                 color: appController.dictationSettingsError.length > 0 ? "#dc9292" : window.muted
                 font.pixelSize: 12
                 wrapMode: Text.Wrap
+            }
+        }
+    }
+
+    // An administrator command waits here for a person. Nothing runs until
+    // Approve is pressed, and Deny is the focused default so a stray Enter
+    // refuses rather than grants.
+    Connections {
+        target: privilegedBroker
+        function onRequestPending(requestId, program, commandLine, reason) {
+            window.privilegedRequestId = requestId
+            privilegedCommandText.text = commandLine
+            privilegedReasonText.text = reason.length > 0 ? reason : "The assistant did not give a reason."
+            privilegedDialog.open()
+        }
+        function onRequestResolved(requestId) {
+            if (requestId === window.privilegedRequestId) {
+                privilegedDialog.close()
+            }
+        }
+    }
+
+    Popup {
+        id: privilegedDialog
+        objectName: "privilegedApprovalDialog"
+        modal: true
+        focus: true
+        closePolicy: Popup.NoAutoClose
+        anchors.centerIn: Overlay.overlay
+        width: 520
+        padding: 22
+        background: Rectangle { radius: 16; color: window.panelRaised; border.color: window.line }
+        onOpened: denyButton.forceActiveFocus()
+
+        contentItem: ColumnLayout {
+            spacing: 14
+            Text {
+                text: "Allow an administrator command?"
+                color: window.ink
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "An agent asked to run this with administrator rights. Your system's password dialog appears only if you approve."
+                color: window.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: commandColumn.implicitHeight + 24
+                radius: 10
+                color: "#15171c"
+                border.color: window.line
+                Column {
+                    id: commandColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 12
+                    spacing: 6
+                    Text { text: "COMMAND"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Text {
+                        id: privilegedCommandText
+                        width: parent.width
+                        color: window.ink
+                        font.family: "monospace"
+                        font.pixelSize: 12
+                        wrapMode: Text.WrapAnywhere
+                    }
+                    Text { text: "REASON"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                    Text {
+                        id: privilegedReasonText
+                        width: parent.width
+                        color: window.ink
+                        font.pixelSize: 12
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                Item { Layout.fillWidth: true }
+                Button {
+                    id: denyButton
+                    objectName: "privilegedDenyButton"
+                    text: "Deny"
+                    onClicked: {
+                        privilegedBroker.respond(window.privilegedRequestId, false)
+                    }
+                }
+                Button {
+                    objectName: "privilegedApproveButton"
+                    text: "Approve"
+                    onClicked: {
+                        privilegedBroker.respond(window.privilegedRequestId, true)
+                    }
+                }
             }
         }
     }

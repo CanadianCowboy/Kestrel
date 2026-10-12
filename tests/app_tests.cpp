@@ -40,6 +40,7 @@
 #include "ui/layoutaudit.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
+#include "app/privilegedcommand.h"
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
 #include "app/echocancelsession.h"
@@ -2615,6 +2616,147 @@ void testAbandonedPhraseIsNotSubmitted() {
 }
 
 /// Runs the Qt worker and file-URL tests; returns nonzero if any check fails.
+// The approval gate is the whole safety story for administrator commands, so
+// its refusal path is tested directly: no approver, and an approver that says
+// no, must both leave the command unstarted.
+void testPrivilegedCommandRefusesWithoutApproval() {
+    kestrel::app::PrivilegedRequest request;
+    request.program = QStringLiteral("true");
+    request.reason = QStringLiteral("test");
+
+    bool refusedWithoutApprover = false;
+    kestrel::app::runPrivilegedCommand(request, {}, [&](kestrel::app::PrivilegedResult result) {
+        refusedWithoutApprover = !result.ran
+            && result.error.contains(QStringLiteral("not approved"));
+    });
+    check(refusedWithoutApprover, "privileged command does not run without an approver");
+
+    bool asked = false;
+    bool declinedCleanly = false;
+    kestrel::app::runPrivilegedCommand(
+        request,
+        [&asked](const kestrel::app::PrivilegedRequest&, kestrel::app::PrivilegedDecision decide) {
+            asked = true;
+            decide(false);
+        },
+        [&](kestrel::app::PrivilegedResult result) { declinedCleanly = !result.ran; });
+    check(asked, "the user is asked before a privileged command runs");
+    check(declinedCleanly, "a declined privileged command does not run");
+}
+
+// Replies a scripted sequence, one per generation, streamed in small chunks so
+// that a tool tag is split across tokens the way a real model splits it.
+class ScriptedToolBackend final : public kestrel::runtime::ModelBackend {
+public:
+    explicit ScriptedToolBackend(std::vector<std::string> replies)
+        : m_replies(std::move(replies)) {}
+
+    [[nodiscard]] BackendKind kind() const noexcept override { return BackendKind::Mock; }
+
+    [[nodiscard]] kestrel::runtime::RuntimeStatus status() const override {
+        return {true, true, "Scripted tool backend", "test", "unit test", 0.0, 0, 4096};
+    }
+
+    bool loadModel(const std::string&, std::string&) override { return true; }
+
+    void generate(const GenerationRequest& request,
+                  kestrel::runtime::TokenCallback onToken,
+                  kestrel::runtime::CompletionCallback onComplete) override {
+        std::string reply;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_requests.push_back(request);
+            reply = m_next < m_replies.size() ? m_replies[m_next] : std::string("Done.");
+            ++m_next;
+        }
+        for (std::size_t offset = 0; offset < reply.size(); offset += 7) {
+            onToken(std::string_view(reply).substr(offset, 7));
+        }
+        onComplete(true, {});
+    }
+
+    void cancel() override {}
+
+    [[nodiscard]] std::vector<GenerationRequest> requests() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_requests;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::vector<std::string> m_replies;
+    std::size_t m_next = 0;
+    std::vector<GenerationRequest> m_requests;
+};
+
+// The chat tool loop end to end: the model writes a tool call, the call is run
+// through the dispatcher, its result becomes model context, and the model's
+// next reply is shown. The call itself never appears in the transcript.
+void testChatToolLoopRunsCallAndAnswers() {
+    kestrel::core::McpDispatcher dispatcher;
+    dispatcher.addTool({
+        "kestrel_status",
+        "Report status.",
+        {kestrel::core::ToolPermission::ReadConversations},
+        [](const kestrel::storage::json::Value&) {
+            return kestrel::core::McpToolResult{false, "ok"};
+        },
+        nullptr});
+    dispatcher.permissions().setEnabled("kestrel_status", true);
+
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setAgentTools(&dispatcher);
+    auto model = std::make_unique<ScriptedToolBackend>(std::vector<std::string>{
+        "Let me check. <tool_call>{\"name\":\"list_tools\",\"arguments\":{}}</tool_call>",
+        "The status tool is available."});
+    ScriptedToolBackend* observed = model.get();
+    controller.setBackendForTesting(std::move(model));
+    controller.sendMessage(QStringLiteral("What tools do you have?"));
+
+    // Generation pauses while the tool runs, so wait for the second reply itself
+    // rather than for the first one to finish.
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(5);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        if (observed->requests().size() == 2 && !controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    poll.start();
+    loop.exec();
+
+    const auto requests = observed->requests();
+    check(requests.size() == 2, "a tool call starts exactly one follow-up generation");
+    if (requests.size() == 2) {
+        bool sawListing = false;
+        for (const auto& message : requests.back().messages) {
+            sawListing = sawListing || (message.role == kestrel::runtime::Role::User
+                                        && message.content.find("kestrel_status") != std::string::npos);
+        }
+        check(sawListing, "the tool result is part of the model's context for the next reply");
+    }
+
+    bool leaked = false;
+    bool sawResultRow = false;
+    bool sawAnswer = false;
+    const kestrel::app::MessageModel* messages = controller.messages();
+    for (int row = 0; row < messages->rowCount(); ++row) {
+        const QModelIndex index = messages->index(row, 0);
+        const QString content = messages->data(index, kestrel::app::MessageModel::ContentRole).toString();
+        const QString author = messages->data(index, kestrel::app::MessageModel::AuthorRole).toString();
+        leaked = leaked || content.contains(QStringLiteral("<tool_call>"));
+        sawResultRow = sawResultRow || author == QStringLiteral("tool");
+        sawAnswer = sawAnswer || content.contains(QStringLiteral("The status tool is available."));
+    }
+    check(!leaked, "the tool call is hidden from the transcript");
+    check(sawResultRow, "the tool result is recorded in the transcript");
+    check(sawAnswer, "the model's answer after the tool result is shown");
+    controller.stopGeneration();
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash still shows how far the run got. A lost buffer
     // turns a five-second diagnosis into a guess about which test died.
@@ -2641,6 +2783,7 @@ int main(int argc, char** argv) {
     }
 
     testListenSessionIgnoresQueuedCallbacksFromPreviousSession();
+    testPrivilegedCommandRefusesWithoutApproval();
     testGenerationRunsOffCallingThread();
     testTokensStreamBeforeCompletionAndPreserveUtf8();
     testCancelBeforeWorkerStarts();
@@ -2676,6 +2819,7 @@ int main(int argc, char** argv) {
     testAReplySentMidSpeechTakesItsOwnWarmth();
     testLoadingVoiceReportsTextOnlyWithoutWaiting();
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
+    testChatToolLoopRunsCallAndAnswers();
     testPreviewInputRequiresExplicitOptIn();
 #if defined(__linux__)
     testLinuxRecognizerReachesListenSession();

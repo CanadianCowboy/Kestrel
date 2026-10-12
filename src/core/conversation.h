@@ -11,7 +11,12 @@ enum class MessageRole {
     User,
     Assistant,
     System,
+    // Local activity recorded for the user, such as an idle-loop tool. It is
+    // never sent back to the model.
     Tool,
+    // The result of a tool the model called from chat. The model reads it on its
+    // next pass, so it is part of the conversation.
+    ToolResult,
 };
 
 struct Message {

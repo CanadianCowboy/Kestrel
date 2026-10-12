@@ -25,6 +25,7 @@ QString toAuthorString(core::MessageRole role) {
     case core::MessageRole::System:
         return QStringLiteral("system");
     case core::MessageRole::Tool:
+    case core::MessageRole::ToolResult:
         return QStringLiteral("tool");
     }
     return QStringLiteral("assistant");

@@ -234,6 +234,12 @@ add_library(kestrel_core
     src/core/presence.h
     src/core/idletool.cpp
     src/core/idletool.h
+    src/core/mcpdispatch.cpp
+    src/core/mcpdispatch.h
+    src/core/mcphttp.cpp
+    src/core/mcphttp.h
+    src/core/agenttools.cpp
+    src/core/agenttools.h
     src/core/voicesession.cpp
     src/core/voicesession.h
     src/runtime/cudadevice.cpp
@@ -674,6 +680,10 @@ if(KESTREL_BUILD_UI)
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
+            src/app/privilegedcommand.cpp
+            src/app/privilegedcommand.h
+            src/app/privilegedapproval.cpp
+            src/app/privilegedapproval.h
             src/app/echocancelsession.cpp
             src/app/echocancelsession.h
             # The layout audit is compiled into the app as well as into
@@ -740,6 +750,22 @@ if(KESTREL_BUILD_UI)
             message(STATUS "Kestrel: Qt Multimedia not found; no local neural voice")
         endif()
 
+        # The MCP endpoint serves local agents over loopback TCP. Optional, so a
+        # Qt install without the Network module still builds the desktop app; the
+        # server is then simply not started.
+        find_package(Qt6Network QUIET)
+        if(TARGET Qt6::Network)
+            target_sources(kestrel PRIVATE
+                src/app/mcpserver.cpp src/app/mcpserver.h
+                src/app/agenttools.cpp src/app/agenttools.h
+                src/app/tavilyclient.cpp src/app/tavilyclient.h)
+            target_link_libraries(kestrel PRIVATE Qt6::Network)
+            target_compile_definitions(kestrel PRIVATE KESTREL_HAS_MCP_SERVER=1)
+            message(STATUS "Kestrel: Qt Network found; the local MCP endpoint can run")
+        else()
+            message(STATUS "Kestrel: Qt Network not found; no local MCP endpoint")
+        endif()
+
         # The app links kestrel_core, so it carries the llama.cpp load-time
         # dependency and cannot start without the runtime beside it. This is the
         # one call that is not a test, and it is the one the packager depends
@@ -778,6 +804,8 @@ if(KESTREL_BUILD_UI)
                 src/app/listensession.h
                 src/app/appcontroller.cpp
                 src/app/appcontroller.h
+                src/app/privilegedcommand.cpp
+                src/app/privilegedcommand.h
                 src/app/echocancelsession.cpp
                 src/app/echocancelsession.h
                 src/app/messagemodel.cpp

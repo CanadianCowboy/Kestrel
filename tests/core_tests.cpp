@@ -2,6 +2,9 @@
 #include "core/pathtext.h"
 #include "core/idlepersona.h"
 #include "core/idletool.h"
+#include "core/mcpdispatch.h"
+#include "core/mcphttp.h"
+#include "core/agenttools.h"
 #include "core/persona.h"
 #include "core/presence.h"
 #include "core/voicesession.h"
@@ -1064,8 +1067,9 @@ void testPeekSpeechSegmentLooksOneClauseAhead() {
 void testWarmthBecomesPace() {
     const core::VoicePersona base;
     const float neutral = core::paceFor(base);
-    // 0.5 + the default rate of 0.96: the speed the engine has always been given.
-    assert(neutral > 1.459F && neutral < 1.461F);
+    // The default rate of 0.96 is the engine speed at neutral warmth. It used to
+    // be offset by 0.5 (1.46), which played back too fast.
+    assert(neutral > 0.959F && neutral < 0.961F);
 
     core::VoicePersona warm = base;
     warm.warmth = 1.0F;
@@ -1224,7 +1228,275 @@ void testPathTextRoundTrip() {
     assert(core::pathText(nested.filename()) == cjk);
 }
 
+namespace {
+
+// A reply body parsed back into a value, so the tests read structure rather
+// than matching serialised text.
+storage::json::Value parsedReply(const std::string& body) {
+    std::string error;
+    auto reply = storage::json::Value::parse(body, error);
+    assert(reply.has_value());
+    return *reply;
+}
+
+std::string toolText(const storage::json::Value& reply) {
+    const storage::json::Value* result = reply.find("result");
+    assert(result != nullptr);
+    const storage::json::Value* content = result->find("content");
+    assert(content != nullptr && content->asArray() != nullptr);
+    const storage::json::Value* text = (*content->asArray())[0].find("text");
+    assert(text != nullptr);
+    return std::string(*text->asString());
+}
+
+bool toolIsError(const storage::json::Value& reply) {
+    const storage::json::Value* isError = reply.find("result")->find("isError");
+    assert(isError != nullptr);
+    return *isError->asBoolean();
+}
+
+void testMcpInitializeAdvertisesTools() {
+    core::McpDispatcher dispatcher;
+    const auto reply = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})"));
+    assert(reply.find("id") != nullptr && reply.find("id")->asInteger() == 1);
+    const auto* result = reply.find("result");
+    assert(result != nullptr);
+    assert(result->find("protocolVersion")->asString() == core::McpDispatcher::kProtocolVersion);
+    assert(result->find("capabilities")->find("tools") != nullptr);
+}
+
+void testMcpNotificationsGetNoReply() {
+    core::McpDispatcher dispatcher;
+    assert(dispatcher.handle(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").empty());
+}
+
+void testMcpRejectsMalformedRequests() {
+    core::McpDispatcher dispatcher;
+    const auto notJson = parsedReply(dispatcher.handle("{not json"));
+    assert(notJson.find("error")->find("code")->asInteger() == -32700);
+    const auto unknown = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":7,"method":"shell/exec"})"));
+    assert(unknown.find("error")->find("code")->asInteger() == -32601);
+    assert(unknown.find("id")->asInteger() == 7);
+}
+
+void testMcpToolsAreHiddenUntilEnabled() {
+    core::McpDispatcher dispatcher;
+    dispatcher.addTool({"read status", "Report the runtime state.",
+                        {core::ToolPermission::ReadConversations},
+                        [](const storage::json::Value&) { return core::McpToolResult{false, "ok"}; },
+                        nullptr});
+    const auto before = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})"));
+    assert(before.find("result")->find("tools")->asArray()->empty());
+
+    dispatcher.permissions().setEnabled("read status", true);
+    const auto after = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":3,"method":"tools/list"})"));
+    assert(after.find("result")->find("tools")->asArray()->size() == 1);
+}
+
+void testMcpToolCallsAreGatedByPermission() {
+    core::McpDispatcher dispatcher;
+    int runs = 0;
+    dispatcher.addTool({"read status", "Report the runtime state.",
+                        {core::ToolPermission::ReadConversations},
+                        [&runs](const storage::json::Value&) {
+                            ++runs;
+                            return core::McpToolResult{false, "runtime is idle"};
+                        },
+                        nullptr});
+    const std::string call =
+        R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read status","arguments":{}}})";
+
+    // Declared but disabled: the handler must not run.
+    assert(toolIsError(parsedReply(dispatcher.handle(call))));
+    assert(runs == 0);
+    assert(toolText(parsedReply(dispatcher.handle(call))).find("disabled") != std::string::npos);
+
+    // Enabled but not granted: refused, and the missing permission is named.
+    dispatcher.permissions().setEnabled("read status", true);
+    const auto ungranted = parsedReply(dispatcher.handle(call));
+    assert(toolIsError(ungranted));
+    assert(toolText(ungranted).find("read conversations") != std::string::npos);
+    assert(runs == 0);
+
+    // Enabled and granted: the handler runs and its text comes back.
+    dispatcher.permissions().grant(core::ToolPermission::ReadConversations, true);
+    const auto allowed = parsedReply(dispatcher.handle(call));
+    assert(!toolIsError(allowed));
+    assert(toolText(allowed) == "runtime is idle");
+    assert(runs == 1);
+}
+
+void testAgentCapabilitiesDescribeStateHonestly() {
+    core::McpDispatcher dispatcher;
+    dispatcher.addTool({"kestrel_status", "Report the backend.", {core::ToolPermission::ReadConversations},
+                        [](const storage::json::Value&) { return core::McpToolResult{false, "x"}; },
+                        nullptr});
+
+    // Nothing enabled: the model is told so, and told how to call a tool.
+    const std::string none = core::describeAgentCapabilities(dispatcher, true);
+    assert(none.find("No external tools are enabled") != std::string::npos);
+    assert(none.find("<tool_call>") != std::string::npos);
+    assert(none.find("list_tools") != std::string::npos);
+    assert(none.find("Tool \"kestrel_status\"") == std::string::npos);
+
+    // Enabled but ungranted: listed, with the refusal stated rather than hidden.
+    dispatcher.permissions().setEnabled("kestrel_status", true);
+    const std::string enabled = core::describeAgentCapabilities(dispatcher, true);
+    assert(enabled.find("Tool \"kestrel_status\": Report the backend.") != std::string::npos);
+    assert(enabled.find("not granted") != std::string::npos);
+
+    dispatcher.permissions().grant(core::ToolPermission::ReadConversations, true);
+    assert(core::describeAgentCapabilities(dispatcher, true).find("not granted") == std::string::npos);
+
+    // A stopped endpoint is reported as stopped, not as available.
+    assert(core::describeAgentCapabilities(dispatcher, false).find("not running") != std::string::npos);
+
+    const auto summaries = dispatcher.toolSummaries();
+    assert(summaries.size() == 1 && summaries[0].enabled && summaries[0].permitted);
+}
+
+void testMcpAsyncToolRepliesWhenItCompletes() {
+    core::McpDispatcher dispatcher;
+    core::McpCompletion pending;
+    dispatcher.addTool({"run thing", "Waits for a person.", {core::ToolPermission::RunPrivileged},
+                        nullptr,
+                        [&pending](const storage::json::Value&, core::McpCompletion done) {
+                            pending = std::move(done);
+                        }});
+    dispatcher.permissions().setEnabled("run thing", true);
+    dispatcher.permissions().grant(core::ToolPermission::RunPrivileged, true);
+
+    const std::string call =
+        R"({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run thing","arguments":{}}})";
+
+    // The synchronous path cannot wait, so it says so rather than answering.
+    assert(parsedReply(dispatcher.handle(call)).find("error") != nullptr);
+
+    std::string reply;
+    dispatcher.handleAsync(call, [&reply](std::string body) { reply = std::move(body); });
+    assert(reply.empty());          // held until the completion runs
+    assert(static_cast<bool>(pending));
+    pending(core::McpToolResult{false, "approved and done"});
+    const auto finished = parsedReply(reply);
+    assert(finished.find("id")->asInteger() == 9);
+    assert(toolText(finished) == "approved and done");
+}
+
+void testMcpHttpRefusesWrongHostAndToken() {
+    core::McpDispatcher dispatcher;
+    const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+    const std::string goodHeaders =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:47600\r\nAuthorization: Bearer secret-token\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+
+    // A page on another site can aim requests at the port, but its Host is
+    // its own name: that is the DNS-rebinding case the guard exists for.
+    const std::string foreignHost =
+        "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer secret-token\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(core::answerMcpRequest(foreignHost, "secret-token", dispatcher).status == 403);
+
+    const std::string badAuth =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer nope\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(core::answerMcpRequest(badAuth, "secret-token", dispatcher).status == 401);
+    assert(core::answerMcpRequest(badAuth, "", dispatcher).status == 401); // no token configured
+
+    const std::string good = goodHeaders + body;
+    const auto ok = core::answerMcpRequest(good, "secret-token", dispatcher);
+    assert(ok.status == 200);
+    assert(ok.contentType == "application/json");
+    assert(ok.body == R"({"jsonrpc":"2.0","id":1,"result":{}})");
+}
+
+void testMcpHttpPathMethodAndNotifications() {
+    core::McpDispatcher dispatcher;
+    const std::string note = R"({"jsonrpc":"2.0","method":"notifications/initialized"})";
+    const std::string notify =
+        "POST /mcp HTTP/1.1\r\nHost: localhost:47600\r\nAuthorization: Bearer t\r\n"
+        "Content-Length: " + std::to_string(note.size()) + "\r\n\r\n" + note;
+    const auto accepted = core::answerMcpRequest(notify, "t", dispatcher);
+    assert(accepted.status == 202);
+    assert(accepted.body.empty());
+
+    const std::string wrongPath =
+        "POST /other HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\nContent-Length: 2\r\n\r\n{}";
+    assert(core::answerMcpRequest(wrongPath, "t", dispatcher).status == 404);
+
+    const std::string getRequest =
+        "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\n\r\n";
+    assert(core::answerMcpRequest(getRequest, "t", dispatcher).status == 405);
+}
+
+void testMcpHttpFramingWaitsForTheWholeBody() {
+    const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+    const std::string head =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    assert(!core::mcpRequestComplete(head));                      // no body yet
+    assert(!core::mcpRequestComplete(head + body.substr(0, 5)));  // partly arrived
+    assert(core::mcpRequestComplete(head + body));                // all of it
+    assert(core::mcpRequestComplete(std::string(core::kMcpMaxRequestBytes + 1, 'x'))); // too large
+    const std::string huge =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\nContent-Length: 999999999\r\n\r\n";
+    core::McpDispatcher dispatcher;
+    assert(core::answerMcpRequest(huge + body, "t", dispatcher).status == 400);
+}
+
+} // namespace
+
+void testModelToolCallParsing() {
+    const auto call = core::findModelToolCall(
+        R"(Let me check. <tool_call>{"name":"web_search","arguments":{"query":"tavily"}}</tool_call>)");
+    assert(call.has_value());
+    assert(call->name == "web_search");
+    assert(call->argumentsJson == R"({"query":"tavily"})");
+
+    // Still being written: not a call yet.
+    assert(!core::findModelToolCall(R"(<tool_call>{"name":"web_search")").has_value());
+    // Malformed JSON and a missing name are ordinary text, not guessed at.
+    assert(!core::findModelToolCall("<tool_call>{not json}</tool_call>").has_value());
+    assert(!core::findModelToolCall(R"(<tool_call>{"arguments":{}}</tool_call>)").has_value());
+    // No call at all.
+    assert(!core::findModelToolCall("Just a normal answer.").has_value());
+}
+
+void testSearchResultParsing() {
+    std::string error;
+    const auto tavily = core::parseTavilyResults(
+        R"({"results":[{"title":"Tavily","url":"https://tavily.com","content":"Search API"},{"title":"no url","content":"dropped"}]})",
+        error);
+    assert(tavily.has_value());
+    assert(tavily->size() == 1); // the result with no address is dropped
+    assert((*tavily)[0].url == "https://tavily.com");
+    assert((*tavily)[0].snippet == "Search API");
+
+    const auto searx = core::parseSearxngResults(R"({"results":[{"title":"A","url":"https://a.example","content":"x"}]})", error);
+    assert(searx.has_value() && searx->size() == 1);
+
+    assert(!core::parseTavilyResults("not json", error).has_value());
+    assert(!error.empty());
+    assert(!core::parseSearxngResults(R"({"other":1})", error).has_value());
+    assert(core::formatSearchHits({}) == "No web results.");
+    assert(core::formatSearchHits(*tavily).find("https://tavily.com") != std::string::npos);
+}
+
 int main() {
+    testModelToolCallParsing();
+    testSearchResultParsing();
+    testAgentCapabilitiesDescribeStateHonestly();
+    testMcpAsyncToolRepliesWhenItCompletes();
+    testMcpHttpRefusesWrongHostAndToken();
+    testMcpHttpPathMethodAndNotifications();
+    testMcpHttpFramingWaitsForTheWholeBody();
+    testMcpInitializeAdvertisesTools();
+    testMcpNotificationsGetNoReply();
+    testMcpRejectsMalformedRequests();
+    testMcpToolsAreHiddenUntilEnabled();
+    testMcpToolCallsAreGatedByPermission();
     testPathTextRoundTrip();
     testConversationBasics();
     testMockBackend();

@@ -1,7 +1,11 @@
 #include "app/generationworker.h"
 
+#include <algorithm>
+
 #include <QMetaObject>
 #include <QStringDecoder>
+
+#include "core/agenttools.h"
 
 namespace kestrel::app {
 
@@ -26,7 +30,30 @@ void GenerationWorker::start(quint64 requestId,
                 return;
             }
             runtime::GenerationRequest request{messages, temperature, maxTokens, addAssistantCue};
+            {
+                std::lock_guard<std::mutex> lock(m_toolCallMutex);
+                m_toolCall.reset();
+            }
+            // Tool calls are hidden from the chat and the voice. Visible text is
+            // emitted up to `emitted`; a partial tag at the end of a token is held
+            // back, so a tag split across tokens is still hidden. Emitted slices
+            // end at an ASCII '<' or at the end of the text. One decoder spans the
+            // whole reply, so a character split across two token pieces is
+            // completed in the next slice rather than replaced.
             QStringDecoder decoder(QStringDecoder::Utf8);
+            std::string written;
+            std::size_t emitted = 0;
+            bool sawCall = false;
+            constexpr std::string_view kOpenTag = "<tool_call>";
+            const auto emitSlice = [this, requestId, &decoder](std::string_view slice) {
+                if (slice.empty()) {
+                    return;
+                }
+                const QString text = decoder(QByteArrayView(slice.data(), slice.size()));
+                if (!text.isEmpty()) {
+                    emit tokenReady(requestId, text);
+                }
+            };
             bool succeeded = false;
             QString failure = QStringLiteral("Backend returned without completion");
 
@@ -36,19 +63,44 @@ void GenerationWorker::start(quint64 requestId,
             // across native token pieces rather than decoding each in isolation.
             m_backend->generate(
                 request,
-                [this, requestId, &decoder](std::string_view token) {
+                [this, &written, &emitted, &sawCall, kOpenTag, emitSlice](std::string_view token) {
                     if (m_cancelRequested.load(std::memory_order_acquire)) {
                         return;
                     }
-                    const QString text = decoder(QByteArrayView(token.data(), token.size()));
-                    if (!text.isEmpty()) {
-                        emit tokenReady(requestId, text);
+                    written.append(token.data(), token.size());
+                    if (sawCall) {
+                        return;
                     }
+                    const std::size_t open = written.find(kOpenTag, emitted);
+                    if (open != std::string::npos) {
+                        emitSlice(std::string_view(written).substr(emitted, open - emitted));
+                        emitted = open;
+                        sawCall = true;
+                        return;
+                    }
+                    std::size_t safe = written.size();
+                    const std::size_t longest = std::min(kOpenTag.size() - 1, written.size() - emitted);
+                    for (std::size_t k = longest; k > 0; --k) {
+                        if (written.compare(written.size() - k, k, kOpenTag.data(), k) == 0) {
+                            safe = written.size() - k;
+                            break;
+                        }
+                    }
+                    emitSlice(std::string_view(written).substr(emitted, safe - emitted));
+                    emitted = safe;
                 },
                 [&succeeded, &failure](bool success, std::string_view error) {
                     succeeded = success;
                     failure = QString::fromUtf8(error.data(), error.size());
                 });
+            if (sawCall) {
+                if (auto call = core::findModelToolCall(std::string_view(written).substr(emitted))) {
+                    std::lock_guard<std::mutex> lock(m_toolCallMutex);
+                    m_toolCall = std::move(call);
+                }
+            } else {
+                emitSlice(std::string_view(written).substr(emitted));
+            }
             // Only release the owner's busy/lifetime guard after generate has
             // returned and its internal locks are released. Emitting from the
             // completion callback can otherwise race a backend replacement.
@@ -61,6 +113,13 @@ void GenerationWorker::start(quint64 requestId, const QString& prompt,
                              float temperature, int maxTokens) {
     start(requestId, {runtime::ChatMessage{runtime::Role::User, prompt.toStdString()}},
           temperature, maxTokens);
+}
+
+std::optional<core::ModelToolCall> GenerationWorker::takeToolCall() {
+    std::lock_guard<std::mutex> lock(m_toolCallMutex);
+    std::optional<core::ModelToolCall> call = std::move(m_toolCall);
+    m_toolCall.reset();
+    return call;
 }
 
 void GenerationWorker::cancel() {

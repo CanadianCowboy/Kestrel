@@ -355,8 +355,10 @@ float paceFor(const VoicePersona& persona) noexcept {
     // would be tiring rather than alive.
     constexpr float kNeutralWarmth = 0.6F;
     constexpr float kWarmthRange = 0.30F;
-    return 0.5F + persona.rate
-         - kWarmthRange * (persona.warmth - kNeutralWarmth);
+    // rate is already the engine's speed multiplier (1.0 is its natural pace).
+    // The former 0.5 offset pushed the default to 1.46, which is why playback
+    // sounded hurried.
+    return persona.rate - kWarmthRange * (persona.warmth - kNeutralWarmth);
 }
 
 std::size_t clauseStartBefore(std::string_view text, std::size_t offset) noexcept {

@@ -22,6 +22,8 @@ enum class ToolPermission {
     RunGeneration,     // spend tokens on the model
     WriteFiles,        // create or modify something on disk
     Network,           // talk to anything outside this machine
+    RunPrivileged,     // run a command with administrator rights, only after the user approves each one
+    CaptureScreen,     // read what is on the user's screen
 };
 
 [[nodiscard]] const char* toString(ToolPermission permission) noexcept;
