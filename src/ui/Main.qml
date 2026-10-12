@@ -142,21 +142,25 @@ ApplicationWindow {
             }
         }
 
-        RowLayout {
+        // Plain anchors rather than a RowLayout. The layout engine was
+        // shrinking the sidebar to zero beside the conversation column, so the
+        // ☰ toggle had no visible effect.
+        Item {
             anchors.fill: parent
             anchors.margins: 18
-            spacing: 14
 
             Rectangle {
                 id: sidebar
-                Layout.preferredWidth: appController.sidebarOpen ? 268 : 0
-                Layout.fillHeight: true
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                width: appController.sidebarOpen ? 268 : 0
                 radius: 18
                 color: "#b3171b20"
                 border.color: window.line
                 clip: true
                 visible: width > 0
-                Behavior on Layout.preferredWidth { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+                Behavior on width { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
 
                 ColumnLayout {
                     anchors.fill: parent
@@ -227,11 +231,12 @@ ApplicationWindow {
 
                     Rectangle {
                         Layout.fillWidth: true
-                        implicitHeight: 96
+                        implicitHeight: runtimeColumn.implicitHeight + 26
                         radius: 12
                         color: "#15181d"
                         border.color: window.line
                         Column {
+                            id: runtimeColumn
                             anchors.fill: parent
                             anchors.margins: 13
                             spacing: 7
@@ -274,9 +279,13 @@ ApplicationWindow {
             }
 
             ColumnLayout {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.left: sidebar.right
+                anchors.leftMargin: sidebar.width > 0 ? 14 : 0
+                anchors.right: parent.right
                 spacing: 0
+                clip: true
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -823,10 +832,21 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Column {
                         spacing: 3
-                        Text { text: "Runtime"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
-                        Text { text: "Ctrl+D to close  ·  click Refresh to re-probe"; color: window.muted; font.pixelSize: 10 }
+                        Text { text: "Runtime"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }                    Text {
+                        text: "Ctrl+D to close  ·  click Refresh to re-probe"; color: window.muted; font.pixelSize: 10 }
                     }
                     Item { Layout.fillWidth: true }
+                    Button {
+                        objectName: "diagnosticsCloseButton"
+                        text: "✕"
+                        implicitWidth: 30
+                        implicitHeight: 30
+                        Accessible.name: "Close runtime panel"
+                        onClicked: appController.diagnosticsOpen = false
+                        contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
+                    }
+
                     Button {
                         text: "Refresh"
                         implicitHeight: 30
