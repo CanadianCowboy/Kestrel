@@ -30,6 +30,9 @@
 #include <algorithm>
 #include <string_view>
 
+#include "storage/profile.h"
+#include "storage/secretstore.h"
+
 namespace kestrel::app {
 
 namespace {
@@ -2464,6 +2467,185 @@ void AppController::renameConversation(int id, const QString& title) {
     m_conversationModel->notifyEntryChanged(id);
     if (id == m_activeId) {
         emit activeConversationChanged();
+    }
+}
+
+namespace {
+
+// Recall stores its times in the app layer, which is allowed to read a clock.
+// The recall model in core takes them as given.
+QString utcNowIso() {
+    return QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+}
+
+QString qstring(std::string_view text) {
+    return QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
+}
+
+} // namespace
+
+void AppController::setProfileStore(std::unique_ptr<storage::SecretStore> store) {
+    m_profileStore = std::move(store);
+    loadRecall();
+}
+
+void AppController::loadRecall() {
+    m_recall.restore(false, {});
+    m_recallError.clear();
+    if (!m_profileStore) {
+        m_recallError = QStringLiteral("Recall needs the system keystore, so Kestrel cannot store anything.");
+        emit recallChanged();
+        return;
+    }
+    std::string reason;
+    if (!m_profileStore->available(reason)) {
+        m_recallError = qstring(reason);
+        emit recallChanged();
+        return;
+    }
+    storage::Profile profile;
+    std::string error;
+    if (!storage::Profile::load(*m_profileStore, storage::Profile::kProfileAccount,
+                                storage::kProfileService, profile, error)) {
+        // Refused rather than repaired. persistRecall() reads the same profile
+        // before it writes, so a profile that will not load is never overwritten.
+        m_recallError = QStringLiteral("Your saved profile could not be read, so recall stays off and nothing is overwritten: ")
+            + qstring(error);
+        emit recallChanged();
+        return;
+    }
+    std::vector<core::Memory> memories;
+    memories.reserve(profile.memories.size());
+    for (const storage::StoredMemory& stored : profile.memories) {
+        core::Memory memory;
+        memory.id = static_cast<std::uint64_t>(stored.id);
+        memory.kind = stored.kind == "summary" ? core::MemoryKind::Summary : core::MemoryKind::Fact;
+        memory.text = stored.text;
+        memory.createdAt = stored.createdAt;
+        memories.push_back(std::move(memory));
+    }
+    m_recall.restore(profile.recallEnabled, std::move(memories));
+    emit recallChanged();
+}
+
+bool AppController::persistRecall() {
+    const auto fail = [this](const QString& reason) {
+        m_recallError = reason;
+        emit recallChanged();
+        return false;
+    };
+    if (!m_profileStore) {
+        return fail(QStringLiteral("Recall needs the system keystore, so nothing was saved."));
+    }
+    // Re-read before writing, so the profile's other fields survive the save.
+    storage::Profile profile;
+    std::string error;
+    if (!storage::Profile::load(*m_profileStore, storage::Profile::kProfileAccount,
+                                storage::kProfileService, profile, error)) {
+        return fail(QStringLiteral("Your saved profile could not be read, so nothing was saved: ") + qstring(error));
+    }
+    profile.recallEnabled = m_recall.enabled();
+    profile.memories.clear();
+    for (const core::Memory& memory : m_recall.memories()) {
+        storage::StoredMemory stored;
+        stored.id = static_cast<std::int64_t>(memory.id);
+        stored.kind = core::toString(memory.kind);
+        stored.text = memory.text;
+        stored.createdAt = memory.createdAt;
+        profile.memories.push_back(std::move(stored));
+    }
+    if (!profile.save(*m_profileStore, storage::Profile::kProfileAccount,
+                      storage::kProfileService, error)) {
+        return fail(QStringLiteral("Kestrel could not save your memories: ") + qstring(error));
+    }
+    m_recallError.clear();
+    emit recallChanged();
+    return true;
+}
+
+bool AppController::recallEnabled() const {
+    return m_recall.enabled();
+}
+
+QString AppController::recallError() const {
+    return m_recallError;
+}
+
+QVariantList AppController::recallMemories() const {
+    return searchMemories(QString());
+}
+
+QVariantList AppController::searchMemories(const QString& query) const {
+    QVariantList list;
+    for (const core::Memory& memory : m_recall.search(query.toUtf8().toStdString())) {
+        QVariantMap entry;
+        entry.insert(QStringLiteral("id"), static_cast<qlonglong>(memory.id));
+        entry.insert(QStringLiteral("kind"), QString::fromLatin1(core::toString(memory.kind)));
+        entry.insert(QStringLiteral("text"), qstring(memory.text));
+        entry.insert(QStringLiteral("createdAt"), qstring(memory.createdAt));
+        list.append(entry);
+    }
+    return list;
+}
+
+// Every change below is saved before it is kept. If the save fails, the change
+// is undone, so what the panel shows is always what is on disk.
+
+void AppController::setRecallEnabled(bool enabled) {
+    const bool wasEnabled = m_recall.enabled();
+    m_recall.setEnabled(enabled);
+    if (!persistRecall()) {
+        m_recall.setEnabled(wasEnabled);
+        emit recallChanged();
+    }
+}
+
+bool AppController::rememberFact(const QString& text) {
+    if (!m_recall.enabled()) {
+        m_recallError = QStringLiteral("Turn recall on before Kestrel can remember anything.");
+        emit recallChanged();
+        return false;
+    }
+    const std::vector<core::Memory> before = m_recall.memories();
+    const std::uint64_t id = m_recall.remember(core::MemoryKind::Fact, text.toUtf8().toStdString(),
+                                               utcNowIso().toUtf8().toStdString());
+    if (id == 0) {
+        m_recallError = QStringLiteral("Nothing was remembered: the text is empty or longer than ")
+            + QString::number(static_cast<qulonglong>(core::Recall::kMaxTextLength)) + QStringLiteral(" characters.");
+        emit recallChanged();
+        return false;
+    }
+    if (!persistRecall()) {
+        m_recall.restore(m_recall.enabled(), before);
+        emit recallChanged();
+        return false;
+    }
+    return true;
+}
+
+void AppController::forgetMemory(qlonglong id) {
+    if (id <= 0) {
+        return;
+    }
+    const std::vector<core::Memory> before = m_recall.memories();
+    if (!m_recall.forget(static_cast<std::uint64_t>(id))) {
+        return;
+    }
+    if (!persistRecall()) {
+        m_recall.restore(m_recall.enabled(), before);
+        emit recallChanged();
+    }
+}
+
+void AppController::clearMemories() {
+    if (m_recall.memories().empty()) {
+        return;
+    }
+    const std::vector<core::Memory> before = m_recall.memories();
+    m_recall.clear();
+    if (!persistRecall()) {
+        m_recall.restore(m_recall.enabled(), before);
+        emit recallChanged();
     }
 }
 

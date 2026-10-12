@@ -37,6 +37,11 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#include "storage/profile.h"
+#include "storage/secretstore.h"
+
+#include <memory>
+#include <optional>
 #include "ui/layoutaudit.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
@@ -981,6 +986,163 @@ void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
 // does nothing, and says why. This is the path a user walks through in the
 // panel, so it is tested from the panel's own entry points rather than from the
 // core registry the app happens to own.
+// Two controllers can be opened on one profile through this, and a switch makes
+// every save fail so the undo path can be tested.
+class SharedMemoryStore final : public kestrel::storage::SecretStore {
+public:
+    SharedMemoryStore(kestrel::storage::InMemorySecretStore& inner, bool* failSeals)
+        : m_inner(inner), m_failSeals(failSeals) {}
+    std::string description() const override { return m_inner.description(); }
+    bool available(std::string& reason) const override { return m_inner.available(reason); }
+    bool seal(std::string_view account, std::string_view service,
+              const std::vector<std::uint8_t>& blob, std::string& error) override {
+        if (*m_failSeals) {
+            error = "the keystore refused the write";
+            return false;
+        }
+        return m_inner.seal(account, service, blob, error);
+    }
+    std::optional<std::vector<std::uint8_t>> sealed(std::string_view account,
+                                                    std::string_view service,
+                                                    std::string& error) override {
+        return m_inner.sealed(account, service, error);
+    }
+    bool forget(std::string_view account, std::string_view service, std::string& error) override {
+        return m_inner.forget(account, service, error);
+    }
+
+private:
+    kestrel::storage::InMemorySecretStore& m_inner;
+    bool* m_failSeals;
+};
+
+std::unique_ptr<kestrel::storage::SecretStore> storeOn(kestrel::storage::InMemorySecretStore& keystore,
+                                                       bool* failSeals) {
+    return std::make_unique<SharedMemoryStore>(keystore, failSeals);
+}
+
+void testRecallIsOffUntilTurnedOnAndPersists() {
+    std::cout << "recall is off until turned on, and what it keeps survives a restart\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    {
+        kestrel::app::AppController controller;
+        controller.setProfileStore(storeOn(keystore, &failSeals));
+        check(!controller.recallEnabled(), "recall starts off");
+        check(!controller.rememberFact(QStringLiteral("Prefers metric units.")),
+              "nothing is remembered while recall is off");
+        controller.setRecallEnabled(true);
+        check(controller.recallEnabled(), "turning recall on takes effect");
+        check(controller.rememberFact(QStringLiteral("Prefers metric units.")),
+              "a fact is remembered once recall is on");
+        check(controller.recallMemories().size() == 1, "and it is listed");
+    }
+    kestrel::app::AppController reopened;
+    reopened.setProfileStore(storeOn(keystore, &failSeals));
+    check(reopened.recallEnabled(), "recall is still on after a restart");
+    const QVariantList memories = reopened.recallMemories();
+    check(memories.size() == 1, "the fact survives a restart");
+    if (memories.size() == 1) {
+        const QVariantMap entry = memories.first().toMap();
+        check(entry.value(QStringLiteral("text")).toString() == QStringLiteral("Prefers metric units."),
+              "with its text intact");
+        check(entry.value(QStringLiteral("kind")).toString() == QStringLiteral("fact"), "and its kind");
+    }
+}
+
+void testRecallWithoutAKeystoreStaysOff() {
+    std::cout << "without a keystore recall cannot be turned on, and the panel says why\n";
+    kestrel::app::AppController controller;
+    check(!controller.recallEnabled(), "recall is off");
+    check(!controller.recallError().isEmpty(), "and the reason is there from the start");
+    controller.setRecallEnabled(true);
+    check(!controller.recallEnabled(), "turning recall on is refused with no keystore");
+}
+
+// A change that cannot be saved must not stay on screen as if it had been kept.
+void testAFailedSaveUndoesTheChange() {
+    std::cout << "a change that cannot be saved is undone, and the panel says why\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    kestrel::app::AppController controller;
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    controller.setRecallEnabled(true);
+    check(controller.rememberFact(QStringLiteral("kept")), "the first fact is saved");
+    failSeals = true;
+    check(!controller.rememberFact(QStringLiteral("never saved")), "a fact that cannot be saved is refused");
+    check(controller.recallMemories().size() == 1, "and it is not left in the panel");
+    check(!controller.recallError().isEmpty(), "with the reason shown");
+    controller.setRecallEnabled(false);
+    check(controller.recallEnabled(), "turning recall off is refused while saves fail");
+    failSeals = false;
+    controller.setRecallEnabled(false);
+    check(!controller.recallEnabled(), "and it works again once saves do");
+}
+
+void testForgetAndClearAreSaved() {
+    std::cout << "forgetting and clearing are saved, and clearing leaves recall on\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    {
+        kestrel::app::AppController controller;
+        controller.setProfileStore(storeOn(keystore, &failSeals));
+        controller.setRecallEnabled(true);
+        check(controller.rememberFact(QStringLiteral("one")), "first fact saved");
+        check(controller.rememberFact(QStringLiteral("two")), "second fact saved");
+        // Newest first, so the oldest is last.
+        const qlonglong oldest = controller.recallMemories().last().toMap().value(QStringLiteral("id")).toLongLong();
+        controller.forgetMemory(oldest);
+        check(controller.recallMemories().size() == 1, "forgetting one removes it");
+    }
+    {
+        kestrel::app::AppController controller;
+        controller.setProfileStore(storeOn(keystore, &failSeals));
+        check(controller.recallMemories().size() == 1, "the removal survives a restart");
+        controller.clearMemories();
+        check(controller.recallMemories().isEmpty(), "clearing removes everything");
+    }
+    kestrel::app::AppController reopened;
+    reopened.setProfileStore(storeOn(keystore, &failSeals));
+    check(reopened.recallMemories().isEmpty(), "the clear survives a restart");
+    check(reopened.recallEnabled(), "and recall is still on");
+}
+
+void testBlankMemoryIsRefusedWithAReason() {
+    std::cout << "a blank memory is refused, and the panel says why\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    kestrel::app::AppController controller;
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    controller.setRecallEnabled(true);
+    check(!controller.rememberFact(QStringLiteral("   ")), "blank text is not remembered");
+    check(controller.recallError().contains(QStringLiteral("characters")), "and the reason is shown");
+    check(controller.recallMemories().isEmpty(), "nothing is stored");
+}
+
+// A profile that cannot be read is reported and left exactly as it is. Recall
+// must not write over it, because that would destroy what the user had.
+void testAnUnreadableProfileIsNeverOverwritten() {
+    std::cout << "an unreadable profile is reported and never overwritten\n";
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    const std::string garbage = "{ this is not a profile";
+    std::string error;
+    const std::vector<std::uint8_t> bytes(garbage.begin(), garbage.end());
+    check(keystore.seal(kestrel::storage::Profile::kProfileAccount, kestrel::storage::kProfileService,
+                        bytes, error),
+          "the test profile is seeded");
+    kestrel::app::AppController controller;
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    check(!controller.recallError().isEmpty(), "the unreadable profile is reported");
+    check(!controller.recallEnabled(), "and recall stays off");
+    controller.setRecallEnabled(true);
+    check(!controller.recallEnabled(), "turning recall on is refused rather than writing over the profile");
+    const auto stored = keystore.sealed(kestrel::storage::Profile::kProfileAccount,
+                                        kestrel::storage::kProfileService, error);
+    check(stored.has_value() && std::string(stored->begin(), stored->end()) == garbage,
+          "and the bytes on disk are unchanged");
+}
+
 void testIdleToolNeedsPermissionBeforeItRuns() {
     std::cout << "an idle tool runs only once it is permitted\n";
 
@@ -2688,6 +2850,12 @@ int main(int argc, char** argv) {
 #endif
     testSpokenPhraseTakesTheTypedPath();
     testAbandonedPhraseIsNotSubmitted();
+    testRecallIsOffUntilTurnedOnAndPersists();
+    testRecallWithoutAKeystoreStaysOff();
+    testAFailedSaveUndoesTheChange();
+    testForgetAndClearAreSaved();
+    testBlankMemoryIsRefusedWithAReason();
+    testAnUnreadableProfileIsNeverOverwritten();
 
     std::cout << (failures == 0 ? "\napp tests passed\n" : "\napp tests FAILED\n");
     return failures == 0 ? 0 : 1;

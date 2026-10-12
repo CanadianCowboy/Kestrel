@@ -7,6 +7,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QVariantList>
+#include <QVariantMap>
 
 #include <cstdint>
 #include <memory>
@@ -19,11 +20,13 @@
 #include "core/idlepersona.h"
 #include "core/idletool.h"
 #include "core/persona.h"
+#include "core/recall.h"
 #include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/cudadevice.h"
 #include "runtime/modelbackend.h"
 #include "runtime/speechrecognizer.h"
+#include "storage/secretstore.h"
 
 namespace kestrel::app {
 
@@ -67,6 +70,10 @@ class AppController final : public QObject {
     Q_PROPERTY(bool canRegenerate READ canRegenerate NOTIFY canRegenerateChanged)
     Q_PROPERTY(bool sidebarOpen READ sidebarOpen WRITE setSidebarOpen NOTIFY sidebarOpenChanged)
     Q_PROPERTY(QString searchQuery READ searchQuery WRITE setSearchQuery NOTIFY searchQueryChanged)
+    // Recall is off until the user turns it on. recallMemories lists newest first.
+    Q_PROPERTY(bool recallEnabled READ recallEnabled NOTIFY recallChanged)
+    Q_PROPERTY(QVariantList recallMemories READ recallMemories NOTIFY recallChanged)
+    Q_PROPERTY(QString recallError READ recallError NOTIFY recallChanged)
 
     // Runtime identity and live metrics.
     Q_PROPERTY(QString backendName READ backendName NOTIFY runtimeChanged)
@@ -377,6 +384,20 @@ public:
     Q_INVOKABLE void selectConversation(int id);
     Q_INVOKABLE void renameConversation(int id, const QString& title);
     Q_INVOKABLE void deleteConversation(int id);
+
+    // Recall. Every change is saved to the encrypted profile before it is kept;
+    // if the save fails the change is undone and recallError says why.
+    Q_INVOKABLE void setRecallEnabled(bool enabled);
+    Q_INVOKABLE bool rememberFact(const QString& text);
+    Q_INVOKABLE void forgetMemory(qlonglong id);
+    Q_INVOKABLE void clearMemories();
+    Q_INVOKABLE QVariantList searchMemories(const QString& query) const;
+    // The keystore recall is kept in. Without one, recall cannot be turned on,
+    // because nothing could be saved.
+    void setProfileStore(std::unique_ptr<storage::SecretStore> store);
+    [[nodiscard]] bool recallEnabled() const;
+    [[nodiscard]] QVariantList recallMemories() const;
+    [[nodiscard]] QString recallError() const;
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
     /// Loads a GGUF on a worker thread and switches the app onto it when ready. Takes the URL a
@@ -425,6 +446,7 @@ signals:
     /// Notifies observers that presence, mood, or the status line changed.
     void presenceChanged();
     void idleToolsChanged();
+    void recallChanged();
     /// Notifies observers that audio availability or playback state changed.
     void ttsChanged();
     /// Notifies observers that listening state or the partial transcript changed.
@@ -606,6 +628,16 @@ private:
     // the assistant company between turns. All three are portable core; this
     // layer only polls them and translates the results into Qt properties.
     core::Persona m_persona;
+
+    // Recall, and the keystore its profile is saved to. loadRecall() reads the
+    // profile once when the store is set; persistRecall() re-reads it before each
+    // save so that the fields recall does not own are never overwritten.
+    core::Recall m_recall;
+    std::unique_ptr<storage::SecretStore> m_profileStore;
+    // Says why recall cannot be used until a keystore is attached.
+    QString m_recallError = QStringLiteral("Recall needs the system keystore, so Kestrel cannot store anything.");
+    void loadRecall();
+    bool persistRecall();
     core::IdlePersona m_idle;
     // The permission boundary for anything the loop does on its own. Held by
     // value: it is small, and sharing one would let a tool grant itself a

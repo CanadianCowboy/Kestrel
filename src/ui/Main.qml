@@ -125,6 +125,19 @@ ApplicationWindow {
 
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
     Shortcut { sequence: "Ctrl+K"; onActivated: composer.forceActiveFocus() }
+    // The memory panel and the runtime panel share the right-hand edge, so only
+    // one of them is open at a time.
+    property bool memoryOpen: false
+    onMemoryOpenChanged: if (memoryOpen) appController.diagnosticsOpen = false
+    Connections {
+        target: appController
+        function onDiagnosticsOpenChanged() {
+            if (appController.diagnosticsOpen) {
+                window.memoryOpen = false
+            }
+        }
+    }
+    Shortcut { sequence: "Ctrl+M"; onActivated: window.memoryOpen = !window.memoryOpen }
     Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
     Shortcut { sequence: "Escape"; onActivated: appController.stopSpeech() }
 
@@ -350,6 +363,28 @@ ApplicationWindow {
                             anchors.fill: parent
                             hoverEnabled: true
                             acceptedButtons: Qt.NoButton
+                        }
+                    }
+                    Rectangle {
+                        id: memoryBadge
+                        implicitWidth: 96
+                        implicitHeight: 34
+                        radius: 17
+                        color: window.memoryOpen ? "#1e2a26" : "#17221f"
+                        border.color: appController.recallEnabled ? "#2d463d" : "#3a3038"
+                        Accessible.name: "Open memory panel"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "MEMORY"
+                            color: appController.recallEnabled ? window.accent : "#b5909c"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: window.memoryOpen = !window.memoryOpen
                         }
                     }
                     Rectangle {
@@ -798,6 +833,180 @@ ApplicationWindow {
         // Runtime diagnostics live in a secondary panel, never in the
         // conversation flow, so the main workspace stays quiet as the runtime
         // layer grows.
+        // What Kestrel remembers. Stored in the profile in the system keystore, and
+        // off until recall is switched on here. Every change is saved before it is
+        // shown as kept; a change that cannot be saved is undone and says why.
+        Rectangle {
+            id: memoryPanel
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            anchors.margins: 18
+            width: 360
+            radius: 18
+            color: "#15171c"
+            border.color: window.line
+            visible: window.memoryOpen
+            opacity: window.memoryOpen ? 1 : 0
+            clip: true
+            onVisibleChanged: clearButton.armed = false
+
+            Behavior on opacity {
+                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            ScrollView {
+                id: memoryScroll
+                anchors.fill: parent
+                anchors.margins: 18
+                clip: true
+                contentWidth: availableWidth
+
+                ColumnLayout {
+                    width: memoryScroll.availableWidth
+                    height: implicitHeight
+                    spacing: 12
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Column {
+                            spacing: 3
+                            Text { text: "Memory"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
+                            Text { text: "Ctrl+M to close  ·  kept only on this machine"; color: window.muted; font.pixelSize: 10 }
+                        }
+                        Item { Layout.fillWidth: true }
+                        Button {
+                            objectName: "memoryCloseButton"
+                            text: "✕"
+                            implicitWidth: 30
+                            implicitHeight: 30
+                            Accessible.name: "Close memory panel"
+                            onClicked: window.memoryOpen = false
+                            contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
+                        }
+                    }
+
+                    IdleToggle {
+                        label: "Remember across sessions"
+                        hint: appController.recallEnabled
+                              ? "on: facts you add are kept on this machine"
+                              : "off: nothing new is stored"
+                        checked: appController.recallEnabled
+                        onToggled: appController.setRecallEnabled(!appController.recallEnabled)
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        visible: appController.recallError.length > 0
+                        text: appController.recallError
+                        color: "#c58b98"
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        TextField {
+                            id: memoryInput
+                            Layout.fillWidth: true
+                            placeholderText: "Something to remember"
+                            Accessible.name: "Text to remember"
+                            onAccepted: rememberButton.clicked()
+                        }
+                        Button {
+                            id: rememberButton
+                            text: "Remember"
+                            enabled: appController.recallEnabled && memoryInput.text.trim().length > 0
+                            onClicked: {
+                                if (appController.rememberFact(memoryInput.text)) {
+                                    memoryInput.text = ""
+                                }
+                            }
+                            contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
+                        }
+                    }
+
+                    TextField {
+                        id: memorySearch
+                        Layout.fillWidth: true
+                        placeholderText: "Search memories"
+                        Accessible.name: "Search memories"
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        visible: appController.recallMemories.length === 0
+                        text: appController.recallEnabled
+                              ? "Nothing remembered yet."
+                              : "Nothing remembered. Turn recall on to keep facts."
+                        color: window.muted
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Repeater {
+                        // Reading recallMemories here makes this binding re-run on
+                        // every change to what is remembered, not only on a new
+                        // search. searchMemories is a method, so QML cannot see
+                        // that it depends on the store by itself.
+                        model: {
+                            appController.recallMemories
+                            return appController.searchMemories(memorySearch.text)
+                        }
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            spacing: 4
+
+                            Text {
+                                text: modelData.kind + "  ·  " + modelData.createdAt
+                                color: window.muted
+                                font.pixelSize: 10
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: modelData.text
+                                color: window.ink
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                            }
+                            Button {
+                                text: "Forget"
+                                implicitHeight: 26
+                                Accessible.name: "Forget this memory"
+                                onClicked: appController.forgetMemory(modelData.id)
+                                contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { radius: 8; color: "#1e222a"; border.color: window.line }
+                            }
+                        }
+                    }
+
+                    // Clearing everything takes two presses, so a stray click
+                    // cannot wipe what Kestrel has learned.
+                    Button {
+                        id: clearButton
+                        property bool armed: false
+                        text: armed ? "Confirm: forget everything" : "Clear all"
+                        enabled: appController.recallMemories.length > 0
+                        Accessible.name: "Clear all memories"
+                        onClicked: {
+                            if (armed) {
+                                appController.clearMemories()
+                                armed = false
+                            } else {
+                                armed = true
+                            }
+                        }
+                        contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
+                    }
+                }
+            }
+        }
+
         Rectangle {
             id: diagnosticsPanel
             anchors.top: parent.top

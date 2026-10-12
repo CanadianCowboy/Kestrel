@@ -345,6 +345,9 @@ int main(int argc, char* argv[]) {
 #endif
 
     kestrel::app::AppController controller;
+    // Recall is saved to the platform keystore. Without it, recall cannot be
+    // turned on, and the panel says why.
+    controller.setProfileStore(kestrel::storage::makePlatformSecretStore());
 
     const QStringList arguments = QGuiApplication::arguments();
 
