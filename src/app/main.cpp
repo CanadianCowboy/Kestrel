@@ -571,12 +571,33 @@ int main(int argc, char* argv[]) {
             kestrel::app::tavilyResearch(networkAccess, QString::fromStdString(std::string(*input->asString())),
                                          std::move(done));
         }});
-    if (qEnvironmentVariable("KESTREL_MCP_ALLOW_TOOLS") == QStringLiteral("1")) {
-        for (const char* tool : {"web_search", "screen_capture", "tavily_extract", "tavily_map", "tavily_crawl", "tavily_research"}) {
+    // KESTREL_MCP_ALLOW_TOOLS is "1" to enable every chat tool, or a comma-separated
+    // list of tool names to enable only those. Each enabled tool still needs its
+    // permission, and the permissions below are granted only for the tools chosen.
+    const QString allowTools = qEnvironmentVariable("KESTREL_MCP_ALLOW_TOOLS");
+    if (!allowTools.isEmpty()) {
+        const QStringList requested = allowTools == QStringLiteral("1")
+            ? QStringList{QStringLiteral("web_search"), QStringLiteral("screen_capture"),
+                          QStringLiteral("tavily_extract"), QStringLiteral("tavily_map"),
+                          QStringLiteral("tavily_crawl"), QStringLiteral("tavily_research")}
+            : allowTools.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        bool needsNetwork = false;
+        bool needsScreen = false;
+        for (const QString& entry : requested) {
+            const std::string tool = entry.trimmed().toStdString();
+            if (tool.empty()) {
+                continue;
+            }
             mcpDispatcher.permissions().setEnabled(tool, true);
+            needsScreen = needsScreen || tool == "screen_capture";
+            needsNetwork = needsNetwork || tool.rfind("tavily_", 0) == 0 || tool == "web_search";
         }
-        mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::Network, true);
-        mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::CaptureScreen, true);
+        if (needsNetwork) {
+            mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::Network, true);
+        }
+        if (needsScreen) {
+            mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::CaptureScreen, true);
+        }
     }
     if (qEnvironmentVariable("KESTREL_MCP_ALLOW_PRIVILEGED") == QStringLiteral("1")) {
         mcpDispatcher.permissions().setEnabled("run_privileged_command", true);
