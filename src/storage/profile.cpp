@@ -45,6 +45,18 @@ Value bodyValue(const Profile& profile) {
         conversations.push(std::move(one));
     }
     document.set("conversations", std::move(conversations));
+
+    document.set("recallEnabled", Value::makeBoolean(profile.recallEnabled));
+    Value memories = Value::makeArray();
+    for (const StoredMemory& memory : profile.memories) {
+        Value entry = Value::makeObject();
+        entry.set("id", Value::makeInteger(memory.id));
+        entry.set("kind", Value::makeString(memory.kind));
+        entry.set("text", Value::makeString(memory.text));
+        entry.set("createdAt", Value::makeString(memory.createdAt));
+        memories.push(std::move(entry));
+    }
+    document.set("memories", std::move(memories));
     return document;
 }
 
@@ -97,6 +109,52 @@ bool readOptionalString(const Value& body, std::string_view key, std::string& ou
         return false;
     }
     out = std::string(*text);
+    return true;
+}
+
+// Recall was added in version 2. A version 1 document has none of these fields,
+// which is a document with recall off and nothing remembered, not a broken one.
+bool readRecall(const Value& body, Profile& profile, std::string& error) {
+    const Value* enabled = body.find("recallEnabled");
+    if (enabled != nullptr) {
+        const auto flag = enabled->asBoolean();
+        if (!flag.has_value()) {
+            error = "the profile's \"recallEnabled\" is not true or false";
+            return false;
+        }
+        profile.recallEnabled = *flag;
+    }
+    const Value* memories = body.find("memories");
+    if (memories == nullptr) {
+        return true;
+    }
+    const std::vector<json::Value>* list = memories->asArray();
+    if (list == nullptr) {
+        error = "the profile's memories are not a list";
+        return false;
+    }
+    for (const json::Value& entry : *list) {
+        if (!entry.isObject()) {
+            error = "a memory in the profile is not a record";
+            return false;
+        }
+        StoredMemory memory;
+        const Value* id = entry.find("id");
+        if (id != nullptr) {
+            const auto number = id->asInteger();
+            if (!number.has_value()) {
+                error = "a memory in the profile has an id that is not a number";
+                return false;
+            }
+            memory.id = *number;
+        }
+        if (!readOptionalString(entry, "kind", memory.kind, error) ||
+            !readOptionalString(entry, "text", memory.text, error) ||
+            !readOptionalString(entry, "createdAt", memory.createdAt, error)) {
+            return false;
+        }
+        profile.memories.push_back(std::move(memory));
+    }
     return true;
 }
 
@@ -196,13 +254,20 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         return false;
     }
 
-    if (!readOptionalString(body, "modelPath", out.modelPath, error) ||
-        !readOptionalString(body, "systemPrompt", out.systemPrompt, error)) {
+    // Built here and moved across only at the end, for every field. Writing
+    // straight into `out` would leave the fields that parsed before one that did
+    // not sitting in a profile the caller was told is empty -- which is the
+    // whole failure this function promises not to do.
+    Profile assembled;
+    if (!readOptionalString(body, "modelPath", assembled.modelPath, error) ||
+        !readOptionalString(body, "systemPrompt", assembled.systemPrompt, error) ||
+        !readRecall(body, assembled, error)) {
         return false;
     }
 
     const Value* conversations = body.find("conversations");
     if (conversations == nullptr) {
+        out = std::move(assembled);
         return true;
     }
     const std::vector<json::Value>* list = conversations->asArray();
@@ -210,14 +275,6 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         error = "the profile's conversations are not a list";
         return false;
     }
-    // Built here and moved across only at the end. Appending straight into
-    // `out` would leave the conversations that parsed before the one that did
-    // not sitting in a profile the caller was told is empty -- which is the
-    // whole failure this function promises not to do, arrived at from the
-    // other direction.
-    Profile assembled;
-    assembled.modelPath = std::move(out.modelPath);
-    assembled.systemPrompt = std::move(out.systemPrompt);
     for (const json::Value& entry : *list) {
         if (!entry.isObject()) {
             error = "a conversation in the profile is not a record";

@@ -12,6 +12,7 @@ using kestrel::storage::InMemorySecretStore;
 using kestrel::storage::kProfileService;
 using kestrel::storage::Profile;
 using kestrel::storage::StoredConversation;
+using kestrel::storage::StoredMemory;
 using kestrel::storage::StoredMessage;
 
 int g_failures = 0;
@@ -424,6 +425,78 @@ void testARealisticProfileSurvives() {
     check(loaded.toJson() == profile.toJson(), "and the document is unchanged");
 }
 
+void testRecallSurvivesARoundTrip() {
+    Profile profile = aFullProfile();
+    profile.recallEnabled = true;
+    StoredMemory fact;
+    fact.id = 3;
+    fact.kind = "fact";
+    fact.text = "Prefers metric units.";
+    fact.createdAt = "2026-10-12T09:00:00Z";
+    profile.memories.push_back(fact);
+    StoredMemory summary;
+    summary.id = 4;
+    summary.kind = "summary";
+    summary.text = kAwkwardText;
+    summary.createdAt = "2026-10-12T09:10:00Z";
+    profile.memories.push_back(summary);
+
+    Profile loaded;
+    std::string error;
+    check(Profile::fromJson(profile.toJson(), loaded, error), "a profile with recall loads: " + error);
+    check(loaded.recallEnabled, "recall stays on across a save");
+    check(loaded.memories.size() == 2, "both memories survive");
+    if (loaded.memories.size() == 2) {
+        check(loaded.memories[0].id == 3 && loaded.memories[0].kind == "fact"
+                  && loaded.memories[0].text == fact.text,
+              "the fact is intact, id included");
+        check(loaded.memories[1].text == summary.text, "awkward text in a memory survives");
+    }
+    check(loaded.toJson() == profile.toJson(), "and the document is unchanged");
+
+    // Recall alone is enough to make a profile worth keeping.
+    Profile lone;
+    lone.recallEnabled = true;
+    check(!lone.empty(), "a profile with only recall switched on is not empty");
+}
+
+// A document written before recall existed has neither field. It must load as
+// recall off with nothing remembered, not be refused.
+void testAVersionOneDocumentLoadsWithRecallOff() {
+    Profile loaded;
+    loaded.recallEnabled = true;
+    std::string error;
+    const std::string document =
+        documentWithChecksumOf(R"({"version":1,"modelPath":"x"})");
+    check(Profile::fromJson(document, loaded, error), "a version 1 document loads: " + error);
+    check(!loaded.recallEnabled, "and recall is off");
+    check(loaded.memories.empty(), "with nothing remembered");
+}
+
+// Recall fields with the wrong type are refused, and the refusal leaves nothing
+// behind, so a half-read memory list never looks like a user who forgot things.
+void testMistypedRecallIsRefused() {
+    struct Case {
+        std::string body;
+        std::string what;
+    };
+    const std::vector<Case> cases = {
+        {R"({"version":2,"recallEnabled":"yes"})", "recall that is not true or false"},
+        {R"({"version":2,"memories":{}})", "memories that are not a list"},
+        {R"({"version":2,"memories":["text"]})", "a memory that is not a record"},
+        {R"({"version":2,"memories":[{"id":"three"}]})", "a memory id that is not a number"},
+        {R"({"version":2,"memories":[{"id":1,"text":5}]})", "memory text that is not text"},
+    };
+    for (const Case& test : cases) {
+        Profile loaded;
+        std::string error;
+        check(!Profile::fromJson(documentWithChecksumOf(test.body), loaded, error),
+              "refused: " + test.what);
+        check(loaded.memories.empty() && !loaded.recallEnabled,
+              "and nothing is left behind: " + test.what);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -443,6 +516,9 @@ int main() {
     testUpsertReplacesRatherThanAppends();
     testAwkwardContentSurvives();
     testARealisticProfileSurvives();
+    testRecallSurvivesARoundTrip();
+    testAVersionOneDocumentLoadsWithRecallOff();
+    testMistypedRecallIsRefused();
 
     if (g_failures == 0) {
         std::cout << "profile tests passed\n";

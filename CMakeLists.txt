@@ -229,6 +229,7 @@ add_library(kestrel_core
     src/core/pathtext.cpp
     src/core/pathtext.h
     src/core/persona.cpp
+    src/core/recall.cpp
     src/core/persona.h
     src/core/presence.cpp
     src/core/presence.h

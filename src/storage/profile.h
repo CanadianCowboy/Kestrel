@@ -30,6 +30,17 @@ struct StoredConversation {
     std::vector<StoredMessage> messages;
 };
 
+// One thing Kestrel remembers across sessions, as it is kept.
+struct StoredMemory {
+    std::int64_t id = 0;
+    // "fact" or "summary". A string for the same reason as StoredMessage::role:
+    // a document field has to be readable by something that is not this program.
+    std::string kind;
+    std::string text;
+    // ISO-8601, UTC, supplied by the app when the memory is stored.
+    std::string createdAt;
+};
+
 // Everything Kestrel knows about you, in one document.
 //
 // This is the top of the storage layer: the keystore holds opaque sealed bytes,
@@ -53,8 +64,10 @@ struct StoredConversation {
 // something they can see in the file.
 class Profile {
 public:
-    // Bumped only alongside a migration that can read the previous version.
-    static constexpr std::int64_t kCurrentVersion = 1;
+    // Version 2 added recall. A version 1 document still loads, and reads as
+    // recall off with nothing remembered. Bumped only when the new fields need
+    // a reader that predates them to refuse the document rather than drop them.
+    static constexpr std::int64_t kCurrentVersion = 2;
 
     // The name the document is filed under inside the store. Distinct from
     // kProfileService so a future second secret cannot land on top of this one.
@@ -69,8 +82,16 @@ public:
 
     std::vector<StoredConversation> conversations;
 
+    // Whether Kestrel may store what it learns. Off unless the user turned it on.
+    bool recallEnabled = false;
+
+    // What Kestrel has remembered, kept while recall is off too: turning recall
+    // off stops new storage, and only an explicit clear deletes.
+    std::vector<StoredMemory> memories;
+
     [[nodiscard]] bool empty() const {
-        return modelPath.empty() && systemPrompt.empty() && conversations.empty();
+        return modelPath.empty() && systemPrompt.empty() && conversations.empty()
+            && !recallEnabled && memories.empty();
     }
 
     // Adds a conversation, or replaces the one with the same id, and returns its

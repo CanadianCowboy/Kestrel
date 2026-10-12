@@ -3,6 +3,7 @@
 #include "core/idlepersona.h"
 #include "core/idletool.h"
 #include "core/persona.h"
+#include "core/recall.h"
 #include "core/presence.h"
 #include "core/voicesession.h"
 #include "runtime/mockbackend.h"
@@ -1227,6 +1228,95 @@ void testPathTextRoundTrip() {
     assert(core::pathText(nested.filename()) == cjk);
 }
 
+// Recall is opt-in. Until the user turns it on, nothing is stored.
+void testRecallIsOffByDefault() {
+    core::Recall recall;
+    assert(!recall.enabled());
+    assert(recall.remember(core::MemoryKind::Fact, "Prefers metric units.", "2026-10-12T09:00:00Z") == 0);
+    assert(recall.memories().empty());
+}
+
+// Turning recall off stops new storage and keeps what is there. Only clear()
+// deletes, and clear() leaves the flag alone.
+void testRecallOffKeepsWhatIsStored() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    const std::uint64_t kept = recall.remember(core::MemoryKind::Fact, "Name is Josh.", "2026-10-12T09:00:00Z");
+    assert(kept != 0);
+    recall.setEnabled(false);
+    assert(recall.remember(core::MemoryKind::Fact, "Something new.", "2026-10-12T09:05:00Z") == 0);
+    assert(recall.memories().size() == 1);
+    assert(recall.memories().front().id == kept);
+    recall.clear();
+    assert(recall.memories().empty());
+    assert(!recall.enabled());
+}
+
+// Empty text is not a memory, and neither is a pasted document. The bound is
+// exact: one character over is refused, the bound itself is kept.
+void testRecallRejectsEmptyAndLongText() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    assert(recall.remember(core::MemoryKind::Summary, "   \n\t ", "t") == 0);
+    const std::string tooLong(core::Recall::kMaxTextLength + 1, 'x');
+    assert(recall.remember(core::MemoryKind::Summary, tooLong, "t") == 0);
+    const std::string exact(core::Recall::kMaxTextLength, 'x');
+    assert(recall.remember(core::MemoryKind::Summary, exact, "t") != 0);
+    assert(recall.remember(core::MemoryKind::Fact, "  padded  ", "t") != 0);
+    assert(recall.memories().size() == 2);
+    assert(recall.memories().back().text == "padded");
+    assert(recall.memories().back().createdAt == "t");
+}
+
+void testRecallForgetRemovesOneMemory() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    const std::uint64_t first = recall.remember(core::MemoryKind::Fact, "one", "t");
+    const std::uint64_t second = recall.remember(core::MemoryKind::Fact, "two", "t");
+    assert(recall.forget(first));
+    assert(!recall.forget(first));
+    assert(recall.memories().size() == 1);
+    assert(recall.memories().front().id == second);
+}
+
+// Search ignores ASCII case and returns the newest match first, so the memory
+// panel shows what was learned most recently at the top.
+void testRecallSearchIsCaseInsensitiveAndNewestFirst() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    recall.remember(core::MemoryKind::Fact, "Prefers METRIC units", "t1");
+    recall.remember(core::MemoryKind::Summary, "Talked about voices", "t2");
+    recall.remember(core::MemoryKind::Fact, "Metric is fine for maps", "t3");
+    const std::vector<core::Memory> hits = recall.search("metric");
+    assert(hits.size() == 2);
+    assert(hits[0].text == "Metric is fine for maps");
+    assert(hits[1].text == "Prefers METRIC units");
+    assert(recall.search("").size() == 3);
+    assert(recall.search("absent").empty());
+}
+
+// A loaded memory keeps its id, and new ones continue after the largest id, so
+// an id is never handed out twice.
+void testRecallRestoreKeepsIdsAndContinues() {
+    core::Recall recall;
+    core::Memory a;
+    a.id = 4;
+    a.kind = core::MemoryKind::Fact;
+    a.text = "kept";
+    a.createdAt = "t";
+    core::Memory b;
+    b.id = 9;
+    b.kind = core::MemoryKind::Summary;
+    b.text = "also kept";
+    b.createdAt = "t";
+    recall.restore(true, {a, b});
+    assert(recall.enabled());
+    assert(recall.memories().size() == 2);
+    assert(recall.memories()[0].id == 4);
+    assert(recall.remember(core::MemoryKind::Fact, "new", "t") == 10);
+    assert(std::string(core::toString(core::MemoryKind::Summary)) == "summary");
+}
+
 int main() {
     testPathTextRoundTrip();
     testConversationBasics();
@@ -1251,6 +1341,12 @@ int main() {
     testPersonaAnticipation();
     testPersonaStatusWhispers();
     testPersonaSessionTopic();
+    testRecallIsOffByDefault();
+    testRecallOffKeepsWhatIsStored();
+    testRecallRejectsEmptyAndLongText();
+    testRecallForgetRemovesOneMemory();
+    testRecallSearchIsCaseInsensitiveAndNewestFirst();
+    testRecallRestoreKeepsIdsAndContinues();
     testIdleStaysSilentWhileTheUserIsPresent();
     testIdleDefaultPolicyIsLocalOnly();
     testIdleOnlyProducesPermittedWork();
