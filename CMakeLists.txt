@@ -787,7 +787,7 @@ if(KESTREL_BUILD_UI)
                 src/app/conversationentry.h
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
-            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
             target_compile_definitions(kestrel_app_tests PRIVATE
                 KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})
