@@ -75,8 +75,9 @@ struct VoicePersona {
     // Identifies the intended voice to a synthesizer. Descriptive rather than a
     // vendor voice name, so nothing here breaks when a platform is missing.
     std::string voiceId = "kestrel-warm-neutral";
-    // 1.0 is the voice's natural pace; below is deliberate, unhurried.
-    float rate = 0.96F;
+    // 1.0 is the voice's natural pace; below is deliberate, unhurried. Lowered
+    // from 0.96 so the default is comfortably easy to follow on every engine.
+    float rate = 0.88F;
     // Semitones. Neutral, because an assistant that sounds emphatic all the time
     // sounds like it is only sometimes paying attention.
     float pitch = 0.0F;

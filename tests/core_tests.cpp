@@ -1071,9 +1071,9 @@ void testPeekSpeechSegmentLooksOneClauseAhead() {
 void testWarmthBecomesPace() {
     const core::VoicePersona base;
     const float neutral = core::paceFor(base);
-    // The default rate of 0.96 is the engine speed at neutral warmth. It used to
+    // The default rate of 0.88 is the engine speed at neutral warmth. It used to
     // be offset by 0.5 (1.46), which played back too fast.
-    assert(neutral > 0.959F && neutral < 0.961F);
+    assert(neutral > 0.879F && neutral < 0.881F);
 
     core::VoicePersona warm = base;
     warm.warmth = 1.0F;

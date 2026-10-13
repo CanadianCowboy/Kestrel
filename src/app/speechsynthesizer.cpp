@@ -136,7 +136,11 @@ public:
         // mood, the same mapping would make the assistant audibly pump quieter
         // and louder as it got thoughtful. Volume is left alone and warmth is
         // left to an engine that can express it as pace.
-        m_voice.setRate(static_cast<double>(persona.rate));
+        // Qt's rate runs from -1 to 1 with 0 as the voice's natural pace, not as
+        // a multiplier. Passing the persona's multiplier straight through put a
+        // slightly slower than natural pace (0.96) at nearly the fastest setting,
+        // which is why speech was hard to follow. Convert the pace to Qt's scale.
+        m_voice.setRate(std::clamp(static_cast<double>(core::paceFor(persona)) - 1.0, -1.0, 1.0));
         m_voice.setPitch(static_cast<double>(persona.pitch) * kPitchPerSemitone);
     }
 
