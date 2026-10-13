@@ -1,5 +1,5 @@
 {
-  "client_id": "https://cdn.jsdelivr.net/gh/CanadianCowboy/Kestrel@feature/cross-os-persona/docs/mcp/kestrel-client.json",
+  "client_id": "https://raw.githubusercontent.com/CanadianCowboy/Kestrel/feature/cross-os-persona/docs/mcp/kestrel-oauth-client.json",
   "client_name": "Kestrel",
   "client_uri": "https://github.com/CanadianCowboy/Kestrel",
   "redirect_uris": ["http://127.0.0.1:8787/callback"],

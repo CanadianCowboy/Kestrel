@@ -24,7 +24,7 @@ namespace {
 // The client ID is the URL of the metadata document in docs/mcp, which Undermind
 // fetches to learn Kestrel's name and redirect before the user approves access.
 constexpr char kClientId[] =
-    "https://cdn.jsdelivr.net/gh/CanadianCowboy/Kestrel@feature/cross-os-persona/docs/mcp/kestrel-client.json";
+    "https://raw.githubusercontent.com/CanadianCowboy/Kestrel/feature/cross-os-persona/docs/mcp/kestrel-oauth-client.json";
 constexpr char kAuthorizeUrl[] = "https://api.undermind.ai/o/authorize/";
 constexpr char kTokenUrl[] = "https://api.undermind.ai/o/token/";
 constexpr char kMcpUrl[] = "https://mcp.undermind.ai/mcp";
