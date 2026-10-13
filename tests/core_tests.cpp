@@ -9,6 +9,7 @@
 #include "core/recall.h"
 #include "core/presence.h"
 #include "core/voicesession.h"
+#include "core/webtext.h"
 #include "runtime/mockbackend.h"
 #include "runtime/chatformat.h"
 
@@ -1607,6 +1608,30 @@ void testSearchResultParsing() {
     assert(core::formatSearchHits(*tavily).find("https://tavily.com") != std::string::npos);
 }
 
+// The browser tool hands the model page text, so markup, scripts and styling must
+// never leak through, and output must stay within its limit.
+void testHtmlToTextKeepsOnlyReadableText() {
+    const std::string page =
+        "<!doctype html><html><head><style>p { color: red; }</style>"
+        "<script>var secret = 1 < 2;</script></head><body>"
+        "<!-- hidden note --><h1>Title</h1><p>A &amp; B &#8212; &lt;ok&gt;</p>"
+        "<p>Spaced    out\n\n\n\ntext</p><p>a < b stays</p></body></html>";
+    const std::string text = core::htmlToText(page, 10000);
+    assert(text.find("Title") != std::string::npos);
+    assert(text.find("A & B \xe2\x80\x94 <ok>") != std::string::npos);
+    assert(text.find("Spaced out") != std::string::npos);
+    assert(text.find("a < b stays") != std::string::npos);
+    assert(text.find("secret") == std::string::npos);
+    assert(text.find("color") == std::string::npos);
+    assert(text.find("hidden") == std::string::npos);
+    assert(text.find("<") == std::string::npos || text.find("a < b") != std::string::npos);
+    assert(text.find("\n\n\n") == std::string::npos);
+
+    const std::string clipped = core::htmlToText(page, 12);
+    assert(clipped.size() <= 12 + std::string("\n[text cut short]").size());
+    assert(clipped.find("[text cut short]") != std::string::npos);
+}
+
 int main() {
     testModelToolCallParsing();
     testSearchResultParsing();
@@ -1662,6 +1687,7 @@ int main() {
     testUndeclaredToolIsRefused();
     testDeclaredToolIsRefusedUntilEnabled();
     testMissingPermissionIsNamed();
+    testHtmlToTextKeepsOnlyReadableText();
     testNothingIsGrantedByDefault();
     testReplacedToolMustBeAgreedAgain();
     testPresenceTracksMeaning();

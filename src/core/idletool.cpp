@@ -32,6 +32,7 @@ constexpr ToolPermission kAllPermissions[] = {
     ToolPermission::Network,
     ToolPermission::RunPrivileged,
     ToolPermission::CaptureScreen,
+    ToolPermission::RunCommand,
 };
 
 } // namespace
@@ -44,6 +45,7 @@ const char* toString(ToolPermission permission) noexcept {
     case ToolPermission::Network: return "network";
     case ToolPermission::RunPrivileged: return "run as administrator";
     case ToolPermission::CaptureScreen: return "capture the screen";
+    case ToolPermission::RunCommand: return "run a shell command";
     }
     return "unknown";
 }

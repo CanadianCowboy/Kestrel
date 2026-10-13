@@ -24,6 +24,7 @@ enum class ToolPermission {
     Network,           // talk to anything outside this machine
     RunPrivileged,     // run a command with administrator rights, only after the user approves each one
     CaptureScreen,     // read what is on the user's screen
+    RunCommand,        // run a command in the ordinary shell, only after the user approves each one
 };
 
 [[nodiscard]] const char* toString(ToolPermission permission) noexcept;

@@ -37,6 +37,7 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#include "app/shellcommand.h"
 #include "app/undermindclient.h"
 #include "storage/profile.h"
 #include "storage/secretstore.h"
@@ -2994,6 +2995,30 @@ void testPkceAndJsonRpcFraming() {
           "a plain JSON reply is found by its id");
 }
 
+// Runs a real command through the shell runner and waits for its one reply.
+kestrel::core::McpToolResult runShellAndWait(const QString& command) {
+    kestrel::core::McpToolResult result{true, "no reply within the test's deadline"};
+    QEventLoop loop;
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    kestrel::app::runShellCommand(command, [&](kestrel::core::McpToolResult reply) {
+        result = std::move(reply);
+        loop.quit();
+    });
+    loop.exec();
+    return result;
+}
+
+void testShellCommandReportsOutputAndExitCode() {
+    const kestrel::core::McpToolResult ok = runShellAndWait(QStringLiteral("echo kestrel-shell-ok"));
+    check(!ok.isError && ok.text.find("kestrel-shell-ok") != std::string::npos,
+          "a shell command returns its output");
+    check(ok.text.find("exit code 0") != std::string::npos, "a successful command reports exit code 0");
+
+    const kestrel::core::McpToolResult failed = runShellAndWait(QStringLiteral("echo nope; exit 3"));
+    check(failed.isError && failed.text.find("exit code 3") != std::string::npos,
+          "a failing command is an error with its exit code");
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash still shows how far the run got. A lost buffer
     // turns a five-second diagnosis into a guess about which test died.
@@ -3058,6 +3083,7 @@ int main(int argc, char** argv) {
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testChatToolLoopRunsCallAndAnswers();
     testPkceAndJsonRpcFraming();
+    testShellCommandReportsOutputAndExitCode();
     testPreviewInputRequiresExplicitOptIn();
 #if defined(__linux__)
     testLinuxRecognizerReachesListenSession();

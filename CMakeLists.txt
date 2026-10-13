@@ -222,6 +222,8 @@ else()
 endif()
 
 add_library(kestrel_core
+    src/core/webtext.cpp
+    src/core/webtext.h
     src/core/conversation.cpp
     src/core/conversation.h
     src/core/idlepersona.cpp
@@ -758,6 +760,8 @@ if(KESTREL_BUILD_UI)
         # required for it; the app cannot link without it.
         find_package(Qt6Network REQUIRED)
         target_sources(kestrel PRIVATE src/app/undermindclient.cpp src/app/undermindclient.h)
+        target_sources(kestrel PRIVATE src/app/shellcommand.cpp src/app/shellcommand.h
+            src/app/browsertools.cpp src/app/browsertools.h)
         if(TARGET Qt6::Network)
             target_sources(kestrel PRIVATE
                 src/app/mcpserver.cpp src/app/mcpserver.h
@@ -810,6 +814,8 @@ if(KESTREL_BUILD_UI)
                 src/app/appcontroller.h
                 src/app/undermindclient.cpp
                 src/app/undermindclient.h
+                src/app/shellcommand.cpp
+                src/app/shellcommand.h
                 src/app/privilegedcommand.cpp
                 src/app/privilegedcommand.h
                 src/app/echocancelsession.cpp

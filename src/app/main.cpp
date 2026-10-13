@@ -21,8 +21,10 @@
 #include <utility>
 
 #include "app/appcontroller.h"
+#include "app/browsertools.h"
 #include "app/privilegedapproval.h"
 #include "app/privilegedcommand.h"
+#include "app/shellcommand.h"
 #include "core/mcpdispatch.h"
 #include "core/pathtext.h"
 #include "storage/json.h"
@@ -406,6 +408,9 @@ int main(int argc, char* argv[]) {
 
     // Pending administrator-command approvals, shown by the desktop dialog.
     kestrel::app::PrivilegedApprovalBroker privilegedBroker;
+    // Shell commands ask the user the same way, through a broker of their own so a
+    // pending admin prompt and a pending command never answer each other.
+    kestrel::app::PrivilegedApprovalBroker shellBroker;
 
 #if KESTREL_HAS_MCP_SERVER
     // Background MCP endpoint for other local agents. Opt-in: nothing listens
@@ -574,6 +579,71 @@ int main(int argc, char* argv[]) {
             kestrel::app::tavilyResearch(networkAccess, QString::fromStdString(std::string(*input->asString())),
                                          std::move(done));
         }});
+    // The shell and the browser. A command runs only after the user approves that
+    // one command; browsing needs the Network permission like the search tools.
+    mcpDispatcher.addTool({
+        "run_shell_command",
+        "Run one command line in the user's shell (home folder) and return its exit code and output. Each command needs the user's approval first. Arguments: command (string), reason (optional string).",
+        {kestrel::core::ToolPermission::RunCommand},
+        nullptr,
+        [&shellBroker](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* command = args.find("command");
+            if (command == nullptr || !command->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"command\"."});
+                return;
+            }
+            const QString commandLine = QString::fromUtf8(std::string(*command->asString()).c_str());
+            if (commandLine.trimmed().isEmpty()) {
+                done(kestrel::core::McpToolResult{true, "The command is empty."});
+                return;
+            }
+            kestrel::app::PrivilegedRequest request;
+            const kestrel::app::ShellInvocation invocation = kestrel::app::shellInvocation(commandLine);
+            request.program = invocation.program;
+            request.arguments = invocation.arguments;
+            if (const kestrel::storage::json::Value* reason = args.find("reason");
+                reason != nullptr && reason->isString()) {
+                request.reason = QString::fromUtf8(std::string(*reason->asString()).c_str());
+            }
+            shellBroker.ask(request, [commandLine, done](bool approved) {
+                if (!approved) {
+                    done(kestrel::core::McpToolResult{true, "The user did not approve this command."});
+                    return;
+                }
+                kestrel::app::runShellCommand(commandLine, done);
+            });
+        }});
+    mcpDispatcher.addTool({
+        "browser_open",
+        "Open a web address in the user's Firefox (or default browser) so they can see it. Arguments: url (string).",
+        {kestrel::core::ToolPermission::Network},
+        [](const kestrel::storage::json::Value& args) {
+            const kestrel::storage::json::Value* url = args.find("url");
+            if (url == nullptr || !url->isString()) {
+                return kestrel::core::McpToolResult{true, "Pass a string \"url\"."};
+            }
+            QString error;
+            const QString address = QString::fromUtf8(std::string(*url->asString()).c_str());
+            if (!kestrel::app::openInBrowser(address, error)) {
+                return kestrel::core::McpToolResult{true, error.toStdString()};
+            }
+            return kestrel::core::McpToolResult{false, "Opened " + address.toStdString() + " in the browser."};
+        },
+        nullptr});
+    mcpDispatcher.addTool({
+        "browser_read",
+        "Fetch a web page and return its readable text (no scripts run, so JavaScript-only pages come back empty). Arguments: url (string).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* url = args.find("url");
+            if (url == nullptr || !url->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"url\"."});
+                return;
+            }
+            kestrel::app::readWebPage(networkAccess, QString::fromUtf8(std::string(*url->asString()).c_str()),
+                                      std::move(done));
+        }});
     // KESTREL_MCP_ALLOW_TOOLS is "1" to enable every chat tool, or a comma-separated
     // list of tool names to enable only those. Each enabled tool still needs its
     // permission, and the permissions below are granted only for the tools chosen.
@@ -582,10 +652,13 @@ int main(int argc, char* argv[]) {
         const QStringList requested = allowTools == QStringLiteral("1")
             ? QStringList{QStringLiteral("web_search"), QStringLiteral("screen_capture"),
                           QStringLiteral("tavily_extract"), QStringLiteral("tavily_map"),
-                          QStringLiteral("tavily_crawl"), QStringLiteral("tavily_research")}
+                          QStringLiteral("tavily_crawl"), QStringLiteral("tavily_research"),
+                          QStringLiteral("browser_open"), QStringLiteral("browser_read"),
+                          QStringLiteral("run_shell_command")}
             : allowTools.split(QLatin1Char(','), Qt::SkipEmptyParts);
         bool needsNetwork = false;
         bool needsScreen = false;
+        bool needsCommand = false;
         for (const QString& entry : requested) {
             const std::string tool = entry.trimmed().toStdString();
             if (tool.empty()) {
@@ -593,13 +666,18 @@ int main(int argc, char* argv[]) {
             }
             mcpDispatcher.permissions().setEnabled(tool, true);
             needsScreen = needsScreen || tool == "screen_capture";
-            needsNetwork = needsNetwork || tool.rfind("tavily_", 0) == 0 || tool == "web_search";
+            needsNetwork = needsNetwork || tool.rfind("tavily_", 0) == 0 || tool == "web_search"
+                || tool == "browser_open" || tool == "browser_read";
+            needsCommand = needsCommand || tool == "run_shell_command";
         }
         if (needsNetwork) {
             mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::Network, true);
         }
         if (needsScreen) {
             mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::CaptureScreen, true);
+        }
+        if (needsCommand) {
+            mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::RunCommand, true);
         }
     }
     if (qEnvironmentVariable("KESTREL_MCP_ALLOW_PRIVILEGED") == QStringLiteral("1")) {
@@ -658,6 +736,7 @@ int main(int argc, char* argv[]) {
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
     engine.rootContext()->setContextProperty(QStringLiteral("privilegedBroker"), &privilegedBroker);
+    engine.rootContext()->setContextProperty(QStringLiteral("shellBroker"), &shellBroker);
     // QQmlApplicationEngine has no errors() accessor; it reports them through
     // this signal, so the connection has to exist before the scene is loaded.
     // Without it a failure prints one bare line and the reason -- an
