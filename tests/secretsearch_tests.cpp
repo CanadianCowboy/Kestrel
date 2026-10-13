@@ -171,6 +171,16 @@ void testALineThatMerelyContainsThePrefixIsNotAValue() {
 
 } // namespace
 
+void testAttributeEchoOnStderrIsNotAFailure() {
+    check(!kestrel::storage::stderrReportsFailure(""), "silent stderr reports no failure");
+    check(!kestrel::storage::stderrReportsFailure("attribute.account = probe-1\nattribute.service = com.kestrel.probe\n"),
+          "the attribute echo that secret-tool prints on stderr is not a failure");
+    check(kestrel::storage::stderrReportsFailure("Unlock the keyring to continue\n"),
+          "any other stderr text is still a failure");
+    check(kestrel::storage::stderrReportsFailure("attribute.account = x\nGDBus.Error: no session bus\n"),
+          "an echo next to a real error is still a failure");
+}
+
 int main() {
     std::cout << "secret search tests\n";
     testAMissIsAbsentAndSilent();
@@ -183,6 +193,7 @@ int main() {
     testTrailingNewlinesAreNotContent();
     testAnEmptyStoredValueIsStillAValue();
     testALineThatMerelyContainsThePrefixIsNotAValue();
+    testAttributeEchoOnStderrIsNotAFailure();
 
     if (g_failures == 0) {
         std::cout << "secret search tests passed\n";

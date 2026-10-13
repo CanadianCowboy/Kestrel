@@ -75,4 +75,25 @@ SecretSearchReport classifySecretSearch(int status, std::string_view report) {
     return result;
 }
 
+bool stderrReportsFailure(std::string_view diagnostics) {
+    std::size_t start = 0;
+    while (start < diagnostics.size()) {
+        std::size_t end = diagnostics.find('\n', start);
+        if (end == std::string_view::npos) {
+            end = diagnostics.size();
+        }
+        const std::string_view line = trimmed(diagnostics.substr(start, end - start));
+        start = end + 1;
+        if (line.empty()) {
+            continue;
+        }
+        // The attribute echo: "attribute.account = probe-1" and its neighbours.
+        if (line.substr(0, 10) == "attribute." && line.find(" = ") != std::string_view::npos) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 } // namespace kestrel::storage

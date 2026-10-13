@@ -61,4 +61,11 @@ struct SecretSearchReport {
 // be tested on the CI machines that have neither.
 [[nodiscard]] SecretSearchReport classifySecretSearch(int status, std::string_view report);
 
+// Whether a run's standard error says something went wrong. `search` echoes the
+// attributes it was asked about to standard error ("attribute.account = ..."),
+// on the secret-tool builds that do this. That echo is information, and treating
+// it as a failure made every read on those builds fail. Any other line still
+// counts as a failure, and the secret is never read from standard error.
+[[nodiscard]] bool stderrReportsFailure(std::string_view diagnostics);
+
 } // namespace kestrel::storage

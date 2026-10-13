@@ -20,14 +20,6 @@ SecretToolResult run(const std::vector<std::string>& arguments, std::string_view
     return runSecretTool(arguments, input, kKeyringTimeout);
 }
 
-std::string trimmed(const std::string& text) {
-    std::string result = text;
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
-
 std::string toHex(const std::vector<std::uint8_t>& bytes) {
     static constexpr char kDigits[] = "0123456789abcdef";
     std::string text;
@@ -93,7 +85,7 @@ SecretSearchReport search(std::string_view account, std::string_view service) {
     }
     // Stderr must never be parsed as a secret. Even exit 0 with warnings is not
     // evidence of an absent profile; refuse instead of risking an overwrite.
-    if (result.status != 0 || !trimmed(result.diagnostics).empty()) {
+    if (result.status != 0 || stderrReportsFailure(result.diagnostics)) {
         return {SecretSearchOutcome::failed, {},
                 "secret-tool could not read the profile. Unlock the keyring and check the desktop D-Bus session."};
     }
@@ -117,7 +109,7 @@ bool sealViaTool(std::string_view account, std::string_view service,
     // the machine can read it.
     error.clear();
     const SecretToolResult result = run(commandFor("store", account, service), toHex(blob) + "\n");
-    if (!result.error.empty() || result.status != 0 || !trimmed(result.diagnostics).empty()) {
+    if (!result.error.empty() || result.status != 0 || stderrReportsFailure(result.diagnostics)) {
         error = result.error.empty()
             ? "secret-tool would not store the profile. Unlock the keyring and check the desktop D-Bus session."
             : result.error;
@@ -164,7 +156,7 @@ std::optional<std::vector<std::uint8_t>> readViaTool(std::string_view account,
 bool forgetViaTool(std::string_view account, std::string_view service, std::string& error) {
     error.clear();
     const SecretToolResult result = run(commandFor("clear", account, service));
-    if (!result.error.empty() || result.status != 0 || !trimmed(result.diagnostics).empty()) {
+    if (!result.error.empty() || result.status != 0 || stderrReportsFailure(result.diagnostics)) {
         error = result.error.empty()
             ? "The keyring would not forget the profile. Unlock the keyring and retry."
             : result.error;
