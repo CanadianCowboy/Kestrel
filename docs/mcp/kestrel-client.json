@@ -1,0 +1,9 @@
+{
+  "client_id": "https://raw.githubusercontent.com/CanadianCowboy/Kestrel/feature/cross-os-persona/docs/mcp/kestrel-client.json",
+  "client_name": "Kestrel",
+  "client_uri": "https://github.com/CanadianCowboy/Kestrel",
+  "redirect_uris": ["http://127.0.0.1:8787/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
