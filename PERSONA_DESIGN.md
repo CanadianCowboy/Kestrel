@@ -75,14 +75,14 @@ anywhere. That statement is updated in the same change as the store.
 
 ### Look
 
-Approved: **detailed figure**, in a **human-to-robot transition**, **mostly
-human**, with a **warm amber** palette.
+Approved: a **Twitch / VR-style avatar**: a stylised 3D character with a large,
+expressive face and a readable silhouette. It replaces the earlier detailed,
+human-to-robot figure.
 
-- The figure reads as a person first. The machine parts are subtle: seams, a
-  glowing eye or hand joint, amber light in the details.
+- The character is original. It is not a photo or a likeness of a real person.
 - Warm amber is the main colour for light and accents.
-- The transition level is part of the character, so it changes with the
-  persona's state.
+- The model is rigged so its face and mouth can move: blend shapes for mood and
+  visemes for speech.
 
 ### Motion
 
@@ -91,9 +91,7 @@ Approved: **mood, idle, and speaking**.
 - **Mood.** Expression follows `PersonaMood`.
 - **Idle.** A slow idle motion while it waits, so it feels alive.
 - **Speaking.** A pulse or motion that tracks the voice while it speaks.
-- **Transition shift.** The amount of machine showing moves with both mood and
-  activity. More machine when focused or working; more human when warm, listening,
-  or speaking. The shift is eased, never snapped.
+- **Expression.** Face and pose follow `PersonaMood` and are eased, never snapped.
 
 ### State
 
@@ -120,12 +118,13 @@ a different voice is out of scope for now.
 1. Recall store: opt-in, local, facts and summaries, with memory panel controls.
    Core tests for the portable part, app tests for the adapter.
 2. Greeting built from recall and time of day, in the UI layer.
-3. Avatar: figure, motion, transition shift, placement setting, static fallback.
+3. Avatar: rigged Twitch / VR-style model, mood and speaking motion, placement
+   setting, static fallback.
 
 ## Open questions
 
-- **Figure detail.** The human side of the figure needs a reference: a sketch,
-  an image, or a description of the face and body.
+- **Model.** The avatar needs a rigged model: a 3D format such as VRM, or a 2D rig.
+  Choose the format, and decide whether to make the model or source one.
 - **Default placement.** Which option starts selected.
 - **Verification.** How the character reads needs a real model and eyes on the
   screen. Unit tests check wording and state, not the feel.
