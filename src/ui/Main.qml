@@ -48,6 +48,9 @@ ApplicationWindow {
         // screenshot check could not see it because it looks for black bands
         // and this is text on text.
         implicitHeight: 18
+        // Layouts derive their minimum from their children, not an overridden
+        // implicitHeight. The hit-target wrapper has no minimum of its own.
+        Layout.minimumHeight: 18
         activeFocusOnTab: true
         Keys.onSpacePressed: function(event) {
             toggle.toggled()
@@ -123,7 +126,7 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
     Shortcut { sequence: "Ctrl+K"; onActivated: composer.forceActiveFocus() }
     Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
-    Shortcut { sequence: "Escape"; onActivated: appController.stopGeneration() }
+    Shortcut { sequence: "Escape"; onActivated: appController.stopSpeech() }
 
     Rectangle {
         anchors.fill: parent
@@ -239,10 +242,6 @@ ApplicationWindow {
                                 Text { text: appController.modelName; color: window.ink; font.pixelSize: 12 }
                             }
                             Text { text: appController.backendName; color: window.muted; font.pixelSize: 11 }
-                            // Loading a model from disk, so the app is not stuck
-                            // previewing canned text. Hidden entirely in a build
-                            // that cannot load a real model, rather than offered
-                            // and then refused.
                             Row {
                                 spacing: 8
                                 visible: appController.canLoadModel
@@ -250,11 +249,6 @@ ApplicationWindow {
                                     id: loadModelButton
                                     text: appController.modelPath.length > 0 ? "Change model" : "Load model"
                                     onClicked: modelDialog.open()
-                                }
-                                Button {
-                                    text: "Preview"
-                                    visible: appController.modelPath.length > 0
-                                    onClicked: appController.usePreviewBackend()
                                 }
                             }
                             Text {
@@ -501,7 +495,83 @@ ApplicationWindow {
                                 font.pixelSize: 11
                                 font.italic: true
                             }
-                        }                            Item {
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: appController.speaking || appController.audioPaused || appController.summarizingSpeech
+                                     || appController.pendingInterruption.length > 0
+                            spacing: 4
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: appController.audioPaused ? "Speech paused · text continues"
+                                          : appController.summarizingSpeech ? "Preparing a short spoken summary…"
+                                          : appController.speakingSummary ? "Speaking summary · full answer remains in chat"
+                                          : appController.canResume ? "Answer held"
+                                          : "Speaking · progress through generated text"
+                                    color: window.muted
+                                    font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                }
+                                Button {
+                                    objectName: "speechPauseButton"
+                                    text: appController.audioPaused ? "Resume" : "Pause"
+                                    visible: appController.pendingInterruption.length === 0
+                                    enabled: appController.audioPaused ? appController.canResumeSpeech : appController.speaking
+                                    onClicked: appController.audioPaused ? appController.resumeSpeech() : appController.pauseSpeech()
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "Pause at the next clause; text generation continues"
+                                }
+                                Button {
+                                    objectName: "speechSkipButton"
+                                    text: "Skip"
+                                    enabled: appController.canSkipSpeech
+                                    onClicked: appController.skipSpeech()
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "Skip the current spoken clause"
+                                }
+                                Button {
+                                    objectName: "speechStopButton"
+                                    text: "Stop audio"
+                                    onClicked: appController.stopSpeech()
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "Stop speech; finish the written answer silently (Esc)"
+                                }
+                            }
+                            ProgressBar {
+                                objectName: "speechProgressBar"
+                                Layout.fillWidth: true
+                                from: 0
+                                to: 1
+                                value: appController.speechProgress
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: appController.pendingInterruption.length > 0
+                                text: "Heard: " + appController.pendingInterruption
+                                color: window.ink
+                                font.pixelSize: 12
+                                wrapMode: Text.Wrap
+                            }
+                            RowLayout {
+                                visible: appController.pendingInterruption.length > 0
+                                Button {
+                                    objectName: "sendInterruptionButton"
+                                    text: "Send new request"
+                                    onClicked: appController.sendPendingInterruption()
+                                }
+                                Button {
+                                    objectName: "resumeHeldAnswerButton"
+                                    text: "Resume held answer"
+                                    enabled: (appController.canResume || appController.canResumeSpeech) && !appController.speaking
+                                    onClicked: appController.resumeInterruptedAnswer()
+                                }
+                            }
+                        }
+
+                        Item {
                                 id: composerDock
                                 Layout.fillWidth: true
                                 // The dictation line sits above the shell and needs
@@ -640,6 +710,8 @@ ApplicationWindow {
                                     // absent.
                                     Button {
                                         id: micButton
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: appController.echoCancellationDetail
                                         implicitWidth: 44
                                         implicitHeight: 44
                                         text: appController.listening ? "■" : "🎤"
@@ -664,11 +736,12 @@ ApplicationWindow {
                                     }
                                     Button {
                                         id: pauseResumeButton
+                                        objectName: "conversationPauseButton"
                                         // Only offered when the voice state machine
                                         // says the transition is actually legal, so
                                         // the button can never be a no-op that
                                         // silently does nothing.
-                                        visible: appController.canPause || appController.canResume
+                                        visible: !appController.ttsAvailable && (appController.canPause || appController.canResume)
                                         implicitWidth: 44
                                         implicitHeight: 44
                                         text: appController.canResume ? "▶" : "❚❚"
@@ -690,9 +763,12 @@ ApplicationWindow {
                                         }
                                     }
                                     Button {
+                                        objectName: "generationStopButton"
                                         implicitWidth: 44
                                         implicitHeight: 44
                                         text: appController.generating ? "■" : "↑"
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: appController.generating ? "Cancel generation and speech" : "Send message"
                                         onClicked: {
                                             if (appController.generating) appController.stopGeneration()
                                             else { appController.sendMessage(composer.text); composer.text = "" }
@@ -731,9 +807,16 @@ ApplicationWindow {
                 NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
             }
 
-            ColumnLayout {
+            ScrollView {
+                id: diagnosticsScroll
                 anchors.fill: parent
                 anchors.margins: 18
+                clip: true
+                contentWidth: availableWidth
+
+            ColumnLayout {
+                width: diagnosticsScroll.availableWidth
+                height: implicitHeight
                 spacing: 14
 
                 RowLayout {
@@ -751,6 +834,16 @@ ApplicationWindow {
                         contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                         background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                     }
+                }
+
+                Button {
+                    objectName: "dictationSettingsButton"
+                    Layout.fillWidth: true
+                    visible: appController.linuxDictationSettings
+                    text: "Dictation settings…"
+                    onClicked: dictationSettingsDialog.open()
+                    contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                 }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: window.line; opacity: 0.7 }
@@ -841,6 +934,29 @@ ApplicationWindow {
                                 elide: Text.ElideRight
                                 Layout.maximumWidth: 170
                             }
+                        }
+
+                        IdleToggle {
+                            objectName: "automaticSpeechSummaryToggle"
+                            label: "Summarize long spoken answers"
+                            hint: "Stream the opening, then use the local model to summarize only the unspoken remainder. Written answers stay unchanged; AI summaries may omit or misstate detail."
+                            checked: appController.automaticSpeechSummary
+                            onToggled: appController.automaticSpeechSummary = !appController.automaticSpeechSummary
+                        }
+                        IdleToggle {
+                            objectName: "echoCancellationToggle"
+                            visible: appController.linuxDictationSettings
+                            label: "Echo-canceled listening"
+                            hint: "Local WebRTC processing of the default microphone with the default output monitor as reference; capture starts only on mic request."
+                            checked: appController.echoCancellationEnabled
+                            onToggled: appController.echoCancellationEnabled = !appController.echoCancellationEnabled
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: appController.echoCancellationDetail
+                            color: appController.echoCancellationActive ? window.accent : window.muted
+                            font.pixelSize: 11
+                            wrapMode: Text.Wrap
                         }
 
                         // Voice choice, when the backend has a choice to offer.
@@ -1062,19 +1178,27 @@ ApplicationWindow {
                     }
                 }
 
-                Text { text: "DIAGNOSTICS"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                Text { text: "RUNTIME CAPABILITIES"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                Text {
+                    Layout.fillWidth: true
+                    text: "Local inference runtime and device availability."
+                    color: window.muted
+                    font.pixelSize: 10
+                    wrapMode: Text.Wrap
+                }
 
                 ListView {
                     id: diagnosticList
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
+                    Layout.preferredHeight: contentHeight
+                    interactive: false
                     clip: true
                     spacing: 10
                     model: appController.runtimeDiagnostics
                     boundsBehavior: Flickable.StopAtBounds
                     delegate: ColumnLayout {
                         required property var modelData
-                        Layout.fillWidth: true
+                        width: diagnosticList.width
                         spacing: 2
                         RowLayout {
                             Layout.fillWidth: true
@@ -1106,6 +1230,113 @@ ApplicationWindow {
                 }
             }
         }
+        }
+    }
+
+    Dialog {
+        id: dictationSettingsDialog
+        objectName: "dictationSettingsDialog"
+        title: "Linux dictation"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(560, window.width - 48)
+        standardButtons: Dialog.Close
+        onOpened: {
+            dictationModel.text = appController.dictationModelPath
+            appController.refreshDictationMicrophones()
+            dictationDevice.editText = appController.dictationAudioDevice
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                text: "Offline whisper.cpp + ALSA. Select existing local weights; nothing is downloaded. Audio stays in memory."
+                color: window.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+            Label { text: "Whisper ggml model (.bin)"; color: window.ink }
+            RowLayout {
+                Layout.fillWidth: true
+                TextField {
+                    id: dictationModel
+                    objectName: "dictationModelField"
+                    Layout.fillWidth: true
+                    placeholderText: "Choose a local model; empty disables dictation"
+                    Accessible.name: "Whisper model path"
+                    selectByMouse: true
+                }
+                Button {
+                    objectName: "dictationBrowseButton"
+                    text: "Browse…"
+                    onClicked: dictationModelDialog.open()
+                }
+            }
+            Label { text: "Microphone / ALSA capture device"; color: window.ink }
+            RowLayout {
+                Layout.fillWidth: true
+                ComboBox {
+                    id: dictationDevice
+                    objectName: "dictationDeviceField"
+                    Layout.fillWidth: true
+                    editable: true
+                    model: appController.dictationMicrophones
+                    Accessible.name: "ALSA microphone device"
+                }
+                Button {
+                    text: "Refresh"
+                    onClicked: {
+                        const draft = dictationDevice.editText
+                        appController.refreshDictationMicrophones()
+                        dictationDevice.editText = draft
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Use default for the desktop audio route, or enter a custom ALSA name such as plughw:1,0. Refresh lists capture hints without opening the microphone."
+                color: window.muted
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+            Button {
+                objectName: "dictationApplyButton"
+                text: "Apply and save"
+                enabled: !appController.listening
+                onClicked: {
+                    if (appController.applyDictationSettings(dictationModel.text, dictationDevice.editText)) {
+                        dictationModel.text = appController.dictationModelPath
+                        dictationDevice.editText = appController.dictationAudioDevice
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: appController.listening
+                      ? "Stop dictation before changing its model or microphone."
+                      : "Saved choices take effect on the next recording and persist after restart. Model loading is checked when you start dictation."
+                color: window.muted
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+            Text {
+                objectName: "dictationSettingsStatus"
+                Layout.fillWidth: true
+                text: appController.dictationSettingsError.length > 0
+                      ? appController.dictationSettingsError : appController.sttDetail
+                color: appController.dictationSettingsError.length > 0 ? "#dc9292" : window.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+        }
+    }
+
+    FileDialog {
+        id: dictationModelDialog
+        title: "Choose a local Whisper ggml model"
+        nameFilters: ["Whisper ggml models (*.bin)", "All files (*)"]
+        onAccepted: dictationModel.text = selectedFile.toString()
     }
 
     // Native picker for a GGUF on disk. The URL is handed straight to the

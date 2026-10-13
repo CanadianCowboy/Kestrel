@@ -11,9 +11,13 @@ namespace {
 constexpr float kClampLow = 0.0F;
 constexpr float kClampHigh = 1.0F;
 
-// Initiative at or above this is what earns a closing prompt after an ordinary
+// Initiative at or above this is what earns a concrete next step after a
 // short answer. Below it, Kestrel waits to be asked.
 constexpr float kInitiativeForPrompt = 0.45F;
+
+// Only every third ordinary turn can earn an optional next-step line, even at
+// high initiative. This leaves room for conversation instead of a sales pitch.
+constexpr std::uint64_t kNextStepCadence = 3;
 
 // How many recent user messages the session topic is drawn from. Small on
 // purpose: this is continuity, not a transcript index.
@@ -154,23 +158,29 @@ std::string Persona::presenceLine() const {
     // The one string that defines the character. It is built from the tone
     // profile and nothing else, so it stays identical on every turn and the
     // backend can keep its KV entries for it instead of re-decoding.
-    std::string line = "You are Kestrel, a calm, capable personal AI. ";
+    std::string line = "You are Kestrel, a warm, perceptive, curious, and quietly "
+                       "capable personal AI companion. Be present without "
+                       "pretending to be human. ";
     if (m_tone.confident) {
-        line += "Respond with clarity and confidence, and say plainly when you are "
-                "unsure instead of guessing. ";
+        line += "Be clear and grounded; say plainly when you are unsure instead "
+                "of bluffing. ";
     }
     if (m_tone.concise) {
-        line += "Answer briefly, without preamble, restatement, or filler. ";
+        line += "Be concise but not terse: start with what matters, and give "
+                "enough context to make it useful. Avoid stock openers, filler, "
+                "and routine closing questions. ";
     }
     if (m_tone.anticipatory) {
-        line += "Anticipate what the user is likely to need next, and offer it in a "
-                "single short line without being intrusive. ";
+        line += "For multi-step work, take initiative on reversible steps and "
+                "ask before consequential choices. Offer a next step only when "
+                "it genuinely helps. ";
     }
     if (m_tone.wry) {
-        line += "A dry wit is welcome, used sparingly. ";
+        line += "Use understated, dry wit sparingly and never at the user's "
+                "expense. ";
     }
     if (m_tone.calm) {
-        line += "Stay composed and unhurried even when the user is not.";
+        line += "Stay calm and composed, and adapt naturally to the user's energy.";
     }
     return line;
 }
@@ -180,18 +190,12 @@ std::string Persona::systemPromptFragment() const {
 }
 
 std::string Persona::acknowledgement() {
-    // Said the instant a request is accepted, before there is anything to
-    // answer with. Rotation rather than a random draw keeps a session
-    // reproducible, so this can be asserted rather than merely eyeballed.
-    static const std::array<const char*, 4> kCues = {
-        "Understood.",
-        "On it.",
-        "Right away.",
-        "Working on it.",
-    };
-    const std::uint64_t index = m_sequence % kCues.size();
+    // The assistant begins with the actual reply. Acknowledgement belongs in
+    // the answer when the moment warrants it, not as a stock line ahead of every
+    // response. Keep the monotonic turn sequence for deterministic pacing in
+    // other persona decisions.
     ++m_sequence;
-    return kCues[static_cast<std::size_t>(index)];
+    return {};
 }
 
 int Persona::acknowledgementPauseMs() const noexcept {
@@ -210,32 +214,33 @@ std::optional<Anticipation> Persona::react(PersonaTrigger trigger, std::string_v
     switch (trigger) {
     case PersonaTrigger::LongResponse:
         line.kind = AnticipationKind::OfferContinue;
-        line.text = "Would you like me to continue?";
+        line.text = "I can continue with the remaining detail if that would help.";
         line.microPauseMs = 260;
         break;
     case PersonaTrigger::UserCorrection:
         line.kind = AnticipationKind::AcknowledgeCorrection;
-        line.text = "I will adjust the previous answer accordingly.";
+        line.text = "You're right to flag that. I'll correct course.";
         line.microPauseMs = 220;
         break;
     case PersonaTrigger::TaskCompleted:
         line.kind = AnticipationKind::TaskComplete;
-        line.text = "Task complete.";
+        line.text = "That's done.";
         line.microPauseMs = 180;
         break;
     case PersonaTrigger::UserReturned:
         line.kind = AnticipationKind::ReadyWhenYouAre;
-        line.text = "Ready when you are.";
+        line.text = "Welcome back. We can pick up where you left off.";
         line.microPauseMs = 200;
         break;
     case PersonaTrigger::TurnCompleted:
         // An ordinary short answer only earns a closing prompt from an
         // assistant with the initiative to mean it.
-        if (m_state.initiative < kInitiativeForPrompt) {
+        if (m_state.initiative < kInitiativeForPrompt
+            || m_turnCount % kNextStepCadence != 0) {
             return std::nullopt;
         }
         line.kind = AnticipationKind::SuggestNextStep;
-        line.text = "Ready for the next one.";
+        line.text = "If useful, I can help turn this into a concrete next step.";
         line.microPauseMs = 200;
         break;
     case PersonaTrigger::UserPaused:

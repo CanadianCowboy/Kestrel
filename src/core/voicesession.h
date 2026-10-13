@@ -145,6 +145,11 @@ struct SpeechSegment {
     const VoicePersona& persona = defaultVoicePersona(),
     int openingPauseMs = 0);
 
+enum class SpokenIntent { Acknowledgement, Pause, Resume, StopAudio, Cancel, Ambiguous };
+// Whole-phrase English rules only: never infer controls from a substring.
+[[nodiscard]] SpokenIntent classifySpokenIntent(std::string_view text);
+[[nodiscard]] bool isListeningAcknowledgement(std::string_view text);
+
 // Returns the start offset of the sentence containing `offset`, so playback can
 // resume from a clean semantic boundary instead of mid-sentence.
 [[nodiscard]] std::size_t sentenceStartBefore(std::string_view text, std::size_t offset) noexcept;
@@ -261,7 +266,12 @@ public:
     // real value when something was said between the clauses -- an
     // acknowledgement cue, most often.
     //
-    // Returns nullopt when the response is fully spoken or does not exist.
+    // Markdown code fences, inline code, URLs/paths, citations and pipe-table
+    // rows are omitted; ordinary prose and list items keep their wording.
+    // Offsets still refer to the raw transcript. An empty-text segment consumes
+    // omitted content only. Incomplete words/constructs and unterminated clauses
+    // wait for more tokens; generation completion flushes the remaining prose.
+    // Returns nullopt when no complete clause is available, fully consumed, or unknown.
     [[nodiscard]] std::optional<SpeechSegment> nextSpeechSegment(ResponseId id,
                                                                   int openingPauseMs = 0) const;
     // The segment that would come after `nextSpeechSegment` returns right now,

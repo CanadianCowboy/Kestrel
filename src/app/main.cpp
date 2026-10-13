@@ -15,6 +15,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <string_view>
 #include <utility>
 
 #include "app/appcontroller.h"
@@ -307,6 +308,19 @@ int printRuntime(const kestrel::app::AppController& controller) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__)
+    // Runtime diagnostics must work over SSH or on a display-less build host.
+    // Normal launches still require a display, and an explicit Qt platform
+    // selection always wins. Do this before Qt tries to connect to Wayland/X11.
+    const bool reportRequested = std::any_of(argv + 1, argv + argc, [](const char* argument) {
+        return std::string_view(argument) == "--print-runtime";
+    });
+    if (reportRequested && qEnvironmentVariableIsEmpty("DISPLAY")
+        && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")
+        && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
+#endif
     QGuiApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("Kestrel"));
     app.setOrganizationName(QStringLiteral("Kestrel"));

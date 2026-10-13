@@ -29,6 +29,7 @@ namespace kestrel::app {
 
 class GenerationWorker;
 class SpeechSynthesizer;
+class EchoCancelSession;
 class ListenSession;
 
 // How long a reply may wait for a voice to announce itself before the app stops
@@ -141,6 +142,15 @@ class AppController final : public QObject {
     Q_PROPERTY(bool ttsAvailable READ ttsAvailable NOTIFY ttsChanged)
     Q_PROPERTY(QString ttsVoice READ ttsVoice NOTIFY ttsChanged)
     Q_PROPERTY(bool speaking READ speaking NOTIFY ttsChanged)
+    Q_PROPERTY(bool audioPaused READ audioPaused NOTIFY ttsChanged)
+    Q_PROPERTY(bool canResumeSpeech READ canResumeSpeech NOTIFY ttsChanged)
+    Q_PROPERTY(bool canSkipSpeech READ canSkipSpeech NOTIFY ttsChanged)
+    Q_PROPERTY(double speechProgress READ speechProgress NOTIFY ttsChanged)
+    Q_PROPERTY(bool automaticSpeechSummary READ automaticSpeechSummary WRITE setAutomaticSpeechSummary NOTIFY ttsChanged)
+    Q_PROPERTY(bool summarizingSpeech READ summarizingSpeech NOTIFY ttsChanged)
+    Q_PROPERTY(bool speakingSummary READ speakingSummary NOTIFY ttsChanged)
+    Q_PROPERTY(QString spokenSummary READ spokenSummary NOTIFY ttsChanged)
+    Q_PROPERTY(QString pendingInterruption READ pendingInterruption NOTIFY listeningChanged)
     // Why audio is unavailable, or what went wrong with it. Empty when it is
     // simply working, so the interface can say which of the two it is.
     Q_PROPERTY(QString ttsError READ ttsError NOTIFY ttsChanged)
@@ -149,6 +159,9 @@ class AppController final : public QObject {
     // typed one takes, so a spoken request interrupts a reply exactly as
     // typing one would.
     Q_PROPERTY(bool listening READ listening NOTIFY listeningChanged)
+    Q_PROPERTY(bool echoCancellationEnabled READ echoCancellationEnabled WRITE setEchoCancellationEnabled NOTIFY listeningChanged)
+    Q_PROPERTY(bool echoCancellationActive READ echoCancellationActive NOTIFY listeningChanged)
+    Q_PROPERTY(QString echoCancellationDetail READ echoCancellationDetail NOTIFY listeningChanged)
     Q_PROPERTY(bool sttAvailable READ sttAvailable NOTIFY listeningChanged)
     Q_PROPERTY(QString sttDetail READ sttDetail NOTIFY listeningChanged)
     // Words heard so far, so the user can see and correct them before the
@@ -156,6 +169,11 @@ class AppController final : public QObject {
     Q_PROPERTY(QString partialTranscript READ partialTranscript NOTIFY listeningChanged)
     // Why listening stopped without a phrase, empty otherwise.
     Q_PROPERTY(QString listenError READ listenError NOTIFY listeningChanged)
+    Q_PROPERTY(bool linuxDictationSettings READ linuxDictationSettings CONSTANT)
+    Q_PROPERTY(QString dictationModelPath READ dictationModelPath NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QString dictationAudioDevice READ dictationAudioDevice NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QStringList dictationMicrophones READ dictationMicrophones NOTIFY dictationSettingsChanged)
+    Q_PROPERTY(QString dictationSettingsError READ dictationSettingsError NOTIFY dictationSettingsChanged)
 
     Q_PROPERTY(bool diagnosticsOpen READ diagnosticsOpen WRITE setDiagnosticsOpen NOTIFY diagnosticsOpenChanged)
 
@@ -163,7 +181,7 @@ class AppController final : public QObject {
     // backend decodes it once and keeps it resident rather than resending it.
     Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt NOTIFY systemPromptChanged)
 
-    // Loading a model from disk, so the app is not stuck on the mock preview.
+    // Loading another local model from disk.
     Q_PROPERTY(bool canLoadModel READ canLoadModel NOTIFY runtimeChanged)
     Q_PROPERTY(QString modelPath READ modelPath NOTIFY runtimeChanged)
     // Why the last load attempt failed, empty when it succeeded. Shown next to
@@ -196,6 +214,7 @@ public:
     // clause pump can be driven on a machine with no voice installed. Mirrors
     // setBackendForTesting, for the same reason.
     void setSpeechBackendForTesting(std::unique_ptr<SpeechBackend> backend);
+    void setSpeechRecognizerForTesting(std::unique_ptr<runtime::SpeechRecognizer> recognizer);
 
     // Test seam for the persona: put the dials somewhere the idle loop would
     // have put them. The warmth dial reaches the synthesizer as a plain copy,
@@ -215,9 +234,9 @@ public:
     [[nodiscard]] QString conversationTitle() const;
     /// Returns the shared instruction text declared for subsequent turns.
     [[nodiscard]] QString systemPrompt() const;
-    /// Returns whether this build provides an available llama.cpp backend.
+    /// Returns whether this build provides an available local model backend.
     [[nodiscard]] bool canLoadModel() const;
-    /// Returns the loaded model's local path, or an empty string in preview mode.
+    /// Returns the loaded model's local path, or an empty string before a model has been loaded.
     [[nodiscard]] QString modelPath() const;
     /// Returns the latest model-switch error, cleared after a successful switch.
     [[nodiscard]] QString modelError() const;
@@ -270,13 +289,36 @@ public:
     /// True while a clause is being spoken. False for the whole lifetime of a
     /// build with no voice, and false between clauses of one that has it.
     [[nodiscard]] bool speaking() const noexcept;
+    [[nodiscard]] bool audioPaused() const noexcept { return m_audioPaused; }
+    [[nodiscard]] bool canResumeSpeech() const noexcept;
+    [[nodiscard]] bool canSkipSpeech() const noexcept;
+    [[nodiscard]] double speechProgress() const noexcept;
+    [[nodiscard]] bool automaticSpeechSummary() const noexcept { return m_automaticSpeechSummary; }
+    void setAutomaticSpeechSummary(bool enabled);
+    [[nodiscard]] bool summarizingSpeech() const noexcept { return m_summaryRequestId != 0; }
+    [[nodiscard]] bool speakingSummary() const noexcept { return m_playingSummary; }
+    [[nodiscard]] QString spokenSummary() const { return m_summaryOutput; }
+    [[nodiscard]] QString pendingInterruption() const { return m_pendingInterruption; }
     [[nodiscard]] QString ttsError() const;
 
     [[nodiscard]] bool listening() const noexcept;
+    [[nodiscard]] bool echoCancellationEnabled() const noexcept { return m_echoCancellationEnabled; }
+    [[nodiscard]] bool echoCancellationActive() const noexcept;
+    [[nodiscard]] QString echoCancellationDetail() const;
+    void setEchoCancellationEnabled(bool enabled);
     [[nodiscard]] bool sttAvailable() const noexcept;
     [[nodiscard]] QString sttDetail() const;
     [[nodiscard]] QString partialTranscript() const;
     [[nodiscard]] QString listenError() const;
+    [[nodiscard]] bool linuxDictationSettings() const noexcept;
+    [[nodiscard]] QString dictationModelPath() const { return m_dictationModelPath; }
+    [[nodiscard]] QString dictationAudioDevice() const { return m_dictationAudioDevice; }
+    [[nodiscard]] QStringList dictationMicrophones() const { return m_dictationMicrophones; }
+    [[nodiscard]] QString dictationSettingsError() const { return m_dictationSettingsError; }
+    // Accepts a local FileDialog URL or a path. Empty model disables dictation.
+    // Refuses an active/unwinding session rather than blocking the UI on teardown.
+    Q_INVOKABLE bool applyDictationSettings(const QString& model, const QString& device);
+    Q_INVOKABLE void refreshDictationMicrophones();
 
     void setIdleLoopEnabled(bool enabled);
     void setIdlePrewarmEnabled(bool enabled);
@@ -318,6 +360,16 @@ public:
     Q_INVOKABLE void stopListening();
     // Starts a phrase over: the partial text is discarded, not submitted.
     Q_INVOKABLE void abandonListening();
+    // Audio-only controls never cancel model generation. Pausing lets the
+    // current clause finish; resume starts with the next unconsumed clause.
+    Q_INVOKABLE void pauseSpeech();
+    Q_INVOKABLE void resumeSpeech();
+    Q_INVOKABLE void stopSpeech();
+    Q_INVOKABLE void skipSpeech();
+    // A real recognized interruption is held until the user chooses to send
+    // it (discarding the old answer) or resume the preserved old answer.
+    Q_INVOKABLE void sendPendingInterruption();
+    Q_INVOKABLE void resumeInterruptedAnswer();
     Q_INVOKABLE void stopGeneration();
     Q_INVOKABLE void pauseConversation();
     Q_INVOKABLE void resumeConversation();
@@ -346,9 +398,6 @@ public:
     /// One signal, one meaning: whoever is listening hears the outcome of the
     /// whole sequence rather than of whichever attempt happened to finish.
     void loadModelFromUrls(const QStringList& urls);
-    /// Goes back to the built-in preview backend, so a user who loaded the
-    /// wrong file is not stuck with it.
-    Q_INVOKABLE void usePreviewBackend();
     // Re-runs device discovery. Probing is cheap, but it is a driver call, so
     // it is explicit rather than happening on every property read.
     Q_INVOKABLE void refreshRuntime();
@@ -380,6 +429,7 @@ signals:
     void ttsChanged();
     /// Notifies observers that listening state or the partial transcript changed.
     void listeningChanged();
+    void dictationSettingsChanged();
 
 private:
     // Worker callbacks, delivered on the UI thread by queued connections.
@@ -393,6 +443,7 @@ private:
 
     // Listen session callbacks. The final phrase is handed to sendMessage, so
     // there is exactly one way a turn starts no matter how the user said it.
+    void replaceSpeechRecognizer(std::unique_ptr<runtime::SpeechRecognizer> recognizer);
     void onUtteranceFinal(const QString& text, double confidence);
     void onListeningEnded(const QString& reason);
 
@@ -513,7 +564,6 @@ private:
     // one beside it that works".
     QStringList m_modelQueue;
     QStringList m_modelAttempts;
-    bool m_discardModelLoad = false;
     GenerationWorker* m_worker = nullptr;
 
     std::vector<std::unique_ptr<ConversationEntry>> m_entries;
@@ -525,7 +575,7 @@ private:
     bool m_generating = false;
     bool m_canRegenerate = false;
     bool m_sidebarOpen = true;
-    bool m_diagnosticsOpen = false;
+    bool m_diagnosticsOpen = true;
     QString m_searchQuery;
     QString m_systemPrompt;
     QString m_modelPath;
@@ -588,13 +638,41 @@ private:
     // and everything else gets the preview recognizer.
     std::unique_ptr<runtime::SpeechRecognizer> m_recognizer;
     std::unique_ptr<ListenSession> m_listen;
+    std::unique_ptr<EchoCancelSession> m_echo;
+    bool m_echoCancellationEnabled = true;
+    bool m_echoListeningRequested = false;
+    bool m_testRecognizer = false;
+    bool m_receivedPhrase = false;
+    bool beginListening();
+    void restoreDictationRecognizer();
+    QString m_dictationModelPath;
+    QString m_dictationAudioDevice = QStringLiteral("default");
+    QStringList m_dictationMicrophones;
+    QString m_dictationSettingsError;
     // True from the first clause of a response until the last one is spoken.
     // Distinct from m_generating, because generation finishes long before the
     // audio does, and the two states gate different things: the worker, and the
     // spoken cursor.
     bool m_speaking = false;
+    bool m_audioPaused = false;
+    bool m_audioStopped = false;
+    bool m_automaticSpeechSummary = true;
+    bool m_summaryPending = false;
+    bool m_summaryAttempted = false;
+    bool m_summaryCancelled = false;
+    bool m_playingSummary = false;
+    quint64 m_summaryRequestId = 0;
+    core::ResponseId m_summaryOwner = core::kInvalidResponseId;
+    core::VoiceSession m_summaryVoice;
+    core::ResponseId m_summaryResponse = core::kInvalidResponseId;
+    QString m_summaryOutput;
+    void startSpeechSummary();
+    core::VoiceSession& playbackSession() { return m_playingSummary ? m_summaryVoice : m_voice; }
+    core::ResponseId playbackResponse() const { return m_playingSummary ? m_summaryResponse : m_activeResponse; }
+    QString m_pendingInterruption;
     QString m_speechError;
     QString m_listenError;
+    QString m_platformSpeechDetail;
     bool m_hasPendingSegment = false;
     std::size_t m_pendingSegmentEnd = 0;
     int m_openingPauseMs = 0;

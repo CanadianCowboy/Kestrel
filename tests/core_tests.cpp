@@ -392,12 +392,12 @@ void testPersonaPresenceLineIsStable() {
     persona.drift(0.4F, 0.4F, 0.4F, -0.4F, 0.4F, 0.0F);
     assert(persona.presenceLine() == line);
 
-    core::ToneProfile wry;
-    wry.wry = true;
-    persona.setTone(wry);
+    core::ToneProfile plain;
+    plain.wry = false;
+    persona.setTone(plain);
     assert(persona.presenceLine() != line);
-    assert(persona.presenceLine().find("wit") != std::string::npos);
-    assert(persona.tone().wry);
+    assert(persona.presenceLine().find("dry wit") == std::string::npos);
+    assert(!persona.tone().wry);
 }
 
 void testPersonaDialsStayInRange() {
@@ -424,22 +424,21 @@ void testPersonaDialsStayInRange() {
     assert(core::toString(core::PersonaMood::Contemplative) == std::string("contemplative"));
 }
 
-void testPersonaAcknowledgementRotates() {
+void testPersonaAcknowledgementIsNotAStockCue() {
     core::Persona persona;
-    std::vector<std::string> cues;
-    for (int i = 0; i < 4; ++i) {
-        cues.push_back(persona.acknowledgement());
-        assert(!cues.back().empty());
-    }
-    for (std::size_t i = 0; i < cues.size(); ++i) {
-        for (std::size_t j = i + 1; j < cues.size(); ++j) {
-            assert(cues[i] != cues[j]);
-        }
-    }
-    assert(persona.sequence() == 4);
-    // Rotation rather than a random draw, so the cycle is reproducible.
-    assert(persona.acknowledgement() == cues.front());
+    assert(persona.acknowledgement().empty());
+    assert(persona.acknowledgement().empty());
+    assert(persona.sequence() == 2);
     assert(persona.acknowledgementPauseMs() > 0);
+}
+
+void testPersonaPromptHasKestrelCharacter() {
+    const core::Persona persona;
+    const std::string fragment = persona.systemPromptFragment();
+    assert(fragment.find("warm, perceptive, curious") != std::string::npos);
+    assert(fragment.find("dry wit sparingly") != std::string::npos);
+    assert(fragment.find("ask before consequential choices") != std::string::npos);
+    assert(fragment.find("Offer a next step only when it genuinely helps") != std::string::npos);
 }
 
 void testPersonaAnticipation() {
@@ -448,7 +447,7 @@ void testPersonaAnticipation() {
     const auto offer = persona.react(core::PersonaTrigger::LongResponse);
     assert(offer.has_value());
     assert(offer->kind == core::AnticipationKind::OfferContinue);
-    assert(offer->text == "Would you like me to continue?");
+    assert(offer->text == "I can continue with the remaining detail if that would help.");
 
     const auto correction = persona.react(core::PersonaTrigger::UserCorrection);
     assert(correction.has_value());
@@ -456,17 +455,24 @@ void testPersonaAnticipation() {
 
     const auto done = persona.react(core::PersonaTrigger::TaskCompleted);
     assert(done.has_value());
-    assert(done->text == "Task complete.");
+    assert(done->text == "That's done.");
 
     const auto back = persona.react(core::PersonaTrigger::UserReturned);
     assert(back.has_value());
     assert(back->kind == core::AnticipationKind::ReadyWhenYouAre);
 
-    // An ordinary short answer only earns a closing prompt from an assistant
-    // with the initiative to mean it.
+    // An ordinary short answer only earns a concrete next step at high
+    // initiative, and only on every third user turn.
     assert(!persona.react(core::PersonaTrigger::TurnCompleted).has_value());
     persona.drift(0.0F, 0.0F, 0.2F, 0.0F, 0.0F, 0.0F);
-    assert(persona.react(core::PersonaTrigger::TurnCompleted).has_value());
+    persona.noteUserMessage("first turn");
+    assert(!persona.react(core::PersonaTrigger::TurnCompleted).has_value());
+    persona.noteUserMessage("second turn");
+    assert(!persona.react(core::PersonaTrigger::TurnCompleted).has_value());
+    persona.noteUserMessage("third turn");
+    const auto nextStep = persona.react(core::PersonaTrigger::TurnCompleted);
+    assert(nextStep.has_value());
+    assert(nextStep->text == "If useful, I can help turn this into a concrete next step.");
 
     // States the UI already shows are not repeated as a line.
     assert(!persona.react(core::PersonaTrigger::UserPaused).has_value());
@@ -981,6 +987,7 @@ void testNextSpeechSegmentTracksTheSpokenCursor() {
     const core::ResponseId id = session.queueResponse();
     const core::GenerationId generation = session.beginGeneration(id);
     assert(session.appendText(id, generation, "Hi. There we go."));
+    assert(session.finishGeneration(id, generation));
 
     const auto first = session.nextSpeechSegment(id, 220);
     assert(first.has_value());
@@ -1015,6 +1022,7 @@ void testPeekSpeechSegmentLooksOneClauseAhead() {
     const core::ResponseId id = session.queueResponse();
     const core::GenerationId generation = session.beginGeneration(id);
     assert(session.appendText(id, generation, "Hi. There we go. Then this."));
+    assert(session.finishGeneration(id, generation));
 
     // Nothing has been handed out yet, so the one after next is the second
     // clause. Offsets are on the same timeline as everything else, so a caller
@@ -1100,6 +1108,7 @@ void testVoicePersonaIsReplaceable() {
     const core::ResponseId id = session.queueResponse();
     const core::GenerationId generation = session.beginGeneration(id);
     assert(session.appendText(id, generation, "One. Two."));
+    assert(session.finishGeneration(id, generation));
     const std::size_t eventsBefore = session.events().size();
     const auto segment = session.nextSpeechSegment(id);
     assert(segment.has_value());
@@ -1114,6 +1123,79 @@ void testVoicePersonaIsReplaceable() {
     const auto nextSegment = session.nextSpeechSegment(id);
     assert(nextSegment.has_value());
     assert(nextSegment->leadingPauseMs == brisk.sentencePauseMs);
+}
+
+void testReadableStreamingSpeech() {
+    const std::string input =
+        "# A heading\nPlain **words** with `secret_call()` and [a label](https://example.test).\n"
+        "```cpp\nsecret();\n```\n"
+        "| Hidden | table |\n| --- | --- |\n| 1 | 2 |\n"
+        "- A readable item.\nUse /tmp/secret.txt and https://example.test/path here [1].\n"
+        "Tail without punctuation";
+    core::VoiceSession session;
+    const auto id = session.queueResponse();
+    const auto generation = session.beginGeneration(id);
+    std::string spoken;
+    const auto drain = [&] {
+        while (const auto segment = session.nextSpeechSegment(id)) {
+            assert(segment->endOffset > session.find(id)->spokenOffset());
+            spoken += segment->text;
+            assert(session.advancePlayback(id, segment->endOffset));
+        }
+    };
+    // Byte-sized tokens exercise every Markdown fence/link/URL split.
+    for (const char c : input) {
+        assert(session.appendText(id, generation, std::string_view(&c, 1)));
+        drain();
+        assert(spoken.find("secret") == std::string::npos);
+        assert(spoken.find("https") == std::string::npos);
+        assert(spoken.find("Hidden") == std::string::npos);
+        assert(spoken.find('`') == std::string::npos);
+        assert(spoken.find('*') == std::string::npos);
+    }
+    assert(spoken.find("Tail without punctuation") == std::string::npos);
+    assert(session.finishGeneration(id, generation));
+    drain();
+    assert(spoken.find("A heading") != std::string::npos);
+    assert(spoken.find("Plain words") != std::string::npos);
+    assert(spoken.find("a label") != std::string::npos);
+    assert(spoken.find("A readable item.") != std::string::npos);
+    assert(spoken.find("Tail without punctuation") != std::string::npos);
+    assert(session.find(id)->generatedText() == input);
+    assert(session.find(id)->spokenOffset() == input.size());
+
+    core::VoiceSession partial;
+    const auto partialId = partial.queueResponse();
+    const auto gen = partial.beginGeneration(partialId);
+    assert(partial.appendText(partialId, gen, "An unfinished thought"));
+    assert(!partial.nextSpeechSegment(partialId));
+    assert(partial.appendText(partialId, gen, " becomes complete. "));
+    assert(partial.nextSpeechSegment(partialId)->text == "An unfinished thought becomes complete.");
+
+    core::VoiceSession omitted;
+    const auto omittedId = omitted.queueResponse();
+    const auto omittedGen = omitted.beginGeneration(omittedId);
+    assert(omitted.appendText(omittedId, omittedGen, "```\nonly_code()\n```"));
+    assert(omitted.finishGeneration(omittedId, omittedGen));
+    const auto skipped = omitted.nextSpeechSegment(omittedId);
+    assert(skipped && skipped->text.empty());
+    assert(omitted.advancePlayback(omittedId, skipped->endOffset));
+    assert(omitted.find(omittedId)->isTerminal());
+
+    assert(core::isListeningAcknowledgement("Okay!"));
+    assert(core::isListeningAcknowledgement("  mm-hm. "));
+    assert(core::isListeningAcknowledgement("Got it."));
+    assert(!core::isListeningAcknowledgement("okay but change the plan"));
+    assert(!core::isListeningAcknowledgement("stop"));
+    assert(!core::isListeningAcknowledgement(""));
+    assert(core::classifySpokenIntent("Kestrel, pause please!") == core::SpokenIntent::Pause);
+    assert(core::classifySpokenIntent("please resume audio") == core::SpokenIntent::Resume);
+    assert(core::classifySpokenIntent("Stop speaking.") == core::SpokenIntent::StopAudio);
+    assert(core::classifySpokenIntent("cancel generation") == core::SpokenIntent::Cancel);
+    assert(core::classifySpokenIntent("that makes sense") == core::SpokenIntent::Acknowledgement);
+    assert(core::classifySpokenIntent("don't stop speaking") == core::SpokenIntent::Ambiguous);
+    assert(core::classifySpokenIntent("pause and explain the other option") == core::SpokenIntent::Ambiguous);
+    assert(core::classifySpokenIntent("okay \xc3\xa9" "coute") == core::SpokenIntent::Ambiguous);
 }
 
 void testSentenceStartBefore() {
@@ -1158,9 +1240,11 @@ int main() {
     testFailureRecovery();
     testInvariantsAndBounds();
     testSentenceStartBefore();
+    testReadableStreamingSpeech();
     testPersonaPresenceLineIsStable();
     testPersonaDialsStayInRange();
-    testPersonaAcknowledgementRotates();
+    testPersonaAcknowledgementIsNotAStockCue();
+    testPersonaPromptHasKestrelCharacter();
     testPersonaAnticipation();
     testPersonaStatusWhispers();
     testPersonaSessionTopic();

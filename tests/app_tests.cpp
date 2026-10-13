@@ -6,6 +6,20 @@
 // taking effect while generation is still in flight.
 
 #include <QCoreApplication>
+#include <QDataStream>
+#include <QFile>
+#include <QProcess>
+#include <cmath>
+#include <cstring>
+#include <QGuiApplication>
+#include <QSettings>
+#include <QTemporaryDir>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QQuickStyle>
+#include <QQuickWindow>
 #include <QElapsedTimer>
 #include <QDir>
 #include <QEventLoop>
@@ -24,16 +38,22 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#include "ui/layoutaudit.h"
 #include "app/generationworker.h"
 #include "app/messagemodel.h"
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
+#include "app/echocancelsession.h"
 #if KESTREL_HAS_QT_MULTIMEDIA
 #include "app/localmodelspeechbackend.h"
 #include <QMediaPlayer>
 #endif
 #include "runtime/mockbackend.h"
+#include "runtime/llamacppbackend.h"
 #include "runtime/modelbackend.h"
+#if defined(__linux__)
+#include "runtime/linuxspeechrecognizer.h"
+#endif
 
 namespace {
 
@@ -49,10 +69,10 @@ using kestrel::runtime::GenerationRequest;
 // the flag, cancel() would appear to do nothing until generation finished.
 class SlowBackend final : public kestrel::runtime::ModelBackend {
 public:
-    explicit SlowBackend(int tokenCount, int delayMs)
-        : m_tokenCount(tokenCount), m_delayMs(delayMs) {}
+    explicit SlowBackend(int tokenCount, int delayMs, BackendKind kind = BackendKind::Mock)
+        : m_tokenCount(tokenCount), m_delayMs(delayMs), m_kind(kind) {}
 
-    [[nodiscard]] BackendKind kind() const noexcept override { return BackendKind::Mock; }
+    [[nodiscard]] BackendKind kind() const noexcept override { return m_kind; }
 
     [[nodiscard]] kestrel::runtime::RuntimeStatus status() const override {
         return {true, true, "Slow test backend", "test", "unit test", 0.0, 0, 4096};
@@ -61,6 +81,11 @@ public:
     bool loadModel(const std::string&, std::string&) override { return true; }
 
     void setTokenPieces(std::vector<std::string> pieces) { m_pieces = std::move(pieces); }
+    void setSummaryResult(std::string text, bool fail = false) {
+        m_summaryText = std::move(text);
+        m_summaryFails = fail;
+    }
+    void holdSummary(bool held) { m_summaryHeld.store(held); }
 
     void generate(const GenerationRequest& request,
                   kestrel::runtime::TokenCallback onToken,
@@ -71,6 +96,17 @@ public:
         }
         m_generateThread = std::this_thread::get_id();
         m_cancelled.store(false, std::memory_order_release);
+        if (!request.messages.empty() && request.messages.back().content.find("<remaining-answer>") != std::string::npos) {
+            // The test releases the result after pausing audio. Counting short
+            // sleeps as elapsed milliseconds depends on the host timer resolution.
+            while (m_summaryHeld.load() && !m_cancelled.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (m_cancelled.load()) { onComplete(false, "Generation stopped"); return; }
+            if (!m_summaryFails) { onToken(m_summaryText); }
+            onComplete(!m_summaryFails, m_summaryFails ? "deliberate test summary failure" : "");
+            return;
+        }
         for (int i = 0; i < m_tokenCount; ++i) {
             if (m_cancelled.load(std::memory_order_acquire)) {
                 onComplete(false, "Generation stopped");
@@ -104,6 +140,10 @@ private:
     std::vector<std::string> m_pieces;
     int m_tokenCount;
     int m_delayMs;
+    BackendKind m_kind;
+    std::string m_summaryText = "Only the remaining detail, in brief.";
+    bool m_summaryFails = false;
+    std::atomic<bool> m_summaryHeld{false};
     std::atomic<bool> m_cancelled{false};
     std::atomic<int> m_tokensEmitted{0};
     std::thread::id m_generateThread{};
@@ -129,6 +169,15 @@ public:
         kestrel::runtime::RecognitionResult result;
         result.text = std::move(text);
         m_results.at(session)(result);
+    }
+
+    void emitFinal(std::size_t session, std::string text) {
+        kestrel::runtime::RecognitionResult result;
+        result.text = std::move(text);
+        result.isFinal = true;
+        m_listening = false;
+        m_results.at(session)(result);
+        m_ends.at(session)(kestrel::runtime::RecognitionEnd::Silence, {});
     }
 
 private:
@@ -255,7 +304,10 @@ public:
 
     void stop() override { ++boundaryStops; }
 
-    void stopImmediately() override { ++immediateStops; }
+    void stopImmediately() override {
+        ++immediateStops;
+        m_speaking = false;
+    }
 
     [[nodiscard]] bool speakingNow() const override { return m_speaking; }
 
@@ -709,6 +761,31 @@ void testResumeUsesPartialAssistantPrompt() {
     }
 }
 
+void testRuntimeDiagnosticsIdentifyTheActiveBackend() {
+    std::cout << "runtime diagnostics distinguish the active backend from alternatives\n";
+    AppController controller;
+    const QVariantList diagnostics = controller.runtimeDiagnostics();
+    bool sawActive = false;
+    bool sawMockBackend = false;
+    for (const QVariant& row : diagnostics) {
+        const QVariantMap item = row.toMap();
+        const QString label = item.value(QStringLiteral("label")).toString();
+        if (label.startsWith(QStringLiteral("Active backend: "))) {
+            sawActive = true;
+            check(label != QStringLiteral("Active backend: mock"),
+                  "a fresh controller selects a real inference backend, never preview mode");
+            check(item.value(QStringLiteral("active")).toBool(),
+                  "the active backend row is flagged active");
+        }
+        if (label.contains(QStringLiteral("mock"), Qt::CaseInsensitive)
+            || item.value(QStringLiteral("value")).toString().contains(QStringLiteral("preview"), Qt::CaseInsensitive)) {
+            sawMockBackend = true;
+        }
+    }
+    check(sawActive, "diagnostics contain one explicitly named active backend");
+    check(!sawMockBackend, "Mock is absent from user-facing runtime diagnostics");
+}
+
 void testModelLoadReportsAsynchronously() {
     std::cout << "model loading reports back on the controller thread\n";
     QTemporaryFile file(QDir::tempPath() + QStringLiteral("/kestrel model-XXXXXX.gguf"));
@@ -787,8 +864,8 @@ void testPresenceAndIdleLoopProject() {
 
     controller.sendMessage(QStringLiteral("What is the plan for tensorrt?"));
     check(controller.generating(), "the turn starts");
-    check(!controller.acknowledgement().isEmpty(),
-          "a cue is offered the moment a request is accepted");
+    check(controller.acknowledgement().isEmpty(),
+          "the reply starts without a stock acknowledgement cue");
     check(controller.presenceState() == QStringLiteral("thinking"),
           "presence reports the turn rather than the keystroke");
     check(controller.presenceIntensity() >= 0.0 && controller.presenceIntensity() <= 1.0,
@@ -799,11 +876,11 @@ void testPresenceAndIdleLoopProject() {
     runTurnToCompletion(controller);
 
     check(!controller.generating(), "the turn finished");
-    check(controller.acknowledgement().isEmpty(), "the cue is cleared once the answer is underway");
+    check(controller.acknowledgement().isEmpty(), "no stock cue is staged at any point");
     check(controller.presenceState() == QStringLiteral("standing by"),
           "presence settles back to standing by");
     check(controller.statusWhisper() == QString::fromUtf8("Standing by\u2026"),
-          "a short answer does not prompt for the next step by default");
+          "a short answer does not append an automatic closing line");
     check(presenceSignals > 0, "observers are told when presence changes");
 }
 
@@ -822,21 +899,19 @@ void testLongAnswerIsOfferedToContinue() {
     runTurnToCompletion(controller);
 
     check(!controller.generating(), "the long turn finished");
-    check(controller.statusWhisper().startsWith(QStringLiteral("Would you like me to continue")),
-          "a long answer is offered to continue rather than left hanging");
+    check(controller.statusWhisper().startsWith(QStringLiteral("I can continue with the remaining detail")),
+          "a long answer offers a useful continuation without a stock question");
 }
 
-// The whole point of speaking clause by clause: the cue lands first, the answer
-// follows in order, and the response is only delivered once the audio is.
+// The whole point of speaking clause by clause: the answer is spoken in order,
+// and the response is only delivered once the audio is.
 // The regression this file exists to keep: a turn must not be declared
 // delivered until the last clause has actually been spoken.
 //
-// The pump starts the moment a request is accepted, so the acknowledgement cue
-// can be heard while the model is still working. That means the pump runs a
-// second time, very early, when there is no answer text to speak yet. An empty
-// result there means "nothing more to say right now", not "the response is
-// over" -- and treating it as the second truncates the reply at whatever the
-// first few tokens happened to be, and skips the follow-up line entirely.
+// The pump starts as soon as answer text arrives. An empty result before that
+// means "nothing more to say right now", not "the response is over" -- and
+// treating it as the second truncates the reply at whatever first tokens happen
+// to exist and skips the rest of the answer.
 void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
     std::cout << "a turn is not delivered before the last clause is spoken\n";
 
@@ -855,18 +930,17 @@ void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
     QTimer::singleShot(300, &settle, &QEventLoop::quit);
     settle.exec();
 
-    check(!observed->spoken.isEmpty(), "the cue reached the engine");
-    check(controller.generating(), "the model is still working when the cue ends");
+    check(observed->spoken.isEmpty(), "no acknowledgement is spoken before the answer exists");
+    check(controller.generating(), "the model is still working before answer text exists");
     check(controller.speaking(), "the turn is still in the speaker's mouth");
 
-    // The cue is finished. There is no answer text yet, and the pump must
-    // simply wait rather than conclude that the response has been delivered.
-    observed->finishUtterance();
-    QEventLoop afterCue;
-    QTimer::singleShot(150, &afterCue, &QEventLoop::quit);
-    afterCue.exec();
+    // There is no answer text yet, and the pump must simply wait rather than
+    // conclude that the response has been delivered.
+    QEventLoop beforeAnswer;
+    QTimer::singleShot(150, &beforeAnswer, &QEventLoop::quit);
+    beforeAnswer.exec();
 
-    check(controller.generating(), "the model is still working after the cue");
+    check(controller.generating(), "the model is still working before the reply");
     check(controller.speaking(), "the response is not delivered before it is spoken");
     check(!controller.statusWhisper().startsWith(QStringLiteral("Would you like me to continue")),
           "no follow-up is offered for a response that has not been given");
@@ -891,8 +965,8 @@ void testSpokenTurnIsNotDeliveredBeforeTheLastClause() {
         return text;
     };
     QString spokenAnswer;
-    for (int i = 1; i < observed->spoken.size(); ++i) {
-        spokenAnswer += observed->spoken.at(i);
+    for (const QString& utterance : observed->spoken) {
+        spokenAnswer += utterance;
     }
     const QString delivered = controller.messages()->data(controller.messages()->index(1, 0),
         kestrel::app::MessageModel::ContentRole).toString();
@@ -998,8 +1072,7 @@ void testSpokenResponseFollowsClauseOrder() {
     check(controller.speaking() == false, "nothing is speaking before a request");
 
     controller.sendMessage(QStringLiteral("Hello there"));
-    // The cue is spoken immediately and the first real clause waits out the
-    // pause the persona asked for, so let the event loop turn rather than
+    // The real answer starts directly; let the event loop turn rather than
     // assuming an instant transition.
     QEventLoop settle;
     QTimer::singleShot(600, &settle, &QEventLoop::quit);
@@ -1009,11 +1082,10 @@ void testSpokenResponseFollowsClauseOrder() {
     check(!observed->spoken.isEmpty(), "something was spoken");
     check(observed->voiceApplications > 0, "the voice persona was applied to the engine");
 
-    // The first utterance is the acknowledgement, not the answer: that is what
-    // makes a request sound accepted before it sounds answered.
-    check(observed->spoken.first() == controller.acknowledgement()
-              || observed->spoken.first().endsWith(QLatin1Char('.')),
-          "the first utterance is the acknowledgement cue");
+    // The first utterance is part of the model's answer, not a stock cue.
+    check(controller.acknowledgement().isEmpty(), "no generic voice cue is pending");
+    check(!observed->spoken.isEmpty() && observed->spoken.first().endsWith(QLatin1Char('.')),
+          "speech begins with a clause from the answer");
     check(controller.speaking(), "the controller reports speech in progress");
 
     // Drive the pump to the end: every clause finishes, one at a time.
@@ -1045,7 +1117,7 @@ void testSpokenResponseFollowsClauseOrder() {
     check(status == kestrel::app::toStatusString(kestrel::app::MessageStatus::Complete),
           "the response is complete once it has been spoken");
 
-    // Everything after the cue is the answer, in order and in full. Whitespace
+    // Every utterance belongs to the answer, in order and in full. Whitespace
     // between clauses is deliberately not spoken -- it is the pause -- so both
     // sides are compared with spacing removed.
     const auto withoutSpace = [](QString text) {
@@ -1053,12 +1125,12 @@ void testSpokenResponseFollowsClauseOrder() {
         return text;
     };
     QString spokenAnswer;
-    for (int i = 1; i < observed->spoken.size(); ++i) {
-        spokenAnswer += observed->spoken.at(i);
+    for (const QString& utterance : observed->spoken) {
+        spokenAnswer += utterance;
     }
     const QString delivered = controller.messages()->data(controller.messages()->index(1, 0),
         kestrel::app::MessageModel::ContentRole).toString();
-    check(!spokenAnswer.isEmpty(), "the answer was spoken, not only the cue");
+    check(!spokenAnswer.isEmpty(), "the answer was spoken");
     const bool complete = withoutSpace(spokenAnswer) == withoutSpace(delivered);
     if (!complete) {
         std::cout << "       spoke " << observed->spoken.size() << " utterances, "
@@ -1121,14 +1193,9 @@ void testWarmthReachesTheVoice() {
     controller.stopGeneration();
 }
 
-// A reply asked for before the voice can answer is still a reply that was asked
-// for, and the first thing anyone hears in a session should not be text just
-// because a local model was still loading. The reply is owed audio until the
-// engine turns up, and spoken then -- from its own unspoken remainder, so
-// nothing is said twice and nothing left over from an earlier turn is spoken
-// in its place.
-void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
-    std::cout << "a reply asked for before the voice is ready is spoken once it is\n";
+// A loading voice must not delay delivery or suddenly speak an earlier reply.
+void testLoadingVoiceLeavesTheCurrentReplySilent() {
+    std::cout << "a loading voice leaves the current reply silent\n";
 
     // A control run first: the same question, with the voice ready from the
     // start. What the late voice has to produce is exactly this, which is the
@@ -1144,8 +1211,9 @@ void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
     control.setSpeechBackendForTesting(std::move(controlSpeech));
     const QString question = QStringLiteral("what did you make of that");
     control.sendMessage(question);
-    // Read before the loop, while the cue is still the one about to be spoken.
+    // There is no acknowledgement to remove from the spoken answer.
     const QString cue = control.acknowledgement();
+    check(cue.isEmpty(), "there is no stock cue before speech");
     for (int i = 0; i < 400 && control.speaking(); ++i) {
         QEventLoop wait;
         QTimer::singleShot(20, &wait, &QEventLoop::quit);
@@ -1155,14 +1223,8 @@ void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
     if (controlVoice->spoken.isEmpty()) {
         return;
     }
-    // The cue belongs to the moment the request was made. A reply whose audio
-    // starts late has no cue left to give, and saying "got it" several seconds
-    // late would be worse than not saying it, so the cue is the one thing
-    // allowed to differ. Everything after it is the reply.
-    QStringList expected = controlVoice->spoken;
-    if (!cue.isEmpty() && expected.first() == cue) {
-        expected.removeFirst();
-    }
+    check(control.voiceState() == QStringLiteral("completed"),
+          "a ready voice completes delivery after playback");
 
     // The real case: the engine is installed and launched but has not finished
     // loading, which is what a cold start looks like.
@@ -1194,19 +1256,13 @@ void testReplyOwedAudioIsSpokenWhenTheVoiceArrives() {
         wait.exec();
     }
 
-    check(!observed->spoken.isEmpty(), "the held reply is spoken once the voice arrives");
-    check(observed->spoken == expected,
-          "the held reply speaks exactly the clauses a ready voice would have spoken");
-    check(observed->spoken.size() == expected.size(),
-          "no clause is spoken twice");
-    bool distinct = true;
-    for (int i = 0; i < observed->spoken.size(); ++i) {
-        for (int j = i + 1; j < observed->spoken.size(); ++j) {
-            distinct = distinct && observed->spoken.at(i) != observed->spoken.at(j);
-        }
-    }
-    check(distinct, "nothing from an earlier turn is spoken in place of this one");
-    check(!controller.speaking(), "playback finished");
+    check(observed->spoken.isEmpty(), "becoming ready never starts the earlier silent reply");
+    check(controller.voiceState() == QStringLiteral("completed"),
+          "the loading reply is fully delivered as text");
+    check(!controller.speaking(), "the completed silent reply stays silent");
+    controller.sendMessage(QStringLiteral("a new question after the voice is ready"));
+    runTurnToCompletion(controller);
+    check(!observed->spoken.isEmpty(), "the next reply automatically uses the ready voice");
     controller.stopGeneration();
 }
 
@@ -1265,16 +1321,13 @@ void testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken() {
     controller.setSpeechBackendForTesting(std::move(speech));
 
     controller.sendMessage(QStringLiteral("why does a held clause still come first"));
-    // Read while the cue is still the one about to be spoken.
     const QString cue = controller.acknowledgement();
+    check(cue.isEmpty(), "the first spoken clause has no preceding cue");
 
-    // The pause is load-bearing and has to stay that way: the cue carries no
-    // pause and goes straight to the engine, while the first clause is still
-    // parked behind its lead-in when sendMessage returns. A fix that let the
-    // lookahead through by sending the clause early would show up here as a
-    // second entry in spoken before the event loop has even turned.
-    check(observed->spoken.size() <= 1,
-          "the first clause is still held back by its leading pause");
+    // The first clause remains parked behind its natural lead-in when
+    // sendMessage returns. A fix that lets lookahead through early would show
+    // up as speech before the event loop has turned.
+    check(observed->spoken.isEmpty(), "the first clause waits for its lead-in");
 
     for (int i = 0; i < 400 && controller.speaking(); ++i) {
         QEventLoop wait;
@@ -1283,16 +1336,9 @@ void testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken() {
     }
 
     // The clauses, in the order they are spoken, which is the order they are
-    // supposed to have been asked for. The cue is not one of them: it is spoken
-    // with no pause before it, so it never sat in front of anything.
-    QStringList clauses = observed->spoken;
-    if (!cue.isEmpty() && !clauses.isEmpty() && clauses.first() == cue) {
-        clauses.removeFirst();
-    }
-    QStringList asked = observed->requests;
-    if (!cue.isEmpty()) {
-        asked.removeAll(cue);
-    }
+    // supposed to have been asked for.
+    const QStringList clauses = observed->spoken;
+    const QStringList asked = observed->requests;
 
     check(clauses.size() >= 2, "the reply had more than one clause");
     check(!asked.isEmpty(), "the engine was asked for something");
@@ -1438,7 +1484,7 @@ void testAReplySentMidSpeechTakesItsOwnWarmth() {
 // waits forever -- text on screen, no audio, no reason given. The deadline has
 // to end it as text, say specifically what happened, and leave the app able to
 // speak again once a voice does turn up.
-void testAHeldReplyGivesUpIfTheVoiceNeverArrives() {
+void testLoadingVoiceReportsTextOnlyWithoutWaiting() {
     std::cout << "a held reply gives up if the voice never arrives\n";
 
     kestrel::app::AppController controller;
@@ -1467,10 +1513,12 @@ void testAHeldReplyGivesUpIfTheVoiceNeverArrives() {
     QTimer::singleShot(500, &expired, &QEventLoop::quit);
     expired.exec();
 
-    check(controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
-          "the app says the voice gave up rather than failing silently");
-    check(controller.ttsError().contains(QLatin1String("model"), Qt::CaseInsensitive),
-          "the reason says what the voice was doing, not merely that it is loading");
+    check(controller.ttsError().contains(QLatin1String("loading"), Qt::CaseInsensitive),
+          "the voice still truthfully reports that it is loading");
+    check(!controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
+          "a silent reply does not invent a model-loading failure");
+    check(controller.voiceState() == QStringLiteral("completed"),
+          "text-only delivery completes without waiting on the voice deadline");
     check(!controller.generating(), "the turn is finished rather than left waiting");
     check(!controller.speaking(), "nothing is claimed to be speaking");
 
@@ -1496,6 +1544,612 @@ void testAHeldReplyGivesUpIfTheVoiceNeverArrives() {
     check(!controller.ttsError().contains(QLatin1String("given up"), Qt::CaseInsensitive),
           "the stale reason is cleared when the voice comes back");
     controller.stopGeneration();
+}
+
+void testAudioControlsDoNotCancelGeneration() {
+    std::cout << "audio controls preserve streaming text\n";
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto model = std::make_unique<SlowBackend>(80, 10);
+    auto* generated = model.get();
+    model->setTokenPieces({"First sentence. ", "Second sentence. "});
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    const auto wait = [](int ms) {
+        QEventLoop loop;
+        QTimer::singleShot(ms, &loop, &QEventLoop::quit);
+        loop.exec();
+    };
+    controller.sendMessage(QStringLiteral("stream this"));
+    wait(160);
+    check(controller.generating() && !voice->spoken.isEmpty(),
+          "the first complete sentence is spoken before generation ends");
+    controller.pauseSpeech();
+    check(controller.audioPaused() && controller.generating(),
+          "audio pause leaves generation running");
+    check(!controller.canResumeSpeech(), "resume waits for the in-flight clause to finish");
+    voice->finishUtterance();
+    const auto count = voice->spoken.size();
+    const int before = generated->tokensEmitted();
+    wait(80);
+    check(voice->spoken.size() == count && generated->tokensEmitted() > before,
+          "paused audio stays quiet while tokens keep arriving");
+    check(controller.canResumeSpeech(), "completed clause enables audio resume");
+    check(controller.speechProgress() > 0.0 && controller.speechProgress() < 1.0,
+          "source-text progress advances only after a consumed clause");
+    controller.resumeSpeech();
+    wait(340);
+    check(voice->spoken.size() == count + 1, "resume speaks the next clause exactly once");
+    const auto skippedCount = voice->spoken.size();
+    controller.skipSpeech();
+    wait(340);
+    check(voice->immediateStops == 1 && voice->spoken.size() == skippedCount + 1,
+          "skip stops the current clause and starts the following one");
+    const auto stoppedCount = voice->spoken.size();
+    controller.stopSpeech();
+    check(!controller.speaking() && !controller.audioPaused(), "stop audio clears playback state");
+    runTurnToCompletion(controller);
+    check(voice->spoken.size() == stoppedCount, "stopped audio never restarts during the reply");
+    check(generated->tokensEmitted() == 80, "stop audio does not cancel any generated tokens");
+    check(controller.voiceState() == QStringLiteral("completed"), "the full written reply completes silently");
+
+    // Audio paused through the end of generation remains resumable.
+    controller.sendMessage(QStringLiteral("pause until generation is done"));
+    wait(160);
+    controller.pauseSpeech();
+    voice->finishUtterance();
+    runTurnToCompletion(controller);
+    check(controller.canResumeSpeech(), "audio can resume after text generation finishes");
+    voice->setTimerContext(&controller);
+    voice->setAutoFinish(true);
+    controller.resumeSpeech();
+    // Avoid waiting for dozens of deliberately paced clauses in this test.
+    wait(340);
+    check(controller.speaking(), "resumed audio is live after generation has completed");
+    controller.stopGeneration();
+    check(!controller.canResumeSpeech(), "explicit cancellation drops paused audio");
+}
+
+void testRecognizedAcknowledgementAndHeldInterruption() {
+    std::cout << "recognized backchannels continue and real interruptions are held\n";
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto model = std::make_unique<SlowBackend>(100, 10);
+    model->setTokenPieces({"A real sentence. "});
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    auto recognizer = std::make_unique<QueuedFakeRecognizer>();
+    auto* ear = recognizer.get();
+    controller.setSpeechRecognizerForTesting(std::move(recognizer));
+    const auto wait = [](int ms) {
+        QEventLoop loop;
+        QTimer::singleShot(ms, &loop, &QEventLoop::quit);
+        loop.exec();
+    };
+    controller.sendMessage(QStringLiteral("first question"));
+    wait(170);
+    check(controller.startListening(), "a real test recognizer listens during playback");
+    ear->emitFinal(0, "okay");
+    wait(20);
+    check(controller.messages()->rowCount() == 2 && controller.generating(),
+          "a backchannel adds no turn and does not stop generation");
+    check(voice->boundaryStops == 0 && controller.pendingInterruption().isEmpty(),
+          "an acknowledgment does not interrupt the voice");
+    check(controller.startListening(), "a second phrase can be captured");
+    ear->emitFinal(1, "Actually explain the other approach");
+    wait(40);
+    check(controller.pendingInterruption() == QStringLiteral("Actually explain the other approach"),
+          "a real request is held visibly for confirmation");
+    check(controller.messages()->rowCount() == 2, "holding the request does not replace the old answer");
+    check(voice->boundaryStops == 1, "a held interruption stops at the clause boundary");
+    voice->finishUtterance();
+    wait(20);
+    check(controller.canResume(), "the old answer remains resumable");
+    controller.resumeInterruptedAnswer();
+    wait(30);
+    check(controller.pendingInterruption().isEmpty() && controller.generating(),
+          "resuming dismisses the pending request and continues the old answer");
+    check(controller.startListening(), "an interruption can be captured after resuming");
+    ear->emitFinal(2, "Replace this with a new answer");
+    wait(40);
+    if (voice->speakingNow()) { voice->finishUtterance(); }
+    wait(20);
+    controller.sendPendingInterruption();
+    wait(30);
+    check(controller.messages()->rowCount() == 4 && controller.pendingInterruption().isEmpty(),
+          "confirming a held request creates one replacement turn and clears its draft");
+    controller.stopGeneration();
+}
+
+void testSpokenPlaybackCommands() {
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto model = std::make_unique<SlowBackend>(100, 15);
+    auto* backend = model.get();
+    model->setTokenPieces({"An answer clause. "});
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    auto recognizer = std::make_unique<QueuedFakeRecognizer>();
+    auto* ear = recognizer.get();
+    controller.setSpeechRecognizerForTesting(std::move(recognizer));
+    const auto wait = [](int ms) { QEventLoop loop; QTimer::singleShot(ms, &loop, &QEventLoop::quit); loop.exec(); };
+    controller.sendMessage(QStringLiteral("answer this"));
+    wait(180);
+    check(controller.startListening(), "pause command capture starts");
+    ear->emitFinal(0, "Kestrel pause please");
+    wait(20);
+    check(controller.audioPaused() && controller.generating(), "spoken pause holds only audio, not generation");
+    voice->finishUtterance();
+    check(controller.startListening(), "resume command capture starts");
+    ear->emitFinal(1, "resume audio");
+    wait(350);
+    check(!controller.audioPaused() && controller.speaking(), "spoken resume restarts audio without a new turn");
+    check(controller.startListening(), "stop command capture starts");
+    ear->emitFinal(2, "stop speaking");
+    wait(20);
+    check(!controller.speaking() && controller.generating(), "spoken stop audio leaves written generation running");
+    runTurnToCompletion(controller);
+    check(backend->tokensEmitted() == 100 && controller.messages()->rowCount() == 2,
+          "voice controls neither truncate text nor become user messages");
+    controller.sendMessage(QStringLiteral("cancel this answer"));
+    wait(180);
+    check(controller.startListening(), "cancel command capture starts");
+    ear->emitFinal(3, "cancel generation");
+    wait(40);
+    check(!controller.speaking() && !controller.generating(), "explicit spoken cancellation ends both audio and generation");
+    check(controller.messages()->rowCount() == 4, "cancellation adds no spurious transcript turn");
+}
+
+void testSpeechControlsThroughQml() {
+    std::cout << "speech controls work through the shipped QML\n";
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setDiagnosticsOpen(false);
+    auto model = std::make_unique<SlowBackend>(30, 10);
+    auto* generated = model.get();
+    model->setTokenPieces({"First **clause**. ", "Next readable clause. "});
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    controller.setSpeechBackendForTesting(std::move(speech));
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the real speech control scene loads");
+    if (!scene) { return; }
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    auto* pause = scene->findChild<QQuickItem*>(QStringLiteral("speechPauseButton"));
+    auto* stop = scene->findChild<QQuickItem*>(QStringLiteral("speechStopButton"));
+    auto* skip = scene->findChild<QQuickItem*>(QStringLiteral("speechSkipButton"));
+    auto* progress = scene->findChild<QQuickItem*>(QStringLiteral("speechProgressBar"));
+    check(window && pause && stop && skip && progress, "QML exposes pause, stop, skip and progress");
+    if (!window || !pause || !stop || !skip || !progress) { return; }
+    window->resize(980, 640);
+    const auto wait = [](int ms) {
+        QEventLoop loop;
+        QTimer::singleShot(ms, &loop, &QEventLoop::quit);
+        loop.exec();
+    };
+    controller.sendMessage(QStringLiteral("read this"));
+    wait(160);
+    check(pause->isVisible() && stop->isVisible() && skip->isVisible(),
+          "playback controls are visible during live streaming speech");
+    check(voice->spoken.first() == QStringLiteral("First clause."),
+          "the actual speech engine receives cleaned prose, not Markdown");
+    check(QMetaObject::invokeMethod(pause, "clicked"), "the QML pause action activates");
+    check(controller.audioPaused() && controller.generating(), "QML pause does not cancel generation");
+    voice->finishUtterance();
+    wait(20);
+    check(progress->property("value").toDouble() > 0.0, "QML progress reflects consumed source text");
+    check(pause->property("enabled").toBool() && pause->property("text").toString() == QStringLiteral("Resume"),
+          "the button changes to an enabled resume action");
+    const auto pausedCount = voice->spoken.size();
+    check(QMetaObject::invokeMethod(pause, "clicked"), "the same QML action resumes");
+    wait(340);
+    check(voice->spoken.size() == pausedCount + 1, "QML resume starts the next clause");
+    check(QMetaObject::invokeMethod(skip, "clicked"), "the QML skip action activates");
+    wait(340);
+    check(voice->spoken.size() == pausedCount + 2, "QML skip advances playback");
+    check(QMetaObject::invokeMethod(stop, "clicked"), "the QML stop-audio action activates");
+    runTurnToCompletion(controller);
+    check(generated->tokensEmitted() == 30 && !controller.speaking(),
+          "QML stop leaves a fully generated silent written answer");
+    auto problems = kestrel::ui::auditLayouts(window->contentItem());
+    for (const auto& problem : problems) {
+        std::cout << problem.where.toStdString() << ": " << problem.what.toStdString() << '\n';
+    }
+    check(problems.isEmpty(), "speech controls do not collapse or overlap at minimum desktop size");
+
+    controller.sendMessage(QStringLiteral("another answer"));
+    wait(160);
+    problems = kestrel::ui::auditLayouts(window->contentItem());
+    check(problems.isEmpty(), "visible playback controls fit the minimum desktop layout");
+    check(QMetaObject::invokeMethod(pause, "clicked"), "audio can be paused again through QML");
+    voice->finishUtterance();
+    wait(340);
+    check(controller.canResumeSpeech(), "finished text still has resumable audio");
+    controller.stopGeneration();
+    check(!controller.audioPaused() && !controller.canResumeSpeech(),
+          "cancelling paused audio clears the QML resume state");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("new conversation works"));
+    wait(160);
+    check(controller.generating() && controller.messages()->rowCount() == 2,
+          "cancelling paused playback releases the timeline for a new conversation");
+    controller.stopGeneration();
+}
+
+void testSpokenSummaryKeepsTheWrittenAnswer() {
+    const auto run = [](bool fail) {
+        AppController controller;
+        controller.setIdleLoopEnabled(false);
+        auto model = std::make_unique<SlowBackend>(16, 0, BackendKind::LlamaCpp);
+        auto* backend = model.get();
+        const std::string sentence = "This is the detailed original answer with several facts and careful qualifications to preserve for the written conversation. ";
+        model->setTokenPieces({sentence});
+        model->setSummaryResult("Here is the remaining detail in brief.", fail);
+        controller.setBackendForTesting(std::move(model));
+        auto speech = std::make_unique<FakeSpeechBackend>();
+        auto* voice = speech.get();
+        speech->setTimerContext(&controller);
+        speech->setAutoFinish(true);
+        controller.setSpeechBackendForTesting(std::move(speech));
+        controller.sendMessage(QStringLiteral("Explain in detail"));
+        runTurnToCompletion(controller);
+        // A summary request owns the worker even after chat generation ends.
+        QElapsedTimer deadline;
+        deadline.start();
+        while ((controller.summarizingSpeech() || controller.speaking()) && deadline.elapsed() < 15000) {
+            QEventLoop step;
+            QTimer::singleShot(20, &step, &QEventLoop::quit);
+            step.exec();
+        }
+        const auto requests = backend->requests();
+        check(requests.size() == 2, "a long answer uses one separate summary request");
+        if (requests.size() == 2) {
+            const auto& prompt = requests.back().messages.back().content;
+            const auto start = prompt.find("<remaining-answer>\n");
+            const auto end = prompt.find("\n</remaining-answer>");
+            check(start != std::string::npos && end != std::string::npos,
+                  "summary source is explicitly delimited as data");
+            if (start != std::string::npos && end != std::string::npos) {
+                const auto material = prompt.substr(start + 19, end - start - 19);
+                check(material.size() < sentence.size() * 16 && !material.empty(),
+                      "the summary receives only the unspoken remainder, not the spoken opening");
+            }
+        }
+        QString expected;
+        for (int i = 0; i < 16; ++i) { expected += QString::fromStdString(sentence); }
+        const QString written = controller.messages()->data(controller.messages()->index(1, 0),
+            kestrel::app::MessageModel::ContentRole).toString();
+        check(written == expected, "a spoken adaptation never edits the original written answer");
+        check(!voice->spoken.isEmpty() && voice->spoken.first() == QString::fromStdString(sentence).trimmed(),
+              "the original opening is spoken before any summary");
+        if (fail) {
+            check(controller.ttsError().contains(QStringLiteral("deliberate test")),
+                  "summary failure is reported, not swallowed");
+            check(voice->spoken.size() == 16, "failed summary falls back to every remaining original clause");
+        } else {
+            check(voice->spoken.contains(QStringLiteral("Here is the remaining detail in brief.")),
+                  "the generated summary reaches the speech backend");
+            check(voice->spoken.size() < 16, "summary replaces, rather than repeats, the original remainder");
+        }
+        check(!controller.summarizingSpeech() && !controller.speaking(), "summary playback and worker both drain");
+        controller.stopGeneration();
+    };
+    run(false);
+    run(true);
+}
+
+void testRealModelSpokenSummaryWhenRequested() {
+    const QString path = qEnvironmentVariable("KESTREL_TEST_SPEECH_GGUF");
+    if (path.isEmpty()) { return; }
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    speech->setTimerContext(&controller);
+    // Hold the first fake utterance until generation finishes. A fake voice that
+    // auto-finishes immediately outruns a real CPU model and drains the whole
+    // answer before there is an unspoken backlog to summarize; that tests the
+    // fake playback speed rather than the summary path.
+    speech->setAutoFinish(false);
+    controller.setSpeechBackendForTesting(std::move(speech));
+    bool loaded = false;
+    QObject::connect(&controller, &AppController::modelLoadFinished, &controller, [&] { loaded = true; });
+    controller.loadModelFromUrl(QUrl::fromLocalFile(path).toString());
+    const auto wait = [](int ms) { QEventLoop loop; QTimer::singleShot(ms, &loop, &QEventLoop::quit); loop.exec(); };
+    QElapsedTimer clock;
+    clock.start();
+    while (!loaded && clock.elapsed() < 30000) { wait(20); }
+    check(loaded && controller.modelError().isEmpty() && !controller.modelPath().isEmpty(),
+          "real GGUF loads through the controller for spoken-summary verification");
+    if (!loaded || !controller.modelError().isEmpty()) { return; }
+    controller.sendMessage(QStringLiteral(
+        "Write a detailed explanation in six paragraphs, about 350 words, of why keeping personal conversations on a local computer can improve privacy. "
+        "Explain offline processing, file permissions, encryption, backups, the risks of local malware, and the need to update software. "
+        "Use plain prose only, no headings or bullet lists. Do not shorten the answer."));
+    bool streamed = false;
+    clock.restart();
+    while (controller.generating() && clock.elapsed() < 180000) {
+        streamed = streamed || !voice->spoken.isEmpty();
+        wait(20);
+    }
+    check(!controller.generating(), "real-model written generation completes within the integration deadline");
+    const QString written = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::ContentRole).toString();
+    // Generation has now completed while the first clause remains in flight.
+    // Finish clauses at explicit boundaries until the real controller launches
+    // its summary, then drain the summary through the same playback interface.
+    while (!controller.summarizingSpeech() && clock.elapsed() < 240000) {
+        if (voice->speakingNow()) { voice->finishUtterance(); }
+        else { wait(10); }
+    }
+    while ((controller.summarizingSpeech() || controller.speaking()) && clock.elapsed() < 240000) {
+        if (voice->speakingNow()) { voice->finishUtterance(); }
+        else { wait(10); }
+    }
+    std::cout << "  real spoken-summary measurement: written chars=" << written.size()
+              << " spoken clauses=" << voice->spoken.size() << " elapsed=" << clock.elapsed() << " ms\n"
+              << "  spoken adaptation: " << controller.spokenSummary().toStdString() << '\n';
+    check(streamed, "the real reply opening was spoken while its remaining text was generating");
+    check(!controller.spokenSummary().trimmed().isEmpty(), "the installed model produces a separate spoken summary");
+    check(controller.messages()->data(controller.messages()->index(1, 0),
+          kestrel::app::MessageModel::ContentRole).toString() == written,
+          "real summary generation leaves the written reply unchanged");
+    check(!controller.summarizingSpeech() && !controller.speaking(), "real summary synthesis/playback drains");
+    check(controller.ttsError().isEmpty(), "the real summary path reports no speech/summary failure");
+    controller.stopGeneration();
+}
+
+void testSummaryCancellationAndQmlControls() {
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setDiagnosticsOpen(true);
+    auto model = std::make_unique<SlowBackend>(18, 0, BackendKind::LlamaCpp);
+    auto* backend = model.get();
+    model->setTokenPieces({"A detailed written sentence that includes the facts and warnings the user needs to retain and understand correctly. "});
+    model->setSummaryResult("A concise spoken remainder.");
+    model->holdSummary(true);
+    controller.setBackendForTesting(std::move(model));
+    auto speech = std::make_unique<FakeSpeechBackend>();
+    auto* voice = speech.get();
+    speech->setTimerContext(&controller);
+    speech->setAutoFinish(true);
+    controller.setSpeechBackendForTesting(std::move(speech));
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    check(scene != nullptr, "summary and echo settings load in the actual QML");
+    if (!scene) { return; }
+    QFile mainQml(QStringLiteral(KESTREL_UI_DIR "/Main.qml"));
+    const QByteArray qmlSource = mainQml.open(QIODevice::ReadOnly | QIODevice::Text)
+        ? mainQml.readAll() : QByteArray();
+    const bool previewUiRemoved = !qmlSource.isEmpty()
+        && !qmlSource.contains("Preview") && !qmlSource.contains("usePreviewBackend");
+    check(previewUiRemoved, "the shipped QML contains no preview button or backend action");
+    auto* summary = scene->findChild<QObject*>(QStringLiteral("automaticSpeechSummaryToggle"));
+    auto* echo = scene->findChild<QObject*>(QStringLiteral("echoCancellationToggle"));
+    check(summary && echo, "QML exposes both voice preferences");
+    if (!summary || !echo) { return; }
+    const auto wait = [](int ms) { QEventLoop loop; QTimer::singleShot(ms, &loop, &QEventLoop::quit); loop.exec(); };
+    const auto waitUntil = [&wait](const auto& ready) {
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!ready() && deadline.elapsed() < 4000) { wait(20); }
+        return ready();
+    };
+    check(QMetaObject::invokeMethod(summary, "toggled"), "QML summary toggle activates");
+    check(!controller.automaticSpeechSummary(), "QML can disable automatic summaries");
+    QMetaObject::invokeMethod(summary, "toggled");
+    check(controller.automaticSpeechSummary(), "QML can enable summaries again");
+    controller.sendMessage(QStringLiteral("long answer"));
+    check(waitUntil([&] { return controller.summarizingSpeech(); }),
+          "the adaptation worker is live after the original opening");
+    controller.pauseSpeech();
+    const auto before = voice->spoken.size();
+    backend->holdSummary(false);
+    check(waitUntil([&] { return !controller.summarizingSpeech(); }),
+          "the summary worker completes while audio is paused");
+    check(controller.spokenSummary() == QStringLiteral("A concise spoken remainder.")
+              && controller.canResumeSpeech() && voice->spoken.size() == before,
+          "a summary completing during audio pause is held without starting speech");
+    controller.resumeSpeech();
+    check(waitUntil([&] { return voice->spoken.contains(QStringLiteral("A concise spoken remainder.")); }),
+          "resuming held summary audio speaks the generated adaptation");
+    controller.stopGeneration();
+
+    controller.newConversation();
+    backend->holdSummary(true);
+    controller.sendMessage(QStringLiteral("long answer to cancel"));
+    check(waitUntil([&] { return controller.summarizingSpeech(); }),
+          "another long answer starts a separate adaptation");
+    const auto count = voice->spoken.size();
+    controller.newConversation();
+    wait(100);
+    check(controller.messages()->rowCount() == 0 && !controller.summarizingSpeech() && !controller.speaking(),
+          "leaving cancels and drains the summary worker before replacing the conversation");
+    check(voice->spoken.size() == count, "a late canceled summary cannot speak in the new conversation");
+}
+
+void testEchoCancelSessionLifecycle() {
+    kestrel::app::EchoCancelSession session;
+    check(!session.active() && !session.starting(), "echo discovery does not capture at construction");
+    // Deterministically exercise missing-tool fallback without opening audio.
+    const QByteArray path = qgetenv("PATH");
+    qputenv("PATH", "/nonexistent-kestrel-tools");
+    QString error;
+    check(!session.start(error), "missing PipeWire tools refuse echo cancellation");
+    check(!error.isEmpty() && !session.active(), "missing tools produce actionable diagnostics");
+    qputenv("PATH", path);
+    if (!qEnvironmentVariableIsSet("KESTREL_TEST_ECHO_LIVE")) { return; }
+    check(session.start(error), "live echo-cancel session starts asynchronously");
+    QElapsedTimer deadline;
+    deadline.start();
+    while (session.starting() && deadline.elapsed() < 6500) {
+        QEventLoop step;
+        QTimer::singleShot(20, &step, &QEventLoop::quit);
+        step.exec();
+    }
+    std::cout << "  echo route: " << session.detail().toStdString() << '\n';
+    check(session.active(), "live PipeWire microphone and render-reference links are active");
+    check(session.captureDevice().startsWith(QStringLiteral("pipewire:NODE=")),
+          "capture is pinned to the verified clean source, not a default microphone");
+    if (session.active() && qEnvironmentVariableIsSet("KESTREL_TEST_ECHO_ACOUSTIC")) {
+        // Explicit opt-in: synthetic playback, microphone PCM in RAM only.
+        // Compare energy, but do not call a room-specific reduction a unit-test guarantee.
+        QTemporaryFile stimulus(QDir::tempPath() + QStringLiteral("/kestrel-aec-stimulus-XXXXXX.wav"));
+        check(stimulus.open(), "a temporary synthetic-only stimulus can be created");
+        QByteArray pcm;
+        QDataStream audio(&pcm, QIODevice::WriteOnly);
+        audio.setByteOrder(QDataStream::LittleEndian);
+        unsigned random = 12345;
+        for (int i = 0; i < 6 * 48000; ++i) {
+            random = random * 1664525u + 1013904223u;
+            const double noise = static_cast<double>((random >> 16) & 65535u) / 32768.0 - 1.0;
+            const double envelope = 0.5 + 0.5 * std::sin(static_cast<double>(i) * 0.0007);
+            audio << static_cast<qint16>(noise * envelope * 2200.0);
+        }
+        QDataStream wav(&stimulus);
+        wav.setByteOrder(QDataStream::LittleEndian);
+        wav.writeRawData("RIFF", 4); wav << static_cast<quint32>(36 + pcm.size());
+        wav.writeRawData("WAVEfmt ", 8); wav << quint32(16) << quint16(1) << quint16(1)
+            << quint32(48000) << quint32(96000) << quint16(2) << quint16(16);
+        wav.writeRawData("data", 4); wav << static_cast<quint32>(pcm.size());
+        wav.writeRawData(pcm.constData(), static_cast<int>(pcm.size()));
+        stimulus.flush();
+        QProcess raw, clean, playback;
+        // Use the same ALSA/PipeWire route and 16 kHz PCM as the app. pw-record
+        // on this host exits 1 at sample-count completion even with full data,
+        // so use arecord's explicit duration rather than accepting error codes.
+        const QStringList arguments{QStringLiteral("-q"), QStringLiteral("-t"), QStringLiteral("raw"),
+            QStringLiteral("-f"), QStringLiteral("S16_LE"), QStringLiteral("-r"), QStringLiteral("16000"),
+            QStringLiteral("-c"), QStringLiteral("1"), QStringLiteral("-d"), QStringLiteral("7"), QStringLiteral("-")};
+        raw.start(QStringLiteral("arecord"), QStringList{QStringLiteral("-D"), QStringLiteral("default")} + arguments);
+        clean.start(QStringLiteral("arecord"), QStringList{QStringLiteral("-D"), session.captureDevice()} + arguments);
+        check(raw.waitForStarted(1000) && clean.waitForStarted(1000), "raw and echo-canceled capture start concurrently");
+        QByteArray rawAudio, cleanAudio;
+        QElapsedTimer elapsed;
+        elapsed.start();
+        bool played = false;
+        while (elapsed.elapsed() < 9000 && (raw.state() != QProcess::NotRunning || clean.state() != QProcess::NotRunning)) {
+            if (!played && elapsed.elapsed() >= 500) {
+                playback.start(QStringLiteral("pw-play"), {QStringLiteral("--volume"), QStringLiteral("0.5"), stimulus.fileName()});
+                played = true;
+            }
+            rawAudio += raw.readAllStandardOutput();
+            cleanAudio += clean.readAllStandardOutput();
+            QEventLoop step;
+            QTimer::singleShot(20, &step, &QEventLoop::quit);
+            step.exec();
+        }
+        rawAudio += raw.readAllStandardOutput();
+        cleanAudio += clean.readAllStandardOutput();
+        std::cout << "  capture status: raw=" << raw.exitCode() << " clean=" << clean.exitCode()
+                  << " raw bytes=" << rawAudio.size() << " clean bytes=" << cleanAudio.size()
+                  << " raw error=" << raw.readAllStandardError().toStdString()
+                  << " clean error=" << clean.readAllStandardError().toStdString() << '\n';
+        check(raw.state() == QProcess::NotRunning && raw.exitCode() == 0
+              && clean.state() == QProcess::NotRunning && clean.exitCode() == 0,
+              "both bounded capture processes complete without device errors");
+        check(playback.state() == QProcess::NotRunning && playback.exitCode() == 0,
+              "synthetic playback completes while microphone capture is running");
+        for (auto* process : {&raw, &clean, &playback}) {
+            if (process->state() != QProcess::NotRunning) { process->kill(); process->waitForFinished(1000); }
+        }
+        const auto energy = [](const QByteArray& data) {
+            double sum = 0;
+            const auto samples = data.size() / static_cast<qsizetype>(sizeof(qint16));
+            for (qsizetype i = samples / 2; i < samples; ++i) {
+                qint16 sample = 0;
+                std::memcpy(&sample, data.constData() + i * static_cast<qsizetype>(sizeof(qint16)), sizeof(qint16));
+                const double value = static_cast<double>(sample) / 32768.0;
+                sum += value * value;
+            }
+            return samples > 0 ? sum / static_cast<double>(samples - samples / 2) : -1.0;
+        };
+        const double rawEnergy = energy(rawAudio), cleanEnergy = energy(cleanAudio);
+        check(rawAudio.size() >= 16000 * 2 && cleanAudio.size() >= 16000 * 2
+              && rawEnergy >= 0 && cleanEnergy >= 0, "both real capture paths deliver finite PCM without saving microphone recordings");
+        if (rawEnergy > 0 && cleanEnergy > 0) {
+            std::cout << "  acoustic measurement: raw RMS=" << std::sqrt(rawEnergy)
+                      << " clean RMS=" << std::sqrt(cleanEnergy)
+                      << " energy reduction=" << 10.0 * std::log10(rawEnergy / cleanEnergy)
+                      << " dB; duration=" << elapsed.elapsed() << " ms (not isolated ERLE or double-talk certification)\n";
+        }
+    }
+    session.stop();
+    check(!session.active() && session.captureDevice().isEmpty(), "stop releases the active echo route");
+#if defined(__linux__)
+    // Exercise the same app/microphone interface a user activates, with a
+    // bounded live recording canceled before any audio is saved or transcribed.
+    const QByteArray mock = qgetenv("KESTREL_SPEECH_INPUT");
+    qputenv("KESTREL_SPEECH_INPUT", "platform");
+    {
+        AppController controller;
+        controller.setIdleLoopEnabled(false);
+        useImmediateModel(controller);
+        auto speech = std::make_unique<FakeSpeechBackend>();
+        controller.setSpeechBackendForTesting(std::move(speech));
+        const QString model = qEnvironmentVariable("KESTREL_TEST_WHISPER_MODEL");
+        if (!model.isEmpty()) {
+            check(controller.applyDictationSettings(model, QStringLiteral("default")),
+                  "the controller selects real Whisper and default PipeWire capture");
+            controller.sendMessage(QStringLiteral("keep speaking while recording"));
+            QEventLoop settle; QTimer::singleShot(200, &settle, &QEventLoop::quit); settle.exec();
+            check(controller.startListening(), "the app starts echo-canceled listening during speech");
+            deadline.restart();
+            while (!controller.echoCancellationActive() && controller.listening() && deadline.elapsed() < 6000) {
+                QEventLoop step; QTimer::singleShot(20, &step, &QEventLoop::quit); step.exec();
+            }
+            check(controller.echoCancellationActive() && controller.listening() && controller.speaking(),
+                  "the actual controller keeps speech and echo-canceled capture live simultaneously");
+            QEventLoop capture; QTimer::singleShot(500, &capture, &QEventLoop::quit); capture.exec();
+            controller.abandonListening();
+            check(!controller.listening() && !controller.echoCancellationActive(),
+                  "the user microphone-stop path disables capture and the echo route");
+            check(controller.messages()->rowCount() == 2, "canceling live capture does not invent another user message");
+            controller.stopGeneration();
+        }
+    }
+    qputenv("KESTREL_SPEECH_INPUT", mock);
+#endif
+}
+
+void testSendingWithoutModelReportsActionableError() {
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    if (controller.runtimeAvailable()) {
+        return;
+    }
+    controller.sendMessage(QStringLiteral("do not pretend to answer"));
+    check(controller.messages()->rowCount() == 0,
+          "a missing local model does not create a fake conversation turn");
+    check(controller.modelError().contains(QStringLiteral("Load a GGUF")),
+          "a missing local model produces a clear load-model instruction");
+}
+
+void testDiagnosticsPreferencePersists() {
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.remove(QStringLiteral("ui/diagnosticsOpen"));
+    settings.sync();
+    { AppController controller;
+      check(controller.diagnosticsOpen(), "diagnostics start open on first launch");
+      controller.setDiagnosticsOpen(false); }
+    { AppController controller;
+      check(!controller.diagnosticsOpen(), "closing diagnostics persists across controllers");
+      controller.setDiagnosticsOpen(true); }
+    { AppController controller;
+      check(controller.diagnosticsOpen(), "reopening diagnostics persists too"); }
 }
 
 // The pace a clause was synthesised at has to be the pace of the persona its
@@ -1592,7 +2246,8 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     kestrel::app::AppController controller;
     controller.setIdleLoopEnabled(false);
     // Slow enough that the turn is still running when the second message lands.
-    auto backend = std::make_unique<SlowBackend>(400, 1);
+    auto backend = std::make_unique<SlowBackend>(8, 50);
+    backend->setTokenPieces({"A complete spoken clause. "});
     controller.setBackendForTesting(std::move(backend));
     auto speech = std::make_unique<FakeSpeechBackend>();
     FakeSpeechBackend* observed = speech.get();
@@ -1607,7 +2262,7 @@ void testBargeInStopsAudioAtAClauseBoundary() {
     controller.sendMessage(QStringLiteral("actually, second question"));
     check(observed->boundaryStops == 1, "a barge-in asks for a boundary stop");
     check(observed->immediateStops == 0, "a barge-in does not cut the clause in flight");
-    check(observed->spoken.size() >= 1, "the acknowledgement cue was spoken");
+    check(observed->spoken.size() >= 1, "an actual answer clause was spoken");
     check(controller.speaking(), "the replacement response waits for the old clause boundary");
     check(observed->boundaryStops == 1,
           "the replacement does not mistake the old clause completion for its own");
@@ -1681,9 +2336,176 @@ void testPreviewInputRequiresExplicitOptIn() {
     qunsetenv("KESTREL_SPEECH_INPUT");
     check(!controller.startListening(), "preview input requires explicit mock selection");
     check(controller.listenError() == controller.sttDetail(), "refusal reports speech detail");
+    check(controller.sttDetail().contains(QStringLiteral("preview"), Qt::CaseInsensitive),
+          "automatic fallback is identified as preview only");
+#if defined(__linux__)
+    check(controller.sttDetail().contains(QStringLiteral("Whisper"), Qt::CaseInsensitive),
+          "Linux dictation explains its offline Whisper setup");
+#endif
     check(!controller.listening(), "refusing preview input leaves listening stopped");
+    check(controller.messages()->rowCount() == 0, "refusal never invents a user message");
     qputenv("KESTREL_SPEECH_INPUT", "mock");
 }
+
+#if defined(__linux__)
+void testLinuxDictationSettings() {
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    QTemporaryFile model(QDir::tempPath() + QStringLiteral("/Whisper model XXXXXX.bin"));
+    check(model.open(), "a local model path with spaces is available");
+    const QString url = QUrl::fromLocalFile(model.fileName()).toString();
+    {
+        AppController controller;
+        check(controller.linuxDictationSettings(), "Linux exposes dictation settings even without SDKs");
+        check(controller.dictationMicrophones().contains(QStringLiteral("default")), "the default ALSA route is always selectable");
+        check(!controller.applyDictationSettings(QStringLiteral("https://example.com/model.bin"), QStringLiteral("default")),
+              "remote model URLs are refused without downloading");
+        check(!controller.applyDictationSettings(model.fileName() + QStringLiteral(".missing"), QStringLiteral("default")),
+              "missing local models are refused");
+        check(!controller.dictationSettingsError().isEmpty(), "invalid settings report an actionable error");
+        check(controller.startListening(), "preview session starts for the active-session guard");
+        check(!controller.applyDictationSettings(url, QStringLiteral("custom_capture")), "settings cannot discard an active phrase");
+        check(controller.listening(), "refused settings leave the active session alone");
+        controller.abandonListening();
+        const QByteArray before = qgetenv("KESTREL_AUDIO_DEVICE");
+        check(controller.applyDictationSettings(url, QStringLiteral("custom_capture")), "local file URLs and custom ALSA routes are accepted");
+        check(controller.dictationModelPath() == model.fileName(), "percent-encoded model URLs become local paths");
+        check(controller.dictationAudioDevice() == QStringLiteral("custom_capture"), "the custom microphone is selected");
+        check(controller.dictationSettingsError().isEmpty(), "successful apply clears validation errors");
+        check(qgetenv("KESTREL_AUDIO_DEVICE") == before, "desktop settings never mutate process-global environment");
+    }
+    {
+        AppController restored;
+        check(restored.dictationModelPath() == model.fileName(), "the model survives a new controller");
+        check(restored.dictationAudioDevice() == QStringLiteral("custom_capture"), "the microphone survives a new controller");
+        check(restored.dictationMicrophones().contains(QStringLiteral("custom_capture")), "a saved custom route remains selectable");
+        check(restored.applyDictationSettings(QString(), QString()), "clearing the model disables dictation");
+        check(!restored.sttAvailable(), "an empty model is not reported as ready");
+        check(restored.dictationAudioDevice() == QStringLiteral("default"), "an empty device restores the default route");
+    }
+    settings.clear();
+}
+
+void testLinuxDictationSettingsDialog() {
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setDiagnosticsOpen(true);
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the shipped Main.qml loads");
+    if (!scene) { return; }
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    auto* button = scene->findChild<QQuickItem*>(QStringLiteral("dictationSettingsButton"));
+    auto* dialog = scene->findChild<QObject*>(QStringLiteral("dictationSettingsDialog"));
+    auto* field = scene->findChild<QObject*>(QStringLiteral("dictationModelField"));
+    auto* device = scene->findChild<QObject*>(QStringLiteral("dictationDeviceField"));
+    auto* apply = scene->findChild<QObject*>(QStringLiteral("dictationApplyButton"));
+    check(window && button && dialog && field && device && apply, "the runtime panel exposes every dictation control");
+    if (!window || !button || !dialog || !field || !device || !apply) { return; }
+    QEventLoop layout;
+    QTimer::singleShot(100, &layout, &QEventLoop::quit);
+    layout.exec();
+    check(button->isVisible() && button->width() > 0 && button->height() > 0, "the settings entry is visible and laid out");
+    check(kestrel::ui::auditLayouts(window->contentItem()).isEmpty(), "adding settings does not collapse the runtime panel's other controls");
+    check(QMetaObject::invokeMethod(button, "clicked"), "the runtime settings button can be activated");
+    QCoreApplication::processEvents();
+    check(dialog->property("visible").toBool(), "activation opens the real settings dialog");
+    field->setProperty("text", QStringLiteral("/missing/whisper-model.bin"));
+    check(QMetaObject::invokeMethod(apply, "clicked"), "the dialog apply action can be activated");
+    check(!controller.dictationSettingsError().isEmpty(), "invalid dialog input reaches controller validation");
+    QTemporaryFile model(QDir::tempPath() + QStringLiteral("/UI Whisper XXXXXX.bin"));
+    check(model.open(), "a model path for the UI is available");
+    field->setProperty("text", QUrl::fromLocalFile(model.fileName()).toString());
+    device->setProperty("editText", QStringLiteral("ui_capture"));
+    check(QMetaObject::invokeMethod(apply, "clicked"), "valid settings can be applied through the dialog");
+    check(controller.dictationModelPath() == model.fileName() && controller.dictationAudioDevice() == QStringLiteral("ui_capture"),
+          "the actual QML controls select the model and microphone");
+    check(controller.dictationSettingsError().isEmpty(), "the dialog clears its previous validation error");
+    window->resize(980, 640);
+    QEventLoop resized;
+    QTimer::singleShot(100, &resized, &QEventLoop::quit);
+    resized.exec();
+    auto* popup = qobject_cast<QQuickItem*>(dialog->property("contentItem").value<QObject*>());
+    check(popup && popup->height() > 0 && popup->height() < window->height(), "dictation content fits the minimum desktop height");
+    const auto problems = kestrel::ui::auditLayouts(window->contentItem());
+    for (const auto& problem : problems) {
+        std::cout << problem.where.toStdString() << ": " << problem.what.toStdString() << '\n';
+    }
+    check(problems.isEmpty(), "the dialog and runtime panel have no collapsed or overlapping cells at minimum size");
+    settings.clear();
+}
+
+void testRealLinuxDictationThroughControllerWhenAsked() {
+    const QByteArray model = qgetenv("KESTREL_TEST_WHISPER_MODEL");
+    const QByteArray device = qgetenv("KESTREL_TEST_ALSA_DEVICE");
+    if (model.isEmpty() || device.isEmpty()) { return; }
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    settings.clear();
+    qputenv("KESTREL_SPEECH_INPUT", "platform");
+    {
+        kestrel::app::AppController controller;
+        controller.setIdleLoopEnabled(false);
+        controller.setBackendForTesting(std::make_unique<kestrel::runtime::MockBackend>());
+        check(controller.applyDictationSettings(QUrl::fromLocalFile(QString::fromUtf8(model)).toString(), QString::fromUtf8(device)),
+              "desktop settings select real Whisper weights and prerecorded ALSA capture");
+        check(controller.sttAvailable(), "configured native offline dictation is available");
+        check(controller.startListening(), "controller starts real prerecorded ALSA/Whisper dictation");
+        QElapsedTimer deadline;
+        deadline.start();
+        while (controller.messages()->rowCount() == 0 && deadline.elapsed() < 15000) {
+            QEventLoop step;
+            QTimer::singleShot(10, &step, &QEventLoop::quit);
+            step.exec();
+        }
+        check(controller.messages()->rowCount() >= 2, "real dictated audio starts a conversation turn");
+        if (controller.messages()->rowCount() > 0) {
+            const QString heard = controller.messages()->data(controller.messages()->index(0, 0),
+                kestrel::app::MessageModel::ContentRole).toString();
+            check(heard.contains(QStringLiteral("country"), Qt::CaseInsensitive),
+                  "Whisper's recognized words reach the visible user message");
+        }
+        controller.abandonListening();
+        controller.stopGeneration();
+    }
+    settings.clear();
+    qputenv("KESTREL_SPEECH_INPUT", "mock");
+}
+
+void testLinuxRecognizerReachesListenSession() {
+    class RecordedCapture final : public kestrel::runtime::SpeechCapture {
+    public:
+        bool capture(std::vector<float>& samples, const kestrel::runtime::SpeechCancelled&,
+                     std::string&) override { samples.assign(16000, 0.1F); return true; }
+    };
+    class RecordedTranscriber final : public kestrel::runtime::SpeechTranscriber {
+    public:
+        bool transcribe(const std::vector<float>&, const kestrel::runtime::SpeechCancelled&,
+                        std::string& text, std::string&) override {
+            text = "local Linux phrase"; return true;
+        }
+    };
+    kestrel::runtime::LinuxSpeechRecognizer recognizer(
+        [] { return std::make_unique<RecordedCapture>(); },
+        [] { return std::make_unique<RecordedTranscriber>(); });
+    kestrel::app::ListenSession session(recognizer);
+    QString heard;
+    QEventLoop wait;
+    QObject::connect(&session, &kestrel::app::ListenSession::utteranceFinal, &wait,
+                     [&](const QString& text, double confidence) { heard = text; check(confidence == 0.0, "no invented Whisper confidence"); });
+    QObject::connect(&session, &kestrel::app::ListenSession::listeningEnded, &wait, &QEventLoop::quit);
+    QTimer::singleShot(2000, &wait, &QEventLoop::quit);
+    QString error;
+    check(session.startListening(error), "native Linux recognizer starts through ListenSession");
+    wait.exec();
+    check(heard == QStringLiteral("local Linux phrase"), "worker transcript reaches the Qt listening interface");
+    check(!session.listening(), "native phrase completion ends the UI listening session");
+}
+#endif
 
 #if KESTREL_HAS_QT_MULTIMEDIA
 class PendingSpeechBackend final : public kestrel::app::LocalModelSpeechBackend {
@@ -1774,8 +2596,8 @@ void testSpokenPhraseTakesTheTypedPath() {
                                       kestrel::app::MessageModel::ContentRole)
               .toString().contains(QStringLiteral("tensorrt"), Qt::CaseInsensitive),
           "the spoken words are in the transcript as a user message");
-    check(!controller.acknowledgement().isEmpty(),
-          "a spoken request is acknowledged exactly like a typed one");
+    check(controller.acknowledgement().isEmpty(),
+          "a spoken request begins with its answer, not a stock cue");
     controller.stopGeneration();
 }
 
@@ -1808,7 +2630,16 @@ int main(int argc, char** argv) {
     // turns a five-second diagnosis into a guess about which test died.
     std::cout << std::unitbuf;
 
-    QCoreApplication app(argc, argv);
+    QTemporaryDir configuration;
+    if (!configuration.isValid()) { return 1; }
+    qputenv("XDG_CONFIG_HOME", configuration.path().toUtf8());
+    QGuiApplication app(argc, argv);
+    // Match main.cpp: the shipped QML customizes controls, which native styles
+    // do not support. Exercise the same style as the desktop application.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+    // Do not read or overwrite the developer's actual desktop preferences.
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, configuration.path());
 
     // Pin the recognizer. The app picks one for the machine it runs on -- SAPI 5
     // when there is a microphone, the scripted preview recognizer when there is
@@ -1816,6 +2647,11 @@ int main(int argc, char** argv) {
     // barge-in, which only the scripted one produces. Without this, plugging in
     // a microphone would change what the suite means.
     qputenv("KESTREL_SPEECH_INPUT", "mock");
+
+    if (qEnvironmentVariableIsSet("KESTREL_TEST_SPEECH_GGUF")) {
+        testRealModelSpokenSummaryWhenRequested();
+        return failures == 0 ? 0 : 1;
+    }
 
     testListenSessionIgnoresQueuedCallbacksFromPreviousSession();
     testGenerationRunsOffCallingThread();
@@ -1827,6 +2663,16 @@ int main(int argc, char** argv) {
     testSendMessageProducesAReply();
     testResumeUsesPartialAssistantPrompt();
     testModelLoadReportsAsynchronously();
+    testRuntimeDiagnosticsIdentifyTheActiveBackend();
+    testSendingWithoutModelReportsActionableError();
+    testDiagnosticsPreferencePersists();
+    testEchoCancelSessionLifecycle();
+    testSpokenSummaryKeepsTheWrittenAnswer();
+    testSummaryCancellationAndQmlControls();
+    testAudioControlsDoNotCancelGeneration();
+    testSpeechControlsThroughQml();
+    testRecognizedAcknowledgementAndHeldInterruption();
+    testSpokenPlaybackCommands();
     testPresenceAndIdleLoopProject();
     testLongAnswerIsOfferedToContinue();
     testIdleToolNeedsPermissionBeforeItRuns();
@@ -1834,16 +2680,22 @@ int main(int argc, char** argv) {
     testSpokenResponseFollowsClauseOrder();
     testBargeInStopsAudioAtAClauseBoundary();
     testWarmthReachesTheVoice();
-    testReplyOwedAudioIsSpokenWhenTheVoiceArrives();
+    testLoadingVoiceLeavesTheCurrentReplySilent();
     testReplyIsDeliveredAsTextWhenTheVoiceNeverArrives();
     testPaceIsCommittedWhereTheAudioIsAskedFor();
     testTheEngineIsAskedForClausesInTheOrderTheyAreSpoken();
     testLeavingAConversationDropsTheReplyItWasHolding();
     testStoppingDropsAReplyHeldForAVoice();
     testAReplySentMidSpeechTakesItsOwnWarmth();
-    testAHeldReplyGivesUpIfTheVoiceNeverArrives();
+    testLoadingVoiceReportsTextOnlyWithoutWaiting();
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testPreviewInputRequiresExplicitOptIn();
+#if defined(__linux__)
+    testLinuxRecognizerReachesListenSession();
+    testLinuxDictationSettings();
+    testLinuxDictationSettingsDialog();
+    testRealLinuxDictationThroughControllerWhenAsked();
+#endif
 #if KESTREL_HAS_QT_MULTIMEDIA
     testSpeakingAdoptsPendingPrefetch();
 #endif

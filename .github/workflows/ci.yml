@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, linux]
   pull_request:
   workflow_dispatch:
 
@@ -286,18 +286,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y desktop-file-utils appstream
 
-      - name: Configure
+      - name: Build, test and install the native Linux desktop
         run: |
-          cmake -S . -B build \
-            -DKESTREL_BUILD_UI=ON \
-            -DKESTREL_BUILD_TESTS=ON \
+          bash scripts/build-linux.sh --build-dir build \
+            --install-prefix "$RUNNER_TEMP/kestrel" -- \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
-      - name: Build
-        run: cmake --build build --config Release
+      - name: Optional audio modules can be absent
+        run: |
+          bash scripts/build-linux.sh --build-dir build-noaudio -- \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt6TextToSpeech=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt6Multimedia=ON \
+            -DKESTREL_ENABLE_LINUX_SPEECH=OFF
+          env -u DISPLAY -u WAYLAND_DISPLAY -u QT_QPA_PLATFORM \
+            ./build-noaudio/kestrel --print-runtime
 
-      - name: Install into a staging prefix
-        run: cmake --install build --prefix "$RUNNER_TEMP/kestrel"
+      - name: An incomplete llama.cpp prefix degrades without a link failure
+        run: |
+          FAKE="$RUNNER_TEMP/llama-headers-only"
+          mkdir -p "$FAKE/include"
+          touch "$FAKE/include/llama.h"
+          bash scripts/build-linux.sh --core-only --build-dir build-no-llama -- \
+            -DCMAKE_DISABLE_FIND_PACKAGE_llama=ON \
+            -DKESTREL_LLAMA_CPP_ROOT="$FAKE"
+
+      - name: A required desktop cannot silently skip Qt
+        run: |
+          if cmake -S . -B build-noqt \
+              -DKESTREL_BUILD_UI=ON -DKESTREL_REQUIRE_UI=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_Qt6=ON > noqt.log 2>&1; then
+            cat noqt.log
+            echo "::error::a required desktop build accepted missing Qt"
+            exit 1
+          fi
+          cat noqt.log
+          grep -q 'Kestrel desktop requires Qt 6.6+' noqt.log
 
       # The llama.cpp path is opt-in, so nothing above exercises it and a
       # mistake in it would ship silently. Configuring against a stub prefix is

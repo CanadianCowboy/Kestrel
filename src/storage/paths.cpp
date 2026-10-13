@@ -44,12 +44,14 @@ std::filesystem::path userDataDirectory() {
         return std::filesystem::path(home) / "Library" / "Application Support" / "Kestrel";
 #else
         std::string base = environment("XDG_DATA_HOME");
-        if (base.empty()) {
-            const std::string home = environment("HOME");
-            if (home.empty()) {
+        // XDG base directories must be absolute. A relative value is invalid,
+        // not permission to write private state into the launch directory.
+        if (!std::filesystem::path(base).is_absolute()) {
+            const std::filesystem::path home = environment("HOME");
+            if (!home.is_absolute()) {
                 return std::filesystem::path();
             }
-            base = home + "/.local/share";
+            return home / ".local" / "share" / "kestrel";
         }
         return std::filesystem::path(base) / "kestrel";
 #endif

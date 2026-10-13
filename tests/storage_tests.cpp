@@ -76,6 +76,14 @@ public:
     ScopedEnvironment(const ScopedEnvironment&) = delete;
     ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
 
+    void set(const std::string& value) {
+#if defined(_WIN32)
+        check(::_putenv_s(m_name.c_str(), value.c_str()) == 0, "set test environment");
+#else
+        check(::setenv(m_name.c_str(), value.c_str(), 1) == 0, "set test environment");
+#endif
+    }
+
 private:
     void clear() {
 #if defined(_WIN32)
@@ -416,6 +424,30 @@ void testPlatformStoreRefusesWithoutAHomeDirectory() {
 #endif
 }
 
+void testXdgDataDirectoryMustBeAbsolute() {
+#if !defined(_WIN32) && !defined(__APPLE__)
+    ScopedEnvironment xdg("XDG_DATA_HOME");
+    ScopedEnvironment home("HOME");
+    home.set("/tmp/kestrel-test-home");
+    const fs::path fallback = "/tmp/kestrel-test-home/.local/share/kestrel";
+    check(storage::userDataDirectory() == fallback, "unset XDG uses the home data directory");
+    xdg.set("");
+    check(storage::userDataDirectory() == fallback, "empty XDG uses the home data directory");
+    xdg.set("relative-data");
+    check(storage::userDataDirectory() == fallback, "relative XDG is ignored");
+    xdg.set("../private-data");
+    check(storage::userDataDirectory() == fallback, "relative parent XDG is ignored");
+    xdg.set("/tmp/kestrel-test-data");
+    check(storage::userDataDirectory() == fs::path("/tmp/kestrel-test-data/kestrel"),
+          "absolute XDG overrides HOME");
+    home.set("relative-home");
+    check(storage::userDataDirectory().is_absolute(), "valid XDG does not require HOME");
+    xdg.set("relative-data");
+    check(storage::userDataDirectory().empty(), "relative HOME and XDG cannot persist");
+    check(storage::sealedBlobDirectory().empty(), "invalid roots cannot create sealed paths");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -425,6 +457,7 @@ int main() {
     testInMemoryStoreContract();
     testPlatformStore();
     testPlatformStoreRefusesWithoutAHomeDirectory();
+    testXdgDataDirectoryMustBeAbsolute();
 
     if (g_failures == 0) {
         std::cout << "storage tests passed\n";
