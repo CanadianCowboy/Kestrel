@@ -130,11 +130,13 @@ ApplicationWindow {
     // The memory panel and the runtime panel share the right-hand edge, so only
     // one of them is open at a time.
     property bool memoryOpen: false
-    onMemoryOpenChanged: if (memoryOpen) { appController.diagnosticsOpen = false; window.activityOpen = false; browserPanel.open = false }
+    onMemoryOpenChanged: if (memoryOpen) { appController.diagnosticsOpen = false; window.activityOpen = false; browserPanel.open = false; paperLibrary.open = false }
     // The activity panel shows tool calls and their results. It shares the same
     // right-hand edge, so it is exclusive with the other side panels.
     property bool activityOpen: false
-    onActivityOpenChanged: if (activityOpen) { window.memoryOpen = false; appController.diagnosticsOpen = false; browserPanel.open = false }
+    // Why the last paper could not be added, shown in the paper panel.
+    property string paperError: ""
+    onActivityOpenChanged: if (activityOpen) { window.memoryOpen = false; appController.diagnosticsOpen = false; browserPanel.open = false; paperLibrary.open = false }
     Connections {
         target: appController
         function onDiagnosticsOpenChanged() {
@@ -142,12 +144,26 @@ ApplicationWindow {
                 window.memoryOpen = false
                 window.activityOpen = false
                 browserPanel.open = false
+                paperLibrary.open = false
             }
         }
     }
     Shortcut { sequence: "Ctrl+M"; onActivated: window.memoryOpen = !window.memoryOpen }
     Shortcut { sequence: "Ctrl+Shift+A"; onActivated: window.activityOpen = !window.activityOpen }
     Shortcut { sequence: "Ctrl+Shift+B"; onActivated: browserPanel.open = !browserPanel.open }
+    Shortcut { sequence: "Ctrl+Shift+P"; onActivated: paperLibrary.open = !paperLibrary.open }
+    // Opening a paper closes the other side panels, the same way they close each other.
+    Connections {
+        target: paperLibrary
+        function onOpenChanged() {
+            if (paperLibrary.open) {
+                window.memoryOpen = false
+                window.activityOpen = false
+                appController.diagnosticsOpen = false
+                browserPanel.open = false
+            }
+        }
+    }
     // Opening the browser closes the other side panels, the same way they close each other.
     Connections {
         target: browserPanel
@@ -156,6 +172,7 @@ ApplicationWindow {
                 window.memoryOpen = false
                 window.activityOpen = false
                 appController.diagnosticsOpen = false
+                paperLibrary.open = false
             }
         }
     }
@@ -428,6 +445,28 @@ ApplicationWindow {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: browserPanel.open = !browserPanel.open
+                        }
+                    }
+                    Rectangle {
+                        id: paperBadge
+                        implicitWidth: 96
+                        implicitHeight: 34
+                        radius: 17
+                        color: paperLibrary.open ? "#1e2a26" : "#17221f"
+                        border.color: paperLibrary.papers.length > 0 ? "#2d463d" : "#3a3038"
+                        Accessible.name: "Open paper panel"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "PAPERS"
+                            color: paperLibrary.papers.length > 0 ? window.accent : "#b5909c"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: paperLibrary.open = !paperLibrary.open
                         }
                     }
                     Rectangle {
@@ -898,6 +937,122 @@ ApplicationWindow {
         // Runtime diagnostics live in a secondary panel, never in the
         // conversation flow, so the main workspace stays quiet as the runtime
         // layer grows.
+        // Research papers the user or the agent opened. Each paper is a PDF rendered
+        // with Qt PDF, and the viewer loads only while this panel is open.
+        Rectangle {
+            id: paperSidePanel
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            anchors.margins: 18
+            width: 620
+            radius: 18
+            color: "#15171c"
+            border.color: window.line
+            visible: paperLibrary.open
+            opacity: paperLibrary.open ? 1 : 0
+            clip: true
+
+            Behavior on opacity {
+                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text {
+                        text: "Papers"
+                        color: window.ink
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                    }
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        objectName: "addPaperButton"
+                        text: "Add PDF…"
+                        enabled: paperLibrary.pdfAvailable
+                        onClicked: paperFileDialog.open()
+                    }
+                    Rectangle {
+                        implicitWidth: 26
+                        implicitHeight: 26
+                        radius: 13
+                        color: "#1d2026"
+                        border.color: window.line
+                        Accessible.name: "Close paper panel"
+                        Text { anchors.centerIn: parent; text: "×"; color: window.ink; font.pixelSize: 14 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: paperLibrary.open = false
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    visible: text.length > 0
+                    text: !paperLibrary.pdfAvailable
+                        ? "Research papers need Qt PDF, which is not in this build of Kestrel."
+                        : window.paperError
+                    color: "#b5909c"
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                ListView {
+                    id: paperList
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(contentHeight, 150)
+                    clip: true
+                    spacing: 6
+                    model: paperLibrary.papers
+                    delegate: Rectangle {
+                        width: paperList.width
+                        height: 36
+                        radius: 10
+                        color: index === paperLibrary.currentIndex ? "#1e2a26" : "#1d2026"
+                        border.color: window.line
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.leftMargin: 12
+                            anchors.rightMargin: 12
+                            text: modelData.title
+                            color: window.ink
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: paperLibrary.showPaper(index)
+                        }
+                    }
+                }
+
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    active: paperLibrary.open && paperLibrary.pdfAvailable && paperLibrary.currentIndex >= 0
+                    source: "PaperView.qml"
+                }
+            }
+
+            FileDialog {
+                id: paperFileDialog
+                title: "Open a research paper"
+                nameFilters: ["PDF papers (*.pdf)"]
+                onAccepted: window.paperError = paperLibrary.addLocalFile(selectedFile)
+            }
+        }
+
         // The page the agent or the user opened. The engine is loaded only while the
         // panel is open. Without Qt WebEngine in this build, the panel says so and
         // pages open in the default browser instead.

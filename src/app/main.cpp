@@ -26,6 +26,7 @@
 
 #include "app/appcontroller.h"
 #include "app/browsertools.h"
+#include "app/paperlibrary.h"
 #include "app/privilegedapproval.h"
 #include "app/privilegedcommand.h"
 #include "app/shellcommand.h"
@@ -420,6 +421,8 @@ int main(int argc, char* argv[]) {
     // pending admin prompt and a pending command never answer each other.
     kestrel::app::PrivilegedApprovalBroker shellBroker;
     kestrel::app::BrowserPanel browserPanel;
+    // Research papers the user or the agent has opened, shown in the paper panel.
+    kestrel::app::PaperLibrary paperLibrary;
 
 #if KESTREL_HAS_MCP_SERVER
     // Background MCP endpoint for other local agents. Opt-in: nothing listens
@@ -659,6 +662,34 @@ int main(int argc, char* argv[]) {
             kestrel::app::readWebPage(networkAccess, QString::fromUtf8(std::string(*url->asString()).c_str()),
                                       std::move(done));
         }});
+    // Research papers. A web address is downloaded as a PDF; the agent cannot
+    // name a file on this computer, only a paper the user already has open. It
+    // needs the same Network permission as the other web tools.
+    mcpDispatcher.addTool({
+        "open_paper",
+        "Show a research paper in Kestrel's paper panel. Pass the web address of a PDF, or the title of a paper the user already has open. Arguments: source (string).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [&paperLibrary](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* source = args.find("source");
+            if (source == nullptr || !source->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"source\"."});
+                return;
+            }
+            const QString text = QString::fromUtf8(std::string(*source->asString()).c_str());
+            if (text.startsWith(QStringLiteral("http://")) || text.startsWith(QStringLiteral("https://"))) {
+                paperLibrary.openWeb(networkAccess, text, std::move(done));
+                return;
+            }
+            const int index = paperLibrary.indexOfTitle(text);
+            if (index < 0) {
+                done(kestrel::core::McpToolResult{true,
+                                                  "No open paper has that title. Pass the web address of a PDF instead."});
+                return;
+            }
+            paperLibrary.showPaper(index);
+            done(kestrel::core::McpToolResult{false, "Showing \"" + text.toStdString() + "\" in the paper panel."});
+        }});
     // KESTREL_MCP_ALLOW_TOOLS is "1" to enable every chat tool, or a comma-separated
     // list of tool names to enable only those. Each enabled tool still needs its
     // permission, and the permissions below are granted only for the tools chosen.
@@ -669,7 +700,8 @@ int main(int argc, char* argv[]) {
                           QStringLiteral("tavily_extract"), QStringLiteral("tavily_map"),
                           QStringLiteral("tavily_crawl"), QStringLiteral("tavily_research"),
                           QStringLiteral("browser_open"), QStringLiteral("browser_read"),
-                          QStringLiteral("run_shell_command")}
+                          QStringLiteral("run_shell_command"),
+                          QStringLiteral("open_paper")}
             : allowTools.split(QLatin1Char(','), Qt::SkipEmptyParts);
         bool needsNetwork = false;
         bool needsScreen = false;
@@ -682,7 +714,7 @@ int main(int argc, char* argv[]) {
             mcpDispatcher.permissions().setEnabled(tool, true);
             needsScreen = needsScreen || tool == "screen_capture";
             needsNetwork = needsNetwork || tool.rfind("tavily_", 0) == 0 || tool == "web_search"
-                || tool == "browser_open" || tool == "browser_read";
+                || tool == "browser_open" || tool == "browser_read" || tool == "open_paper";
             needsCommand = needsCommand || tool == "run_shell_command";
         }
         if (needsNetwork) {
@@ -753,6 +785,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("privilegedBroker"), &privilegedBroker);
     engine.rootContext()->setContextProperty(QStringLiteral("shellBroker"), &shellBroker);
     engine.rootContext()->setContextProperty(QStringLiteral("browserPanel"), &browserPanel);
+    engine.rootContext()->setContextProperty(QStringLiteral("paperLibrary"), &paperLibrary);
     // QQmlApplicationEngine has no errors() accessor; it reports them through
     // this signal, so the connection has to exist before the scene is loaded.
     // Without it a failure prints one bare line and the reason -- an

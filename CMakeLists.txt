@@ -721,6 +721,7 @@ if(KESTREL_BUILD_UI)
                 src/ui/Main.qml
                 src/ui/MessageBubble.qml
                 src/ui/BrowserView.qml
+                src/ui/PaperView.qml
         )
 
         target_link_libraries(kestrel PRIVATE
@@ -739,6 +740,17 @@ if(KESTREL_BUILD_UI)
             message(STATUS "Kestrel: Qt WebEngine found; pages open in the embedded browser panel")
         else()
             message(STATUS "Kestrel: Qt WebEngine not found; pages open in the default browser")
+        endif()
+
+        # The paper panel renders PDFs with Qt PDF. Without it the panel says so and
+        # papers cannot be shown, while the rest of the app still works.
+        find_package(Qt6PdfQuick QUIET)
+        if(TARGET Qt6::PdfQuick)
+            target_link_libraries(kestrel PRIVATE Qt6::PdfQuick)
+            target_compile_definitions(kestrel PRIVATE KESTREL_HAS_PDF=1)
+            message(STATUS "Kestrel: Qt PDF found; research papers render in the paper panel")
+        else()
+            message(STATUS "Kestrel: Qt PDF not found; the paper panel cannot show papers")
         endif()
 
         if(TARGET Qt6::TextToSpeech)
@@ -773,7 +785,8 @@ if(KESTREL_BUILD_UI)
         find_package(Qt6Network REQUIRED)
         target_sources(kestrel PRIVATE src/app/undermindclient.cpp src/app/undermindclient.h)
         target_sources(kestrel PRIVATE src/app/shellcommand.cpp src/app/shellcommand.h
-            src/app/browsertools.cpp src/app/browsertools.h)
+            src/app/browsertools.cpp src/app/browsertools.h
+            src/app/paperlibrary.cpp src/app/paperlibrary.h)
         if(TARGET Qt6::Network)
             target_sources(kestrel PRIVATE
                 src/app/mcpserver.cpp src/app/mcpserver.h
@@ -828,6 +841,8 @@ if(KESTREL_BUILD_UI)
                 src/app/undermindclient.h
                 src/app/shellcommand.cpp
                 src/app/shellcommand.h
+                src/app/paperlibrary.cpp
+                src/app/paperlibrary.h
                 src/app/privilegedcommand.cpp
                 src/app/privilegedcommand.h
                 src/app/echocancelsession.cpp

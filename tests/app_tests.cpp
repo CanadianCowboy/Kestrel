@@ -38,6 +38,8 @@
 
 #include "app/appcontroller.h"
 #include "app/shellcommand.h"
+#include "app/paperlibrary.h"
+#include <QNetworkAccessManager>
 #include "app/undermindclient.h"
 #include "storage/profile.h"
 #include "storage/secretstore.h"
@@ -3019,6 +3021,71 @@ void testShellCommandReportsOutputAndExitCode() {
           "a failing command is an error with its exit code");
 }
 
+void testPaperLibrary() {
+    using kestrel::app::PaperLibrary;
+    using kestrel::app::cacheFileNameForUrl;
+    using kestrel::app::looksLikePdf;
+    using kestrel::app::titleForSource;
+
+    check(looksLikePdf(QByteArrayLiteral("%PDF-1.7\n")), "a PDF header is recognised");
+    check(!looksLikePdf(QByteArrayLiteral("<html>")), "an HTML page is not taken for a PDF");
+    check(!looksLikePdf(QByteArray()), "an empty download is not a PDF");
+
+    const QUrl first(QStringLiteral("https://example.org/a.pdf"));
+    const QUrl second(QStringLiteral("https://example.org/b.pdf"));
+    const QString name = cacheFileNameForUrl(first);
+    check(name.endsWith(QStringLiteral(".pdf")) && name == cacheFileNameForUrl(first),
+          "a paper's cache name is stable and ends in .pdf");
+    check(name != cacheFileNameForUrl(second), "different papers get different cache names");
+
+    check(titleForSource(QStringLiteral("https://x.org/papers/deep-learning_survey.pdf"))
+              == QStringLiteral("deep learning survey"),
+          "a web title is cleaned from its file name");
+    check(titleForSource(QStringLiteral("/tmp/My Paper.pdf")) == QStringLiteral("My Paper"),
+          "a local title keeps its words");
+    check(titleForSource(QString()) == QStringLiteral("Untitled paper"),
+          "an empty source gets a placeholder title");
+
+    QTemporaryDir dir;
+    check(dir.isValid(), "a temporary folder is available for the paper files");
+    const auto writeFile = [](const QString& path, const QByteArray& bytes) {
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+    };
+    const QString pdfPath = dir.filePath(QStringLiteral("first.pdf"));
+    const QString textPath = dir.filePath(QStringLiteral("notes.pdf"));
+    check(writeFile(pdfPath, QByteArrayLiteral("%PDF-1.4\n%test\n")), "the test PDF can be written");
+    check(writeFile(textPath, QByteArrayLiteral("just text, not a PDF")), "the test text file can be written");
+
+    PaperLibrary library;
+    check(library.addLocalFile(QUrl::fromLocalFile(pdfPath)).isEmpty(), "a real PDF is accepted");
+    check(library.papers().size() == 1 && library.currentIndex() == 0,
+          "the accepted PDF is listed and shown");
+    check(library.open(), "adding a paper opens the panel");
+    check(library.currentSource() == QUrl::fromLocalFile(pdfPath), "the viewer reads the PDF's file");
+    check(!library.addLocalFile(QUrl::fromLocalFile(textPath)).isEmpty(),
+          "a file without the PDF header is refused");
+    check(library.papers().size() == 1, "a refused file is not listed");
+    check(library.addLocalFile(QUrl::fromLocalFile(pdfPath)).isEmpty() && library.papers().size() == 1,
+          "the same PDF is not listed twice");
+    check(!library.addLocalFile(QUrl(QStringLiteral("https://example.org/a.pdf"))).isEmpty(),
+          "a web address is not accepted as a local file");
+    check(library.indexOfTitle(QStringLiteral("FIRST")) == 0, "a title matches ignoring case");
+    check(library.indexOfTitle(QStringLiteral("missing")) == -1, "an unknown title matches nothing");
+    library.showPaper(7);
+    check(library.currentIndex() == 0, "showing a paper that is not listed changes nothing");
+
+    QNetworkAccessManager network;
+    bool answered = false;
+    bool refused = false;
+    library.openWeb(network, QStringLiteral("ftp://example.org/a.pdf"),
+                    [&](kestrel::core::McpToolResult reply) {
+                        answered = true;
+                        refused = reply.isError;
+                    });
+    check(answered && refused, "a non-web address is refused without a download");
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash still shows how far the run got. A lost buffer
     // turns a five-second diagnosis into a guess about which test died.
@@ -3084,6 +3151,7 @@ int main(int argc, char** argv) {
     testChatToolLoopRunsCallAndAnswers();
     testPkceAndJsonRpcFraming();
     testShellCommandReportsOutputAndExitCode();
+    testPaperLibrary();
     testPreviewInputRequiresExplicitOptIn();
 #if defined(__linux__)
     testLinuxRecognizerReachesListenSession();
