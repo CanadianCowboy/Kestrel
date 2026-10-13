@@ -2,6 +2,10 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
+
+#ifdef KESTREL_HAS_WEBENGINE
+#include <QtWebEngineQuick/qtwebenginequickglobal.h>
+#endif
 #include <QEventLoop>
 #include <QImage>
 #include <QQuickItem>
@@ -336,6 +340,10 @@ int main(int argc, char* argv[]) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
     }
 #endif
+#ifdef KESTREL_HAS_WEBENGINE
+    // WebEngine has to start before the application object exists.
+    QtWebEngineQuick::initialize();
+#endif
     QGuiApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("Kestrel"));
     app.setOrganizationName(QStringLiteral("Kestrel"));
@@ -411,6 +419,7 @@ int main(int argc, char* argv[]) {
     // Shell commands ask the user the same way, through a broker of their own so a
     // pending admin prompt and a pending command never answer each other.
     kestrel::app::PrivilegedApprovalBroker shellBroker;
+    kestrel::app::BrowserPanel browserPanel;
 
 #if KESTREL_HAS_MCP_SERVER
     // Background MCP endpoint for other local agents. Opt-in: nothing listens
@@ -617,13 +626,19 @@ int main(int argc, char* argv[]) {
         "browser_open",
         "Open a web address in the user's Firefox (or default browser) so they can see it. Arguments: url (string).",
         {kestrel::core::ToolPermission::Network},
-        [](const kestrel::storage::json::Value& args) {
+        [&browserPanel](const kestrel::storage::json::Value& args) {
             const kestrel::storage::json::Value* url = args.find("url");
             if (url == nullptr || !url->isString()) {
                 return kestrel::core::McpToolResult{true, "Pass a string \"url\"."};
             }
             QString error;
             const QString address = QString::fromUtf8(std::string(*url->asString()).c_str());
+            if (browserPanel.webEngineAvailable()) {
+                if (!browserPanel.showPage(address, error)) {
+                    return kestrel::core::McpToolResult{true, error.toStdString()};
+                }
+                return kestrel::core::McpToolResult{false, "Showing " + address.toStdString() + " in the Kestrel browser panel."};
+            }
             if (!kestrel::app::openInBrowser(address, error)) {
                 return kestrel::core::McpToolResult{true, error.toStdString()};
             }
@@ -737,6 +752,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
     engine.rootContext()->setContextProperty(QStringLiteral("privilegedBroker"), &privilegedBroker);
     engine.rootContext()->setContextProperty(QStringLiteral("shellBroker"), &shellBroker);
+    engine.rootContext()->setContextProperty(QStringLiteral("browserPanel"), &browserPanel);
     // QQmlApplicationEngine has no errors() accessor; it reports them through
     // this signal, so the connection has to exist before the scene is loaded.
     // Without it a failure prints one bare line and the reason -- an

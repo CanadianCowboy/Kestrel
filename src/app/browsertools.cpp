@@ -88,4 +88,33 @@ void readWebPage(QNetworkAccessManager& network, const QString& address,
     });
 }
 
+BrowserPanel::BrowserPanel(QObject* parent) : QObject(parent) {}
+
+void BrowserPanel::setOpen(bool open) {
+    if (open != m_open) {
+        m_open = open;
+        emit openChanged();
+    }
+}
+
+bool BrowserPanel::webEngineAvailable() const {
+#ifdef KESTREL_HAS_WEBENGINE
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool BrowserPanel::showPage(const QString& address, QString& error) {
+    const QUrl url(address.trimmed());
+    if (!isWebAddress(url)) {
+        error = QStringLiteral("Only http and https addresses can be shown.");
+        return false;
+    }
+    m_url = url;
+    emit urlChanged();
+    setOpen(true);
+    return true;
+}
+
 } // namespace kestrel::app

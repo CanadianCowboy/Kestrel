@@ -130,22 +130,35 @@ ApplicationWindow {
     // The memory panel and the runtime panel share the right-hand edge, so only
     // one of them is open at a time.
     property bool memoryOpen: false
-    onMemoryOpenChanged: if (memoryOpen) { appController.diagnosticsOpen = false; window.activityOpen = false }
+    onMemoryOpenChanged: if (memoryOpen) { appController.diagnosticsOpen = false; window.activityOpen = false; browserPanel.open = false }
     // The activity panel shows tool calls and their results. It shares the same
     // right-hand edge, so it is exclusive with the other side panels.
     property bool activityOpen: false
-    onActivityOpenChanged: if (activityOpen) { window.memoryOpen = false; appController.diagnosticsOpen = false }
+    onActivityOpenChanged: if (activityOpen) { window.memoryOpen = false; appController.diagnosticsOpen = false; browserPanel.open = false }
     Connections {
         target: appController
         function onDiagnosticsOpenChanged() {
             if (appController.diagnosticsOpen) {
                 window.memoryOpen = false
                 window.activityOpen = false
+                browserPanel.open = false
             }
         }
     }
     Shortcut { sequence: "Ctrl+M"; onActivated: window.memoryOpen = !window.memoryOpen }
     Shortcut { sequence: "Ctrl+Shift+A"; onActivated: window.activityOpen = !window.activityOpen }
+    Shortcut { sequence: "Ctrl+Shift+B"; onActivated: browserPanel.open = !browserPanel.open }
+    // Opening the browser closes the other side panels, the same way they close each other.
+    Connections {
+        target: browserPanel
+        function onOpenChanged() {
+            if (browserPanel.open) {
+                window.memoryOpen = false
+                window.activityOpen = false
+                appController.diagnosticsOpen = false
+            }
+        }
+    }
     Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
     Shortcut { sequence: "Escape"; onActivated: appController.stopSpeech() }
 
@@ -393,6 +406,28 @@ ApplicationWindow {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: window.activityOpen = !window.activityOpen
+                        }
+                    }
+                    Rectangle {
+                        id: browserBadge
+                        implicitWidth: 96
+                        implicitHeight: 34
+                        radius: 17
+                        color: browserPanel.open ? "#1e2a26" : "#17221f"
+                        border.color: browserPanel.url.toString().length > 0 ? "#2d463d" : "#3a3038"
+                        Accessible.name: "Open browser panel"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "BROWSER"
+                            color: browserPanel.url.toString().length > 0 ? window.accent : "#b5909c"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: browserPanel.open = !browserPanel.open
                         }
                     }
                     Rectangle {
@@ -863,6 +898,82 @@ ApplicationWindow {
         // Runtime diagnostics live in a secondary panel, never in the
         // conversation flow, so the main workspace stays quiet as the runtime
         // layer grows.
+        // The page the agent or the user opened. The engine is loaded only while the
+        // panel is open. Without Qt WebEngine in this build, the panel says so and
+        // pages open in the default browser instead.
+        Rectangle {
+            id: browserSidePanel
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            anchors.margins: 18
+            width: 620
+            radius: 18
+            color: "#15171c"
+            border.color: window.line
+            visible: browserPanel.open
+            opacity: browserPanel.open ? 1 : 0
+            clip: true
+
+            Behavior on opacity {
+                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text {
+                        text: "Browser"
+                        color: window.ink
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                    }
+                    Text {
+                        text: browserPanel.url.toString()
+                        color: "#8b93a3"
+                        font.pixelSize: 11
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+                    Rectangle {
+                        implicitWidth: 26
+                        implicitHeight: 26
+                        radius: 13
+                        color: "#1d2026"
+                        border.color: window.line
+                        Accessible.name: "Close browser panel"
+                        Text { anchors.centerIn: parent; text: "×"; color: window.ink; font.pixelSize: 14 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: browserPanel.open = false
+                        }
+                    }
+                }
+
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    active: browserPanel.open && browserPanel.webEngineAvailable
+                    source: "BrowserView.qml"
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    visible: !browserPanel.webEngineAvailable
+                    text: "The embedded browser is not built into this copy of Kestrel. Pages open in your default browser."
+                    color: "#8b93a3"
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+
         // What the agent has done this session: each tool call, its arguments, and
         // what came back, including web search results. Read-only except for clear.
         Rectangle {

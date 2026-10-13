@@ -720,6 +720,7 @@ if(KESTREL_BUILD_UI)
             QML_FILES
                 src/ui/Main.qml
                 src/ui/MessageBubble.qml
+                src/ui/BrowserView.qml
         )
 
         target_link_libraries(kestrel PRIVATE
@@ -728,6 +729,17 @@ if(KESTREL_BUILD_UI)
             Qt6::QuickControls2
         )
         target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT=1)
+
+        # The embedded browser needs Qt WebEngine. Without it the browser tool
+        # opens pages in the user's default browser instead.
+        find_package(Qt6WebEngineQuick QUIET)
+        if(TARGET Qt6::WebEngineQuick)
+            target_link_libraries(kestrel PRIVATE Qt6::WebEngineQuick)
+            target_compile_definitions(kestrel PRIVATE KESTREL_HAS_WEBENGINE=1)
+            message(STATUS "Kestrel: Qt WebEngine found; pages open in the embedded browser panel")
+        else()
+            message(STATUS "Kestrel: Qt WebEngine not found; pages open in the default browser")
+        endif()
 
         if(TARGET Qt6::TextToSpeech)
             target_link_libraries(kestrel PRIVATE Qt6::TextToSpeech)
