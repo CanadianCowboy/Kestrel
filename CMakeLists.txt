@@ -754,7 +754,10 @@ if(KESTREL_BUILD_UI)
         # The MCP endpoint serves local agents over loopback TCP. Optional, so a
         # Qt install without the Network module still builds the desktop app; the
         # server is then simply not started.
-        find_package(Qt6Network QUIET)
+        # The Undermind connection is part of the desktop app, so Qt Network is
+        # required for it; the app cannot link without it.
+        find_package(Qt6Network REQUIRED)
+        target_sources(kestrel PRIVATE src/app/undermindclient.cpp src/app/undermindclient.h)
         if(TARGET Qt6::Network)
             target_sources(kestrel PRIVATE
                 src/app/mcpserver.cpp src/app/mcpserver.h
@@ -805,6 +808,8 @@ if(KESTREL_BUILD_UI)
                 src/app/listensession.h
                 src/app/appcontroller.cpp
                 src/app/appcontroller.h
+                src/app/undermindclient.cpp
+                src/app/undermindclient.h
                 src/app/privilegedcommand.cpp
                 src/app/privilegedcommand.h
                 src/app/echocancelsession.cpp
@@ -816,7 +821,8 @@ if(KESTREL_BUILD_UI)
                 src/app/conversationentry.h
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
-            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+            find_package(Qt6Network REQUIRED)
+            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Network)
             target_compile_definitions(kestrel_app_tests PRIVATE
                 KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})

@@ -37,6 +37,7 @@
 #include <thread>
 
 #include "app/appcontroller.h"
+#include "app/undermindclient.h"
 #include "storage/profile.h"
 #include "storage/secretstore.h"
 
@@ -2930,6 +2931,21 @@ void testChatToolLoopRunsCallAndAnswers() {
 
     const auto requests = observed->requests();
     check(requests.size() == 2, "a tool call starts exactly one follow-up generation");
+
+    // The activity panel reads this log, so a call that ran must leave a call
+    // entry and a result entry behind, in that order.
+    const QVariantList activity = controller.activityEntries();
+    check(activity.size() == 2, "the tool call and its result are both in the activity log");
+    if (activity.size() == 2) {
+        const QVariantMap callEntry = activity[0].toMap();
+        const QVariantMap resultEntry = activity[1].toMap();
+        check(callEntry.value(QStringLiteral("kind")).toString() == QStringLiteral("call")
+                  && callEntry.value(QStringLiteral("name")).toString() == QStringLiteral("list_tools"),
+              "the activity log records the call by name");
+        check(resultEntry.value(QStringLiteral("kind")).toString() == QStringLiteral("result")
+                  && !resultEntry.value(QStringLiteral("isError")).toBool(),
+              "the activity log records a successful result");
+    }
     if (requests.size() == 2) {
         bool sawListing = false;
         for (const auto& message : requests.back().messages) {
@@ -2955,6 +2971,27 @@ void testChatToolLoopRunsCallAndAnswers() {
     check(sawResultRow, "the tool result is recorded in the transcript");
     check(sawAnswer, "the model's answer after the tool result is shown");
     controller.stopGeneration();
+}
+
+// PKCE and the MCP reply framing that the Undermind connection depends on.
+void testPkceAndJsonRpcFraming() {
+    // RFC 7636, appendix B: the published verifier and its S256 challenge.
+    check(kestrel::app::pkceChallenge(QStringLiteral("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
+              == QStringLiteral("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+          "the PKCE challenge matches RFC 7636");
+    check(kestrel::app::pkceVerifier().size() == 64, "a fresh PKCE verifier is 64 characters");
+    check(kestrel::app::pkceVerifier() != kestrel::app::pkceVerifier(), "PKCE verifiers are not repeated");
+
+    const QByteArray stream = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+    const auto fromStream = kestrel::app::jsonRpcResponse(stream, "text/event-stream", 3);
+    check(fromStream.has_value()
+              && fromStream->value(QStringLiteral("result")).toObject().value(QStringLiteral("ok")).toBool(),
+          "a reply inside an event stream is found by its id");
+    check(!kestrel::app::jsonRpcResponse(stream, "text/event-stream", 4).has_value(),
+          "a reply with a different id is not returned");
+    check(kestrel::app::jsonRpcResponse(QByteArray(R"({"jsonrpc":"2.0","id":5,"result":{}})"),
+                                        "application/json", 5).has_value(),
+          "a plain JSON reply is found by its id");
 }
 
 int main(int argc, char** argv) {
@@ -3020,6 +3057,7 @@ int main(int argc, char** argv) {
     testLoadingVoiceReportsTextOnlyWithoutWaiting();
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testChatToolLoopRunsCallAndAnswers();
+    testPkceAndJsonRpcFraming();
     testPreviewInputRequiresExplicitOptIn();
 #if defined(__linux__)
     testLinuxRecognizerReachesListenSession();

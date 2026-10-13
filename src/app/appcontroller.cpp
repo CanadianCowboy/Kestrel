@@ -1,5 +1,9 @@
 #include "app/appcontroller.h"
 
+#include "app/undermindclient.h"
+
+#include <QJsonDocument>
+
 #include "app/generationworker.h"
 #include "app/echocancelsession.h"
 #include "app/listensession.h"
@@ -1994,6 +1998,7 @@ void AppController::runToolCall(core::ModelToolCall call) {
         return;
     }
     ++m_toolRounds;
+    recordActivity(QStringLiteral("call"), name, QString::fromStdString(call.argumentsJson), false);
 
     if (call.name == "list_tools") {
         // Read from the dispatcher now, so it reflects what is enabled right now.
@@ -2057,9 +2062,83 @@ void AppController::runToolCall(core::ModelToolCall call) {
     });
 }
 
+// Keeps the most recent entries only, so a long session cannot grow the list
+// without bound.
+void AppController::recordActivity(const QString& kind, const QString& name, const QString& text, bool isError) {
+    constexpr int kMaxActivityEntries = 200;
+    QVariantMap entry;
+    entry.insert(QStringLiteral("kind"), kind);
+    entry.insert(QStringLiteral("name"), name);
+    entry.insert(QStringLiteral("text"), text);
+    entry.insert(QStringLiteral("isError"), isError);
+    m_activity.append(entry);
+    while (m_activity.size() > kMaxActivityEntries) {
+        m_activity.removeFirst();
+    }
+    emit activityChanged();
+}
+
+void AppController::clearActivity() {
+    if (m_activity.isEmpty()) {
+        return;
+    }
+    m_activity.clear();
+    emit activityChanged();
+}
+
+QString AppController::undermindStatus() const {
+    return m_undermind != nullptr ? m_undermind->status() : QStringLiteral("Not connected");
+}
+
+// Signs in to Undermind, then registers each of its tools with the dispatcher.
+// Names are prefixed so they cannot shadow a local tool. Clicking Connect is the
+// user's grant of the Network permission these tools need.
+void AppController::connectUndermind() {
+    if (m_agentTools == nullptr) {
+        return;
+    }
+    if (m_undermind == nullptr) {
+        m_undermind = new UndermindClient(this);
+        connect(m_undermind, &UndermindClient::statusChanged, this, &AppController::undermindChanged);
+    }
+    m_undermind->connectAndList([this](bool ok, QJsonArray tools) {
+        if (!ok || m_agentTools == nullptr || m_undermind == nullptr) {
+            return;
+        }
+        UndermindClient* client = m_undermind;
+        for (const QJsonValue& value : tools) {
+            const QJsonObject tool = value.toObject();
+            const QString remote = tool.value(QStringLiteral("name")).toString();
+            if (remote.isEmpty()) {
+                continue;
+            }
+            const std::string remoteName = remote.toStdString();
+            const QByteArray schema = QJsonDocument(tool.value(QStringLiteral("inputSchema")).toObject())
+                                          .toJson(QJsonDocument::Compact);
+            const std::string description =
+                tool.value(QStringLiteral("description")).toString().toStdString()
+                + " Undermind tool. Arguments (JSON schema): " + std::string(schema.constData(), schema.size());
+            const std::string localName = "undermind_" + remoteName;
+            m_agentTools->addTool({
+                localName,
+                description,
+                {core::ToolPermission::Network},
+                nullptr,
+                [client, remoteName](const storage::json::Value& arguments, core::McpCompletion done) {
+                    client->callTool(remoteName, arguments.serialize(), std::move(done));
+                }});
+            m_agentTools->permissions().setEnabled(localName, true);
+        }
+        m_agentTools->permissions().grant(core::ToolPermission::Network, true);
+    });
+}
+
 // The result becomes a row in the transcript, which the model sees on its next
 // pass, and the reply continues in a fresh streamed answer.
 void AppController::recordToolResult(const QString& name, const QString& text, bool isError) {
+    // Recorded before the turn check below: the activity panel should show what
+    // a tool returned even when the answer itself has no place to go.
+    recordActivity(isError ? QStringLiteral("error") : QStringLiteral("result"), name, text, isError);
     if (m_generating) {
         // A turn started while the tool ran; its result no longer has a place.
         return;

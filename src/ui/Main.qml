@@ -129,16 +129,22 @@ ApplicationWindow {
     // The memory panel and the runtime panel share the right-hand edge, so only
     // one of them is open at a time.
     property bool memoryOpen: false
-    onMemoryOpenChanged: if (memoryOpen) appController.diagnosticsOpen = false
+    onMemoryOpenChanged: if (memoryOpen) { appController.diagnosticsOpen = false; window.activityOpen = false }
+    // The activity panel shows tool calls and their results. It shares the same
+    // right-hand edge, so it is exclusive with the other side panels.
+    property bool activityOpen: false
+    onActivityOpenChanged: if (activityOpen) { window.memoryOpen = false; appController.diagnosticsOpen = false }
     Connections {
         target: appController
         function onDiagnosticsOpenChanged() {
             if (appController.diagnosticsOpen) {
                 window.memoryOpen = false
+                window.activityOpen = false
             }
         }
     }
     Shortcut { sequence: "Ctrl+M"; onActivated: window.memoryOpen = !window.memoryOpen }
+    Shortcut { sequence: "Ctrl+Shift+A"; onActivated: window.activityOpen = !window.activityOpen }
     Shortcut { sequence: "Ctrl+D"; onActivated: appController.diagnosticsOpen = !appController.diagnosticsOpen }
     Shortcut { sequence: "Escape"; onActivated: appController.stopSpeech() }
 
@@ -364,6 +370,28 @@ ApplicationWindow {
                             anchors.fill: parent
                             hoverEnabled: true
                             acceptedButtons: Qt.NoButton
+                        }
+                    }
+                    Rectangle {
+                        id: activityBadge
+                        implicitWidth: 96
+                        implicitHeight: 34
+                        radius: 17
+                        color: window.activityOpen ? "#1e2a26" : "#17221f"
+                        border.color: appController.activityEntries.length > 0 ? "#2d463d" : "#3a3038"
+                        Accessible.name: "Open activity panel"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "ACTIVITY"
+                            color: appController.activityEntries.length > 0 ? window.accent : "#b5909c"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: window.activityOpen = !window.activityOpen
                         }
                     }
                     Rectangle {
@@ -834,6 +862,160 @@ ApplicationWindow {
         // Runtime diagnostics live in a secondary panel, never in the
         // conversation flow, so the main workspace stays quiet as the runtime
         // layer grows.
+        // What the agent has done this session: each tool call, its arguments, and
+        // what came back, including web search results. Read-only except for clear.
+        Rectangle {
+            id: activityPanel
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            anchors.margins: 18
+            width: 380
+            radius: 18
+            color: "#15171c"
+            border.color: window.line
+            visible: window.activityOpen
+            opacity: window.activityOpen ? 1 : 0
+            clip: true
+
+            Behavior on opacity {
+                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 18
+                spacing: 12
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "Activity"
+                        color: window.ink
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                        Layout.fillWidth: true
+                    }
+                    Text {
+                        text: appController.activityEntries.length + " events"
+                        color: "#8b93a3"
+                        font.pixelSize: 11
+                    }
+                    Rectangle {
+                        implicitWidth: 60
+                        implicitHeight: 26
+                        radius: 13
+                        color: "#1d2026"
+                        border.color: window.line
+                        Text { anchors.centerIn: parent; text: "Clear"; color: window.ink; font.pixelSize: 11 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: appController.clearActivity()
+                        }
+                    }
+                    Rectangle {
+                        implicitWidth: 26
+                        implicitHeight: 26
+                        radius: 13
+                        color: "#1d2026"
+                        border.color: window.line
+                        Accessible.name: "Close activity panel"
+                        Text { anchors.centerIn: parent; text: "×"; color: window.ink; font.pixelSize: 14 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: window.activityOpen = false
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text {
+                        text: appController.undermindStatus
+                        color: "#8b93a3"
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                    Rectangle {
+                        implicitWidth: 132
+                        implicitHeight: 26
+                        radius: 13
+                        color: "#1d2026"
+                        border.color: window.line
+                        Accessible.name: "Connect Undermind"
+                        Text { anchors.centerIn: parent; text: "Connect Undermind"; color: window.accent; font.pixelSize: 11 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: appController.connectUndermind()
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "Tool calls appear here as the model makes them. Each shows the arguments it sent and the output it got back."
+                    color: "#8b93a3"
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                }
+
+                ListView {
+                    id: activityList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 8
+                    model: appController.activityEntries
+                    onCountChanged: positionViewAtEnd()
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: activityList.width
+                        height: entryColumn.implicitHeight + 20
+                        radius: 10
+                        color: modelData.isError ? "#2a1b1f" : "#1b1e25"
+                        border.color: modelData.isError ? "#4a2a33" : window.line
+
+                        Column {
+                            id: entryColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: 10
+                            spacing: 4
+                            Text {
+                                text: (modelData.kind === "call" ? "CALL " : modelData.isError ? "FAILED " : "RESULT ") + modelData.name
+                                color: modelData.isError ? "#e0a0ad" : window.accent
+                                font.pixelSize: 11
+                                font.weight: Font.DemiBold
+                            }
+                            Text {
+                                width: parent.width
+                                text: modelData.text
+                                color: window.ink
+                                font.family: "monospace"
+                                font.pixelSize: 11
+                                wrapMode: Text.WrapAnywhere
+                            }
+                        }
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        visible: activityList.count === 0
+                        text: "No tool calls yet."
+                        color: "#8b93a3"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+        }
+
         // What Kestrel remembers. Stored in the profile in the system keystore, and
         // off until recall is switched on here. Every change is saved before it is
         // shown as kept; a change that cannot be saved is undone and says why.

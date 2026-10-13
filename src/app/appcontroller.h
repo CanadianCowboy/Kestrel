@@ -36,6 +36,7 @@ class GenerationWorker;
 class SpeechSynthesizer;
 class EchoCancelSession;
 class ListenSession;
+class UndermindClient;
 
 // How long a reply may wait for a voice to announce itself before the app stops
 // waiting and delivers it as text.
@@ -76,6 +77,12 @@ class AppController final : public QObject {
     Q_PROPERTY(bool recallEnabled READ recallEnabled NOTIFY recallChanged)
     Q_PROPERTY(QVariantList recallMemories READ recallMemories NOTIFY recallChanged)
     Q_PROPERTY(QString recallError READ recallError NOTIFY recallChanged)
+    // Every tool call the model makes and what came back, newest last. Bounded,
+    // and shown in the activity panel so tool use is visible rather than only
+    // implied by a reply.
+    Q_PROPERTY(QVariantList activityEntries READ activityEntries NOTIFY activityChanged)
+    // Where the Undermind connection stands, for the activity panel.
+    Q_PROPERTY(QString undermindStatus READ undermindStatus NOTIFY undermindChanged)
 
     // Runtime identity and live metrics.
     Q_PROPERTY(QString backendName READ backendName NOTIFY runtimeChanged)
@@ -395,6 +402,11 @@ public:
     // if the save fails the change is undone and recallError says why.
     Q_INVOKABLE void setRecallEnabled(bool enabled);
     Q_INVOKABLE bool rememberFact(const QString& text);
+    [[nodiscard]] QVariantList activityEntries() const { return m_activity; }
+    Q_INVOKABLE void clearActivity();
+    // Signs in to Undermind and makes its tools available to the agent.
+    Q_INVOKABLE void connectUndermind();
+    [[nodiscard]] QString undermindStatus() const;
     Q_INVOKABLE void forgetMemory(qlonglong id);
     Q_INVOKABLE void clearMemories();
     Q_INVOKABLE QVariantList searchMemories(const QString& query) const;
@@ -453,6 +465,8 @@ signals:
     void presenceChanged();
     void idleToolsChanged();
     void recallChanged();
+    void activityChanged();
+    void undermindChanged();
     /// Notifies observers that audio availability or playback state changed.
     void ttsChanged();
     /// Notifies observers that listening state or the partial transcript changed.
@@ -465,6 +479,7 @@ private:
     void onGenerationFinished(quint64 requestId, bool success, const QString& error);
     void runToolCall(core::ModelToolCall call);
     void recordToolResult(const QString& name, const QString& text, bool isError);
+    void recordActivity(const QString& kind, const QString& name, const QString& text, bool isError);
     void continueAfterTool();
 
     // The idle thought cycle, driven by m_idleTimer. Silent whenever the user
@@ -661,6 +676,8 @@ private:
     quint64 m_toolRequestId = 0;
     core::McpDispatcher* m_agentTools = nullptr;
     int m_toolRounds = 0;
+    QVariantList m_activity;
+    UndermindClient* m_undermind = nullptr;
     // The text a permissioned tool produced, accumulated from its own tokens.
     // It cannot come out of the streaming path, which only keeps the active
     // request, and it cannot be read back off the transcript, whose last row
