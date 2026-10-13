@@ -15,6 +15,7 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QRandomGenerator>
+#include <QStandardPaths>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrl>
@@ -422,7 +423,8 @@ int main(int argc, char* argv[]) {
     kestrel::app::PrivilegedApprovalBroker shellBroker;
     kestrel::app::BrowserPanel browserPanel;
     // Research papers the user or the agent has opened, shown in the paper panel.
-    kestrel::app::PaperLibrary paperLibrary;
+    kestrel::app::PaperLibrary paperLibrary(
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/papers.json"));
 
 #if KESTREL_HAS_MCP_SERVER
     // Background MCP endpoint for other local agents. Opt-in: nothing listens

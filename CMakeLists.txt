@@ -745,6 +745,22 @@ if(KESTREL_BUILD_UI)
         # The paper panel renders PDFs with Qt PDF. Without it the panel says so and
         # papers cannot be shown, while the rest of the app still works.
         find_package(Qt6PdfQuick QUIET)
+        # Qt's QML import step links the plugins of every QML module the app uses,
+        # and it only finds a plugin whose config has been loaded. Load them all
+        # from Qt's plugin folder, so none is silently left out of the build.
+        if(Qt6Qml_DIR)
+            file(GLOB _kestrel_qml_plugin_configs "${Qt6Qml_DIR}/QmlPlugins/*Config.cmake")
+            foreach(_kestrel_qml_plugin_config IN LISTS _kestrel_qml_plugin_configs)
+                get_filename_component(_kestrel_qml_plugin_package "${_kestrel_qml_plugin_config}" NAME_WE)
+                string(REGEX REPLACE "Config$" "" _kestrel_qml_plugin_package "${_kestrel_qml_plugin_package}")
+                # Test helpers and private modules are not imported by Kestrel, and on
+                # some Qt installs their configs name object files that are missing.
+                if(NOT _kestrel_qml_plugin_package MATCHES "TestUtils|AssetDownloader|Private")
+                    find_package(${_kestrel_qml_plugin_package} CONFIG QUIET
+                        PATHS "${Qt6Qml_DIR}/QmlPlugins" NO_DEFAULT_PATH)
+                endif()
+            endforeach()
+        endif()
         if(TARGET Qt6::PdfQuick)
             target_link_libraries(kestrel PRIVATE Qt6::PdfQuick)
             target_compile_definitions(kestrel PRIVATE KESTREL_HAS_PDF=1)

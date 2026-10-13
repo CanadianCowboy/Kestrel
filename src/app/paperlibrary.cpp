@@ -1,12 +1,17 @@
 #include "app/paperlibrary.h"
 
 #include <QCryptographicHash>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QSaveFile>
 #include <QStandardPaths>
 
 #include <utility>
@@ -53,7 +58,62 @@ QString titleForSource(const QString& source) {
     return title.isEmpty() ? QStringLiteral("Untitled paper") : title;
 }
 
-PaperLibrary::PaperLibrary(QObject* parent) : QObject(parent) {}
+PaperLibrary::PaperLibrary(QString storePath, QObject* parent)
+    : QObject(parent), m_storePath(std::move(storePath)) {
+    load();
+}
+
+// A saved paper whose file has gone is dropped rather than shown as a broken
+// entry. A file the user moved is simply no longer where the list says it is.
+void PaperLibrary::load() {
+    if (m_storePath.isEmpty()) {
+        return;
+    }
+    QFile file(m_storePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    if (!document.isObject()) {
+        return;
+    }
+    for (const QJsonValue& value : document.object().value(QStringLiteral("papers")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        Paper paper{entry.value(QStringLiteral("title")).toString(),
+                    entry.value(QStringLiteral("source")).toString(),
+                    entry.value(QStringLiteral("filePath")).toString()};
+        if (paper.filePath.isEmpty() || !QFileInfo::exists(paper.filePath)) {
+            continue;
+        }
+        m_papers.push_back(std::move(paper));
+    }
+}
+
+void PaperLibrary::save() const {
+    if (m_storePath.isEmpty()) {
+        return;
+    }
+    QJsonArray papers;
+    for (const Paper& paper : m_papers) {
+        QJsonObject entry;
+        entry.insert(QStringLiteral("title"), paper.title);
+        entry.insert(QStringLiteral("source"), paper.source);
+        entry.insert(QStringLiteral("filePath"), paper.filePath);
+        papers.append(entry);
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("papers"), papers);
+
+    QDir().mkpath(QFileInfo(m_storePath).absolutePath());
+    QSaveFile file(m_storePath);
+    if (!file.open(QIODevice::WriteOnly) || file.write(QJsonDocument(root).toJson(QJsonDocument::Compact)) < 0
+        || !file.commit()) {
+        // The paper is still open this session; only its place on the next start is lost.
+        qWarning().noquote() << "Kestrel could not save the paper list to" << m_storePath
+                             << "so these papers will not be listed after a restart. Check that the folder is writable.";
+    }
+}
 
 QVariantList PaperLibrary::papers() const {
     QVariantList list;
@@ -96,6 +156,7 @@ int PaperLibrary::addPaper(Paper paper) {
         }
     }
     m_papers.push_back(std::move(paper));
+    save();
     emit papersChanged();
     return static_cast<int>(m_papers.size()) - 1;
 }

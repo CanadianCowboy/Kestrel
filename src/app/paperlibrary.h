@@ -37,7 +37,9 @@ class PaperLibrary final : public QObject {
     Q_PROPERTY(bool pdfAvailable READ pdfAvailable CONSTANT)
 
 public:
-    explicit PaperLibrary(QObject* parent = nullptr);
+    // An empty storePath keeps the list for this session only. With a path, the
+    // list is loaded from it now and saved to it whenever a paper is added.
+    explicit PaperLibrary(QString storePath = {}, QObject* parent = nullptr);
 
     [[nodiscard]] QVariantList papers() const;
     [[nodiscard]] int currentIndex() const { return m_current; }
@@ -74,7 +76,10 @@ private:
     };
 
     int addPaper(Paper paper);
+    void load();
+    void save() const;
 
+    QString m_storePath;
     std::vector<Paper> m_papers;
     int m_current = -1;
     bool m_open = false;

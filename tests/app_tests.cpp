@@ -39,7 +39,10 @@
 #include "app/appcontroller.h"
 #include "app/shellcommand.h"
 #include "app/paperlibrary.h"
+#include <QHostAddress>
 #include <QNetworkAccessManager>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include "app/undermindclient.h"
 #include "storage/profile.h"
 #include "storage/secretstore.h"
@@ -3086,6 +3089,87 @@ void testPaperLibrary() {
     check(answered && refused, "a non-web address is refused without a download");
 }
 
+void testPaperListSurvivesARestart() {
+    using kestrel::app::PaperLibrary;
+    QTemporaryDir dir;
+    check(dir.isValid(), "a temporary folder is available for the restart test");
+    const QString store = dir.filePath(QStringLiteral("papers.json"));
+    const QString pdf = dir.filePath(QStringLiteral("kept.pdf"));
+    QFile file(pdf);
+    check(file.open(QIODevice::WriteOnly) && file.write(QByteArrayLiteral("%PDF-1.4\n%kept\n")) > 0,
+          "the restart test PDF can be written");
+    file.close();
+    {
+        PaperLibrary before(store);
+        check(before.addLocalFile(QUrl::fromLocalFile(pdf)).isEmpty(), "a PDF is added before the restart");
+    }
+    PaperLibrary after(store);
+    check(after.papers().size() == 1 && after.indexOfTitle(QStringLiteral("kept")) == 0,
+          "the paper is listed again after a restart");
+    QFile::remove(pdf);
+    PaperLibrary gone(store);
+    check(gone.papers().isEmpty(), "a saved paper whose file has gone is dropped on the next start");
+}
+
+void testPaperDownloadFromAWebAddress() {
+    using kestrel::app::PaperLibrary;
+    using kestrel::core::McpToolResult;
+    const QByteArray pdfBody = QByteArrayLiteral("%PDF-1.4\n%web\n");
+
+    // A local server stands in for the web: one PDF path and one HTML page.
+    QTcpServer server;
+    check(server.listen(QHostAddress::LocalHost), "a local server can listen for the download test");
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&server, pdfBody] {
+        QTcpSocket* socket = server.nextPendingConnection();
+        if (socket == nullptr) {
+            return;
+        }
+        QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+        QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, pdfBody] {
+            const QByteArray request = socket->readAll();
+            const bool html = request.contains("GET /page.html ");
+            const QByteArray body = html ? QByteArrayLiteral("<html>not a paper</html>") : pdfBody;
+            const QByteArray type = html ? QByteArrayLiteral("text/html") : QByteArrayLiteral("application/pdf");
+            socket->write("HTTP/1.1 200 OK\r\nContent-Type: " + type + "\r\nContent-Length: "
+                          + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+            socket->disconnectFromHost();
+        });
+    });
+    const QString base = QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort());
+    QNetworkAccessManager network;
+
+    PaperLibrary library;
+    McpToolResult result{true, "no answer"};
+    bool answered = false;
+    QEventLoop first;
+    QTimer::singleShot(15000, &first, &QEventLoop::quit);
+    library.openWeb(network, base + QStringLiteral("/paper.pdf"), [&](McpToolResult reply) {
+        result = reply;
+        answered = true;
+        first.quit();
+    });
+    first.exec();
+    check(answered && !result.isError, "a PDF from a web address is downloaded and opened");
+    check(library.papers().size() == 1 && library.open(), "the downloaded paper is listed and the panel opens");
+    QFile saved(library.currentSource().toLocalFile());
+    check(saved.open(QIODevice::ReadOnly) && saved.readAll() == pdfBody,
+          "the saved copy is exactly the PDF that was served");
+
+    PaperLibrary other;
+    McpToolResult refusal{false, "no answer"};
+    bool refused = false;
+    QEventLoop second;
+    QTimer::singleShot(15000, &second, &QEventLoop::quit);
+    other.openWeb(network, base + QStringLiteral("/page.html"), [&](McpToolResult reply) {
+        refusal = reply;
+        refused = true;
+        second.quit();
+    });
+    second.exec();
+    check(refused && refusal.isError && other.papers().isEmpty(),
+          "a web page that is not a PDF is refused and not listed");
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash still shows how far the run got. A lost buffer
     // turns a five-second diagnosis into a guess about which test died.
@@ -3094,6 +3178,11 @@ int main(int argc, char** argv) {
     QTemporaryDir configuration;
     if (!configuration.isValid()) { return 1; }
     qputenv("XDG_CONFIG_HOME", configuration.path().toUtf8());
+    // Downloaded papers and the saved paper list go to a throwaway folder, not the
+    // developer's real application data.
+    QTemporaryDir dataHome;
+    if (!dataHome.isValid()) { return 1; }
+    qputenv("XDG_DATA_HOME", dataHome.path().toUtf8());
     QGuiApplication app(argc, argv);
     // Do not read or overwrite the developer's actual desktop preferences.
     QSettings::setDefaultFormat(QSettings::IniFormat);
@@ -3152,6 +3241,8 @@ int main(int argc, char** argv) {
     testPkceAndJsonRpcFraming();
     testShellCommandReportsOutputAndExitCode();
     testPaperLibrary();
+    testPaperListSurvivesARestart();
+    testPaperDownloadFromAWebAddress();
     testPreviewInputRequiresExplicitOptIn();
 #if defined(__linux__)
     testLinuxRecognizerReachesListenSession();
