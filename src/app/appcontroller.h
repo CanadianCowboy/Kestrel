@@ -18,7 +18,9 @@
 #include "app/conversationmodel.h"
 #include "app/messagemodel.h"
 #include "core/idlepersona.h"
+#include "core/agenttools.h"
 #include "core/idletool.h"
+#include "core/mcpdispatch.h"
 #include "core/persona.h"
 #include "core/recall.h"
 #include "core/presence.h"
@@ -346,6 +348,10 @@ public:
     /// Trims and stores changed instruction text, updates the backend, and publishes metrics.
     void setSystemPrompt(const QString& text);
 
+    // The tools the chat model may call. Borrowed; the owner keeps it alive.
+    // Calls go through the same dispatcher, so the same permissions apply.
+    void setAgentTools(core::McpDispatcher* tools);
+
     Q_INVOKABLE void sendMessage(const QString& text);
     // Permissioned idle work. Both of these are deliberately string-keyed from
     // QML: the panel lists what the registry actually holds, and a name that is
@@ -457,6 +463,9 @@ private:
     // Worker callbacks, delivered on the UI thread by queued connections.
     void onGenerationToken(quint64 requestId, const QString& token);
     void onGenerationFinished(quint64 requestId, bool success, const QString& error);
+    void runToolCall(core::ModelToolCall call);
+    void recordToolResult(const QString& name, const QString& text, bool isError);
+    void continueAfterTool();
 
     // The idle thought cycle, driven by m_idleTimer. Silent whenever the user
     // is present: a turn is running, the voice is live, or something is typed
@@ -650,6 +659,8 @@ private:
     // the prewarm id so a backend swap can tell "busy answering someone" from
     // "busy thinking on its own".
     quint64 m_toolRequestId = 0;
+    core::McpDispatcher* m_agentTools = nullptr;
+    int m_toolRounds = 0;
     // The text a permissioned tool produced, accumulated from its own tokens.
     // It cannot come out of the streaming path, which only keeps the active
     // request, and it cannot be read back off the transcript, whose last row

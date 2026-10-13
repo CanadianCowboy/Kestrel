@@ -10,16 +10,29 @@
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QRandomGenerator>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrl>
 
 #include <algorithm>
+#include <memory>
 #include <string_view>
 #include <utility>
 
 #include "app/appcontroller.h"
+#include "app/privilegedapproval.h"
+#include "app/privilegedcommand.h"
+#include "core/mcpdispatch.h"
 #include "core/pathtext.h"
+#include "storage/json.h"
+#if KESTREL_HAS_MCP_SERVER
+#include "app/agenttools.h"
+#include "app/mcpserver.h"
+#include "app/tavilyclient.h"
+#include <QNetworkAccessManager>
+#include <QStandardPaths>
+#endif
 #include "runtime/backendregistry.h"
 #include "runtime/modeldiscovery.h"
 #include "ui/layoutaudit.h"
@@ -391,8 +404,260 @@ int main(int argc, char* argv[]) {
         controller.seedDemoContent(demoMode == QLatin1String("live"));
     }
 
+    // Pending administrator-command approvals, shown by the desktop dialog.
+    kestrel::app::PrivilegedApprovalBroker privilegedBroker;
+
+#if KESTREL_HAS_MCP_SERVER
+    // Background MCP endpoint for other local agents. Opt-in: nothing listens
+    // unless KESTREL_MCP_PORT is set. Tools start disabled in the dispatcher,
+    // so a running endpoint still offers nothing until the user enables it.
+    kestrel::core::McpDispatcher mcpDispatcher;
+    mcpDispatcher.addTool({
+        "kestrel_status",
+        "Report which model backend Kestrel is using.",
+        {kestrel::core::ToolPermission::ReadConversations},
+        [&controller](const kestrel::storage::json::Value&) {
+            return kestrel::core::McpToolResult{false, controller.backendName().toStdString()};
+        }});
+    // Administrator commands. Each run waits for the user's approval in the app,
+    // then runs through pkexec, so the password is typed into the desktop's own
+    // dialog. The tool is off unless the launcher opts in, and even then every
+    // command still needs a fresh approval.
+    mcpDispatcher.addTool({
+        "run_privileged_command",
+        "Run a program with administrator rights. Each run needs the user's approval in Kestrel.",
+        {kestrel::core::ToolPermission::RunPrivileged},
+        nullptr,
+        [&privilegedBroker](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            kestrel::app::PrivilegedRequest request;
+            const kestrel::storage::json::Value* program = args.find("program");
+            if (program == nullptr || !program->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"program\"."});
+                return;
+            }
+            request.program = QString::fromStdString(std::string(*program->asString()));
+            if (const kestrel::storage::json::Value* list = args.find("arguments");
+                list != nullptr && list->asArray() != nullptr) {
+                for (const kestrel::storage::json::Value& item : *list->asArray()) {
+                    if (!item.isString()) {
+                        done(kestrel::core::McpToolResult{true, "Every argument must be a string."});
+                        return;
+                    }
+                    request.arguments << QString::fromStdString(std::string(*item.asString()));
+                }
+            }
+            if (const kestrel::storage::json::Value* reason = args.find("reason");
+                reason != nullptr && reason->isString()) {
+                request.reason = QString::fromStdString(std::string(*reason->asString()));
+            }
+            kestrel::app::runPrivilegedCommand(
+                request,
+                [&privilegedBroker](const kestrel::app::PrivilegedRequest& pending,
+                                    kestrel::app::PrivilegedDecision decide) {
+                    privilegedBroker.ask(pending, std::move(decide));
+                },
+                [done](kestrel::app::PrivilegedResult result) {
+                    const std::string output = result.output.toStdString();
+                    if (result.ran && result.exitCode == 0) {
+                        done(kestrel::core::McpToolResult{false, output});
+                        return;
+                    }
+                    std::string text = result.error.isEmpty()
+                        ? std::string("The command exited with code ") + std::to_string(result.exitCode) + "."
+                        : result.error.toStdString();
+                    done(kestrel::core::McpToolResult{true, text + (output.empty() ? "" : "\n" + output)});
+                });
+        }});
+    // Web search and screen capture. Both need the user's opt-in, so they are
+    // registered disabled and only switched on by KESTREL_MCP_ALLOW_TOOLS=1.
+    static QNetworkAccessManager networkAccess;
+    const QString captureDirectory =
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/captures");
+    mcpDispatcher.addTool({
+        "web_search",
+        "Search the web (Tavily, or SearXNG if configured) and return numbered results with their addresses. Arguments: query (string), max_results (optional number).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* query = args.find("query");
+            if (query == nullptr || !query->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"query\"."});
+                return;
+            }
+            int limit = 5;
+            if (const kestrel::storage::json::Value* requested = args.find("max_results");
+                requested != nullptr && requested->isInteger()) {
+                limit = static_cast<int>(*requested->asInteger());
+            }
+            kestrel::app::runWebSearch(networkAccess,
+                                       QString::fromStdString(std::string(*query->asString())),
+                                       limit, std::move(done));
+        }});
+    mcpDispatcher.addTool({
+        "screen_capture",
+        "Save a screenshot of the primary screen and report the file path.",
+        {kestrel::core::ToolPermission::CaptureScreen},
+        [captureDirectory](const kestrel::storage::json::Value&) {
+            return kestrel::app::captureScreen(captureDirectory);
+        },
+        nullptr});
+    // Tavily's richer endpoints. Each is a network call, so each needs the
+    // Network permission and the same opt-in as the search tool.
+    mcpDispatcher.addTool({
+        "tavily_extract",
+        "Extract the full readable text of one or more known URLs (up to 20). Arguments: urls (array of strings).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            QStringList urls;
+            if (const kestrel::storage::json::Value* list = args.find("urls");
+                list != nullptr && list->asArray() != nullptr) {
+                for (const kestrel::storage::json::Value& item : *list->asArray()) {
+                    if (item.isString()) {
+                        urls << QString::fromStdString(std::string(*item.asString()));
+                    }
+                }
+            }
+            QString query;
+            if (const kestrel::storage::json::Value* q = args.find("query"); q != nullptr && q->isString()) {
+                query = QString::fromStdString(std::string(*q->asString()));
+            }
+            kestrel::app::tavilyExtract(networkAccess, urls, query, std::move(done));
+        }});
+    mcpDispatcher.addTool({
+        "tavily_map",
+        "List the URLs on a website, optionally filtered by instructions. Arguments: url (string), instructions (optional string).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* url = args.find("url");
+            if (url == nullptr || !url->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"url\"."});
+                return;
+            }
+            QString instructions;
+            if (const kestrel::storage::json::Value* i = args.find("instructions"); i != nullptr && i->isString()) {
+                instructions = QString::fromStdString(std::string(*i->asString()));
+            }
+            kestrel::app::tavilyMap(networkAccess, QString::fromStdString(std::string(*url->asString())),
+                                    instructions, std::move(done));
+        }});
+    mcpDispatcher.addTool({
+        "tavily_crawl",
+        "Crawl a website section and return the text of the pages it finds. Arguments: url (string), instructions (optional string).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* url = args.find("url");
+            if (url == nullptr || !url->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"url\"."});
+                return;
+            }
+            QString instructions;
+            if (const kestrel::storage::json::Value* i = args.find("instructions"); i != nullptr && i->isString()) {
+                instructions = QString::fromStdString(std::string(*i->asString()));
+            }
+            kestrel::app::tavilyCrawl(networkAccess, QString::fromStdString(std::string(*url->asString())),
+                                      instructions, std::move(done));
+        }});
+    mcpDispatcher.addTool({
+        "tavily_research",
+        "Run multi-source cited research on a question and return a report with sources. Takes minutes. Arguments: input (string question).",
+        {kestrel::core::ToolPermission::Network},
+        nullptr,
+        [](const kestrel::storage::json::Value& args, kestrel::core::McpCompletion done) {
+            const kestrel::storage::json::Value* input = args.find("input");
+            if (input == nullptr || !input->isString()) {
+                done(kestrel::core::McpToolResult{true, "Pass a string \"input\" with the research question."});
+                return;
+            }
+            kestrel::app::tavilyResearch(networkAccess, QString::fromStdString(std::string(*input->asString())),
+                                         std::move(done));
+        }});
+    // KESTREL_MCP_ALLOW_TOOLS is "1" to enable every chat tool, or a comma-separated
+    // list of tool names to enable only those. Each enabled tool still needs its
+    // permission, and the permissions below are granted only for the tools chosen.
+    const QString allowTools = qEnvironmentVariable("KESTREL_MCP_ALLOW_TOOLS");
+    if (!allowTools.isEmpty()) {
+        const QStringList requested = allowTools == QStringLiteral("1")
+            ? QStringList{QStringLiteral("web_search"), QStringLiteral("screen_capture"),
+                          QStringLiteral("tavily_extract"), QStringLiteral("tavily_map"),
+                          QStringLiteral("tavily_crawl"), QStringLiteral("tavily_research")}
+            : allowTools.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        bool needsNetwork = false;
+        bool needsScreen = false;
+        for (const QString& entry : requested) {
+            const std::string tool = entry.trimmed().toStdString();
+            if (tool.empty()) {
+                continue;
+            }
+            mcpDispatcher.permissions().setEnabled(tool, true);
+            needsScreen = needsScreen || tool == "screen_capture";
+            needsNetwork = needsNetwork || tool.rfind("tavily_", 0) == 0 || tool == "web_search";
+        }
+        if (needsNetwork) {
+            mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::Network, true);
+        }
+        if (needsScreen) {
+            mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::CaptureScreen, true);
+        }
+    }
+    if (qEnvironmentVariable("KESTREL_MCP_ALLOW_PRIVILEGED") == QStringLiteral("1")) {
+        mcpDispatcher.permissions().setEnabled("run_privileged_command", true);
+        mcpDispatcher.permissions().grant(kestrel::core::ToolPermission::RunPrivileged, true);
+    }
+    std::unique_ptr<kestrel::app::McpServer> mcpServer;
+    const QString mcpPortText = qEnvironmentVariable("KESTREL_MCP_PORT");
+    if (!mcpPortText.isEmpty()) {
+        bool portOk = false;
+        const quint16 mcpPort = mcpPortText.toUShort(&portOk);
+        if (!portOk || mcpPort == 0) {
+            QTextStream(stderr) << "Kestrel MCP: KESTREL_MCP_PORT must be a port number from 1 to 65535.\n";
+            return 2;
+        }
+        // A token from the environment lets a launcher pick it; otherwise one is
+        // generated for this run and printed once to the launching terminal.
+        QString mcpToken = qEnvironmentVariable("KESTREL_MCP_TOKEN");
+        if (mcpToken.isEmpty()) {
+            QByteArray hex;
+            for (int word = 0; word < 4; ++word) {
+                hex += QByteArray::number(QRandomGenerator::system()->generate64(), 16).rightJustified(16, '0');
+            }
+            mcpToken = QString::fromLatin1(hex);
+            QTextStream(stderr) << "Kestrel MCP token (shown once): " << mcpToken << "\n";
+        }
+        mcpServer = std::make_unique<kestrel::app::McpServer>(mcpDispatcher, mcpToken);
+        QString mcpError;
+        if (!mcpServer->start(mcpPort, mcpError)) {
+            QTextStream(stderr) << "Kestrel MCP: " << mcpError << "\n";
+            return 2;
+        }
+        QTextStream(stderr) << "Kestrel MCP endpoint: http://127.0.0.1:" << mcpServer->port() << "/mcp\n";
+    }
+#endif
+
+    // Tell the model what Kestrel can do, so it answers truthfully when asked.
+    // The description is appended to the shared prefix once, at startup, and
+    // reflects the tools and endpoint as they are launched.
+    {
+#if KESTREL_HAS_MCP_SERVER
+        const bool endpointRunning = mcpServer != nullptr;
+        const kestrel::core::McpDispatcher& capabilityDispatcher = mcpDispatcher;
+        // The chat model may call the same tools the endpoint offers, through the
+        // same dispatcher and permissions.
+        controller.setAgentTools(&mcpDispatcher);
+#else
+        const bool endpointRunning = false;
+        const kestrel::core::McpDispatcher capabilityDispatcher;
+#endif
+        const QString capabilities = QString::fromStdString(
+            kestrel::core::describeAgentCapabilities(capabilityDispatcher, endpointRunning));
+        controller.setSystemPrompt(controller.systemPrompt() + QLatin1Char('\n') + capabilities);
+    }
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    engine.rootContext()->setContextProperty(QStringLiteral("privilegedBroker"), &privilegedBroker);
     // QQmlApplicationEngine has no errors() accessor; it reports them through
     // this signal, so the connection has to exist before the scene is loaded.
     // Without it a failure prints one bare line and the reason -- an

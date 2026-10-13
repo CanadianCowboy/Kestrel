@@ -1968,9 +1968,150 @@ void AppController::onGenerationToken(quint64 requestId, const QString& token) {
     }
 }
 
+void AppController::setAgentTools(core::McpDispatcher* tools) {
+    m_agentTools = tools;
+}
+
+// Runs one tool call the model wrote, then records the result in the transcript
+// and lets the model continue. Every call goes through the same dispatcher as
+// the MCP endpoint, so the same enable and permission checks apply.
+void AppController::runToolCall(core::ModelToolCall call) {
+    constexpr int kMaxToolRounds = 4;
+    // A new turn owns the conversation now. The call is dropped rather than
+    // answered into a turn nobody asked it for.
+    if (m_agentTools == nullptr || m_generating) {
+        return;
+    }
+    if (m_speaking || m_audioPaused) {
+        // The first part of the reply is still being spoken, and the next reply
+        // needs the voice timeline. Try again once the speech has finished.
+        QTimer::singleShot(250, this, [this, call] { runToolCall(call); });
+        return;
+    }
+    const QString name = QString::fromStdString(call.name);
+    if (m_toolRounds >= kMaxToolRounds) {
+        recordToolResult(name, QStringLiteral("Stopped: this reply already used %1 tool steps.").arg(kMaxToolRounds), true);
+        return;
+    }
+    ++m_toolRounds;
+
+    if (call.name == "list_tools") {
+        // Read from the dispatcher now, so it reflects what is enabled right now.
+        std::string listing = "Tools you can call from this chat:\n";
+        bool anyEnabled = false;
+        for (const core::McpToolSummary& tool : m_agentTools->toolSummaries()) {
+            if (!tool.enabled) {
+                continue;
+            }
+            anyEnabled = true;
+            listing += "- " + tool.name + (tool.permitted ? "" : " (a required permission is not granted)")
+                       + ": " + tool.description + "\n";
+        }
+        if (!anyEnabled) {
+            listing += "- None are enabled right now.\n";
+        }
+        recordToolResult(name, QString::fromStdString(listing), false);
+        return;
+    }
+
+    std::string parseError;
+    std::optional<storage::json::Value> arguments = storage::json::Value::parse(call.argumentsJson, parseError);
+    if (!arguments || !arguments->isObject()) {
+        arguments = storage::json::Value::makeObject();
+    }
+    storage::json::Value params = storage::json::Value::makeObject();
+    params.set("name", storage::json::Value::makeString(call.name));
+    params.set("arguments", *arguments);
+    storage::json::Value request = storage::json::Value::makeObject();
+    request.set("jsonrpc", storage::json::Value::makeString("2.0"));
+    request.set("id", storage::json::Value::makeInteger(m_toolRounds));
+    request.set("method", storage::json::Value::makeString("tools/call"));
+    request.set("params", params);
+
+    m_agentTools->handleAsync(request.serialize(), [this, name](std::string reply) {
+        std::string error;
+        const std::optional<storage::json::Value> envelope = storage::json::Value::parse(reply, error);
+        QString text = QStringLiteral("The tool did not answer.");
+        bool isError = true;
+        if (envelope) {
+            if (const storage::json::Value* result = envelope->find("result")) {
+                isError = result->find("isError") != nullptr
+                    && result->find("isError")->asBoolean().value_or(false);
+                const storage::json::Value* content = result->find("content");
+                if (content != nullptr && content->asArray() != nullptr && !content->asArray()->empty()) {
+                    const storage::json::Value* item = (*content->asArray())[0].find("text");
+                    if (item != nullptr && item->isString()) {
+                        const std::string_view body = *item->asString();
+                        text = QString::fromUtf8(body.data(), static_cast<qsizetype>(body.size()));
+                    }
+                }
+            } else if (const storage::json::Value* failure = envelope->find("error")) {
+                const storage::json::Value* message = failure->find("message");
+                if (message != nullptr && message->isString()) {
+                    const std::string_view reason = *message->asString();
+                    text = QString::fromUtf8(reason.data(), static_cast<qsizetype>(reason.size()));
+                }
+            }
+        }
+        recordToolResult(name, text, isError);
+    });
+}
+
+// The result becomes a row in the transcript, which the model sees on its next
+// pass, and the reply continues in a fresh streamed answer.
+void AppController::recordToolResult(const QString& name, const QString& text, bool isError) {
+    if (m_generating) {
+        // A turn started while the tool ran; its result no longer has a place.
+        return;
+    }
+    const QString note = QStringLiteral("Tool %1 %2:\n%3")
+        .arg(name, isError ? QStringLiteral("failed") : QStringLiteral("returned"), text);
+    m_messageModel->appendMessage(core::MessageRole::ToolResult, note, MessageStatus::Complete);
+    continueAfterTool();
+}
+
+// Starts the model again after a tool result, as a new assistant reply in the
+// same turn. The voice timeline gets a new response for it, so the answer is
+// spoken like any other.
+void AppController::continueAfterTool() {
+    m_messageModel->appendMessage(core::MessageRole::Assistant, QString(), MessageStatus::Streaming);
+    m_generating = true;
+    m_userStopped = false;
+    m_userPaused = false;
+    m_audioPaused = false;
+    m_audioStopped = false;
+    resetMetrics();
+    m_generationClock.start();
+
+    m_activeResponse = m_voice.queueResponse(std::string{});
+    m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
+    m_activeRequestId = m_nextRequestId++;
+
+    noteAssistant(core::AssistantAction::Thinking);
+    emit generatingChanged();
+    emit voiceChanged();
+    startPlayback();
+    refreshCanRegenerate();
+    touchActiveConversation();
+
+    if (m_activeGeneration == core::kInvalidGenerationId) {
+        finalizeStream(MessageStatus::Failed, QStringLiteral("An earlier response is still active."));
+        return;
+    }
+    m_worker->start(m_activeRequestId, buildMessages(), 0.7F, 512);
+}
+
 void AppController::onGenerationFinished(quint64 requestId,
                                          bool success,
                                          const QString& error) {
+    // A complete tool call in the chat reply. The normal completion below still
+    // runs and finishes this reply; the tool itself starts on the next loop turn.
+    if (requestId == m_activeRequestId && success && !m_userStopped && !m_userPaused
+        && m_agentTools != nullptr) {
+        if (std::optional<core::ModelToolCall> call = m_worker->takeToolCall()) {
+            QTimer::singleShot(0, this, [this, pending = *call] { runToolCall(pending); });
+        }
+    }
     if (requestId == m_summaryRequestId) {
         m_summaryRequestId = 0;
         const bool valid = !m_summaryCancelled && m_summaryOwner == m_activeResponse
@@ -2137,6 +2278,7 @@ void AppController::startGeneration(const QString& userText) {
     resetMetrics();
     m_generationClock.start();
 
+    m_toolRounds = 0;
     m_activeResponse = m_voice.queueResponse(userText.toStdString());
     m_activeGeneration = m_voice.beginGeneration(m_activeResponse);
     m_activeRequestId = m_nextRequestId++;
@@ -2188,7 +2330,14 @@ std::vector<runtime::ChatMessage> AppController::buildMessages() const {
                 case core::MessageRole::System:
                     role = runtime::Role::System;
                     break;
+                case core::MessageRole::ToolResult:
+                    // A chat tool's result reaches the model as a user-side
+                    // observation, which every chat template accepts.
+                    role = runtime::Role::User;
+                    break;
                 case core::MessageRole::Tool:
+                    // Local activity for the user. It never enters the model's
+                    // context, which is what keeps idle-loop output private.
                     continue;
             }
             messages.push_back(runtime::ChatMessage{role, message.content});

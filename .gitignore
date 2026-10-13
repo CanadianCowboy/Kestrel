@@ -69,3 +69,8 @@ voice-samples/
 # record one machine's screen at one moment, and the reasoning they support
 # belongs in the commit message rather than in the tree.
 audit/
+
+# Tavily API key files (keep credentials out of the repository)
+tavily_api_key
+TAVILY_API_KEY
+*.kestrel-key

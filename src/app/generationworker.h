@@ -4,7 +4,11 @@
 #include <QString>
 
 #include <atomic>
+#include <mutex>
+#include <optional>
 #include <vector>
+
+#include "core/agenttools.h"
 
 #include "runtime/modelbackend.h"
 
@@ -63,6 +67,11 @@ public:
     /// completion first.
     void setBackend(runtime::ModelBackend* backend);
 
+    // The tool call the last generation wrote, if it wrote a complete one. The
+    // text of a call is not streamed to the chat, so the caller acts on this
+    // instead. Taking it clears it.
+    [[nodiscard]] std::optional<core::ModelToolCall> takeToolCall();
+
 signals:
     void tokenReady(quint64 requestId, QString token);
     void finished(quint64 requestId, bool success, QString error);
@@ -70,6 +79,10 @@ signals:
 private:
     runtime::ModelBackend* m_backend = nullptr;
     std::atomic<bool> m_cancelRequested{false};
+    // Written on the worker thread before `finished` is emitted, read on the
+    // UI thread after it, so the mutex is what makes the hand-off safe.
+    std::mutex m_toolCallMutex;
+    std::optional<core::ModelToolCall> m_toolCall;
 };
 
 } // namespace kestrel::app
