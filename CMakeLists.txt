@@ -874,7 +874,7 @@ if(KESTREL_BUILD_UI)
             )
             set_target_properties(kestrel_app_tests PROPERTIES AUTOMOC ON)
             find_package(Qt6Network REQUIRED)
-            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Network)
+            target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Network)
             target_compile_definitions(kestrel_app_tests PRIVATE
                 KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})

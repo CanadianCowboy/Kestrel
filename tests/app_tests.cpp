@@ -22,6 +22,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickStyle>
 #include <QQuickWindow>
 #include <QElapsedTimer>
 #include <QDir>
@@ -99,11 +100,11 @@ public:
     bool loadModel(const std::string&, std::string&) override { return true; }
 
     void setTokenPieces(std::vector<std::string> pieces) { m_pieces = std::move(pieces); }
-    void setSummaryResult(std::string text, bool fail = false, int delay = 0) {
+    void setSummaryResult(std::string text, bool fail = false) {
         m_summaryText = std::move(text);
         m_summaryFails = fail;
-        m_summaryDelay = delay;
     }
+    void holdSummary(bool held) { m_summaryHeld.store(held); }
 
     void generate(const GenerationRequest& request,
                   kestrel::runtime::TokenCallback onToken,
@@ -115,7 +116,9 @@ public:
         m_generateThread = std::this_thread::get_id();
         m_cancelled.store(false, std::memory_order_release);
         if (!request.messages.empty() && request.messages.back().content.find("<remaining-answer>") != std::string::npos) {
-            for (int i = 0; i < m_summaryDelay && !m_cancelled.load(); ++i) {
+            // The test releases the result after pausing audio. Counting short
+            // sleeps as elapsed milliseconds depends on the host timer resolution.
+            while (m_summaryHeld.load() && !m_cancelled.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             if (m_cancelled.load()) { onComplete(false, "Generation stopped"); return; }
@@ -159,7 +162,7 @@ private:
     BackendKind m_kind;
     std::string m_summaryText = "Only the remaining detail, in brief.";
     bool m_summaryFails = false;
-    int m_summaryDelay = 0;
+    std::atomic<bool> m_summaryHeld{false};
     std::atomic<bool> m_cancelled{false};
     std::atomic<int> m_tokensEmitted{0};
     std::thread::id m_generateThread{};
@@ -2359,8 +2362,10 @@ void testSummaryCancellationAndQmlControls() {
     controller.setIdleLoopEnabled(false);
     controller.setDiagnosticsOpen(true);
     auto model = std::make_unique<SlowBackend>(18, 0, BackendKind::LlamaCpp);
+    auto* backend = model.get();
     model->setTokenPieces({"A detailed written sentence that includes the facts and warnings the user needs to retain and understand correctly. "});
-    model->setSummaryResult("A concise spoken remainder.", false, 1500);
+    model->setSummaryResult("A concise spoken remainder.");
+    model->holdSummary(true);
     controller.setBackendForTesting(std::move(model));
     auto speech = std::make_unique<FakeSpeechBackend>();
     auto* voice = speech.get();
@@ -2384,37 +2389,42 @@ void testSummaryCancellationAndQmlControls() {
     check(summary && echo, "QML exposes both voice preferences");
     if (!summary || !echo) { return; }
     const auto wait = [](int ms) { QEventLoop loop; QTimer::singleShot(ms, &loop, &QEventLoop::quit); loop.exec(); };
+    const auto waitUntil = [&wait](const auto& ready) {
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!ready() && deadline.elapsed() < 4000) { wait(20); }
+        return ready();
+    };
     check(QMetaObject::invokeMethod(summary, "toggled"), "QML summary toggle activates");
     check(!controller.automaticSpeechSummary(), "QML can disable automatic summaries");
     QMetaObject::invokeMethod(summary, "toggled");
     check(controller.automaticSpeechSummary(), "QML can enable summaries again");
     controller.sendMessage(QStringLiteral("long answer"));
-    QElapsedTimer deadline;
-    deadline.start();
-    while (!controller.summarizingSpeech() && deadline.elapsed() < 4000) { wait(20); }
-    check(controller.summarizingSpeech(), "the adaptation worker is live after the original opening");
+    check(waitUntil([&] { return controller.summarizingSpeech(); }),
+          "the adaptation worker is live after the original opening");
     controller.pauseSpeech();
     const auto before = voice->spoken.size();
-    wait(1800);
-    check(controller.canResumeSpeech() && voice->spoken.size() == before,
+    backend->holdSummary(false);
+    check(waitUntil([&] { return !controller.summarizingSpeech(); }),
+          "the summary worker completes while audio is paused");
+    check(controller.spokenSummary() == QStringLiteral("A concise spoken remainder.")
+              && controller.canResumeSpeech() && voice->spoken.size() == before,
           "a summary completing during audio pause is held without starting speech");
     controller.resumeSpeech();
-    wait(400);
-    check(voice->spoken.contains(QStringLiteral("A concise spoken remainder.")),
+    check(waitUntil([&] { return voice->spoken.contains(QStringLiteral("A concise spoken remainder.")); }),
           "resuming held summary audio speaks the generated adaptation");
     controller.stopGeneration();
 
     controller.newConversation();
+    backend->holdSummary(true);
     controller.sendMessage(QStringLiteral("long answer to cancel"));
-    deadline.restart();
-    while (!controller.summarizingSpeech() && deadline.elapsed() < 4000) { wait(20); }
-    check(controller.summarizingSpeech(), "another long answer starts a separate adaptation");
+    check(waitUntil([&] { return controller.summarizingSpeech(); }),
+          "another long answer starts a separate adaptation");
+    const auto count = voice->spoken.size();
     controller.newConversation();
     wait(100);
     check(controller.messages()->rowCount() == 0 && !controller.summarizingSpeech() && !controller.speaking(),
           "leaving cancels and drains the summary worker before replacing the conversation");
-    const auto count = voice->spoken.size();
-    wait(1600);
     check(voice->spoken.size() == count, "a late canceled summary cannot speak in the new conversation");
 }
 
@@ -4182,6 +4192,9 @@ int main(int argc, char** argv) {
     if (!dataHome.isValid()) { return 1; }
     qputenv("XDG_DATA_HOME", dataHome.path().toUtf8());
     QGuiApplication app(argc, argv);
+    // Match main.cpp: the shipped QML customizes controls, which native styles
+    // do not support. Exercise the same style as the desktop application.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
     // Do not read or overwrite the developer's actual desktop preferences.
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, configuration.path());
