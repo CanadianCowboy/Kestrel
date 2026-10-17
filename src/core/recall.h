@@ -8,67 +8,64 @@
 
 namespace kestrel::core {
 
-// What kind of thing is remembered. A fact is something the user asked Kestrel
-// to keep, or a preference it was told. A summary is a short account of a past
-// conversation.
-enum class MemoryKind {
-    Fact,
-    Summary,
-};
-
+enum class MemoryKind { Fact, Summary, Episode };
 [[nodiscard]] const char* toString(MemoryKind kind) noexcept;
 
 struct Memory {
     std::uint64_t id = 0;
     MemoryKind kind = MemoryKind::Fact;
     std::string text;
-    // Supplied by the owner. This layer never reads a clock.
+    // Time is always supplied by the owner, never read here.
     std::string createdAt;
+    std::string updatedAt;
+    std::string source = "manual";
+    bool sensitive = false;
 };
 
-// What Kestrel remembers across sessions, held in memory.
-//
-// Off by default. While off, remember() stores nothing. Turning recall off stops
-// new storage and keeps what is already stored. Only clear() deletes.
-//
-// The model reads no files and no clock. The app loads it from the profile,
-// saves it back, and supplies every timestamp.
+// Conservative heuristics, not a guarantee that all private information is
+// recognized. The UI states this explicitly; approved private records remain
+// local-only regardless of retrieval relevance.
+[[nodiscard]] bool memoryNeedsApproval(std::string_view text);
+// Empty when the message is too large. Splits without cutting UTF-8 characters.
+[[nodiscard]] std::vector<std::string> memoryChunks(std::string_view text);
+
 class Recall {
 public:
-    // Longer than this is not a memory. A memory is a sentence or two, and a
-    // long one is usually a pasted document that does not belong in recall.
-    static constexpr std::size_t kMaxTextLength = 500;
+    static constexpr std::size_t kMaxTextLength = 500; // UTF-8 bytes, not characters.
+    static constexpr std::size_t kMaxMemories = 2000;
+    static constexpr std::size_t kMaxCaptureBytes = 2000;
+    static constexpr std::size_t kMaxContextBytes = 2400;
+    static constexpr std::size_t kMaxContextRecords = 8;
 
+    // A bare domain object stays off until its owner attaches secure storage.
+    // The desktop enables fresh profiles by default; explicit opt-outs survive.
     void setEnabled(bool enabled) noexcept;
     [[nodiscard]] bool enabled() const noexcept;
 
-    // Stores one memory and returns its id. Returns 0, and stores nothing, when
-    // recall is off, when the text is empty after trimming, or when it is longer
-    // than kMaxTextLength.
-    std::uint64_t remember(MemoryKind kind, std::string_view text, std::string_view createdAt);
-
-    // Removes one memory. Returns false when no memory has that id.
+    // Exact ASCII-case/whitespace normalized duplicates reuse an existing id.
+    // Sensitive material must have explicit approval even through this API.
+    std::uint64_t remember(MemoryKind kind, std::string_view text, std::string_view createdAt,
+                           std::string_view source = "manual", bool approvedSensitive = false);
+    bool edit(std::uint64_t id, std::string_view text, std::string_view updatedAt,
+              bool approvedSensitive = false);
     bool forget(std::uint64_t id);
-
-    // Removes everything. The enabled flag is left as it is.
     void clear();
-
-    // Replaces the contents with a loaded set. Ids are kept, so a memory keeps
-    // the id it had. New memories continue after the largest id loaded.
     void restore(bool enabled, std::vector<Memory> memories);
-
-    // Oldest first, in the order they were stored.
     [[nodiscard]] const std::vector<Memory>& memories() const noexcept;
 
-    // Memories whose text contains the query, ignoring ASCII case, newest first.
-    // An empty query matches everything.
+    // Panel search is case-insensitive substring search, newest first.
     [[nodiscard]] std::vector<Memory> search(std::string_view query) const;
-
-    // The recalled material for a user turn: the newest memories first, with the
-    // oldest dropped first when the block would exceed maxCharacters. Empty when
-    // recall is off or nothing is stored. The block says what it is, so the model
-    // uses it where it bears on the question instead of reciting it.
-    [[nodiscard]] std::string contextBlock(std::size_t maxCharacters) const;
+    // Lexical relevance with inverse document-frequency weighting; newest wins
+    // ties. Nonmatching episodes never leak into unrelated questions. Explicit
+    // facts are a small background profile. Sensitive records never leave local.
+    [[nodiscard]] std::vector<Memory> retrieve(std::string_view query, bool cloud,
+                                              std::size_t limit = kMaxContextRecords) const;
+    // Formats only whole records that fit. selected receives the records really
+    // included, so the UI does not claim a record was used when it was dropped.
+    [[nodiscard]] std::string contextBlock(std::string_view query, bool cloud,
+                                            std::size_t maxBytes,
+                                            std::vector<Memory>* selected = nullptr) const;
+    [[nodiscard]] std::string contextBlock(std::size_t maxBytes) const;
 
 private:
     bool m_enabled = false;

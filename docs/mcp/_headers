@@ -1,0 +1,9 @@
+/oauth/kestrel-linux.json
+  Content-Type: application/json
+  Cache-Control: public, max-age=300
+  X-Content-Type-Options: nosniff
+
+/oauth/kestrel-windows.json
+  Content-Type: application/json
+  Cache-Control: public, max-age=300
+  X-Content-Type-Options: nosniff

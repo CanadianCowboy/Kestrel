@@ -13,6 +13,7 @@ enum class BackendKind {
     Mock,
     LlamaCpp,
     OrtGenAI,
+    Groq, // Constructed explicitly by the desktop adapter; never a local fallback.
 };
 
 // Who produced a turn. Mirrors core::MessageRole closely enough to cross the

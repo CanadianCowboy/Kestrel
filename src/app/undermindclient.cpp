@@ -9,6 +9,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -21,10 +22,17 @@
 namespace kestrel::app {
 namespace {
 
-// The client ID is the URL of the metadata document in docs/mcp, which Undermind
-// fetches to learn Kestrel's name and redirect before the user approves access.
+// The client ID is the public HTTPS URL of this platform's OAuth Client ID
+// Metadata Document, which Undermind fetches to learn Kestrel's name and
+// loopback redirect before the user approves access.
+#if defined(_WIN32)
+constexpr char kClientId[] = "https://identity.josh-lynes.com/oauth/kestrel-windows.json";
+#elif defined(__linux__)
+constexpr char kClientId[] = "https://identity.josh-lynes.com/oauth/kestrel-linux.json";
+#else
 constexpr char kClientId[] =
     "https://raw.githubusercontent.com/CanadianCowboy/Kestrel/feature/cross-os-persona/docs/mcp/kestrel-oauth-client.json";
+#endif
 constexpr char kAuthorizeUrl[] = "https://api.undermind.ai/o/authorize/";
 constexpr char kTokenUrl[] = "https://api.undermind.ai/o/token/";
 constexpr char kMcpUrl[] = "https://mcp.undermind.ai/mcp";
@@ -76,11 +84,16 @@ QString pkceVerifier() {
     return verifier;
 }
 
+QString undermindClientId() {
+    return QString::fromLatin1(kClientId);
+}
+
 std::optional<QJsonObject> jsonRpcResponse(const QByteArray& body, const QByteArray& contentType,
                                            std::int64_t id) {
     const auto matches = [id](const QJsonObject& object) {
         const QJsonValue value = object.value(QStringLiteral("id"));
-        return value.isDouble() && static_cast<std::int64_t>(value.toDouble()) == id;
+        return object.value(QStringLiteral("jsonrpc")).toString() == QStringLiteral("2.0")
+            && value.isDouble() && value.toDouble() == static_cast<double>(id);
     };
     if (contentType.contains("text/event-stream")) {
         for (const QByteArray& rawLine : body.split('\n')) {
@@ -110,6 +123,15 @@ UndermindClient::UndermindClient(QObject* parent)
     loadTokens();
 }
 
+UndermindClient::UndermindClient(QNetworkAccessManager& network,
+                                 std::unique_ptr<storage::SecretStore> store, QObject* parent)
+    : QObject(parent),
+      m_network(&network),
+      m_store(std::move(store)),
+      m_status(QStringLiteral("Not connected")) {
+    loadTokens();
+}
+
 UndermindClient::~UndermindClient() {
     closeListener();
 }
@@ -121,18 +143,53 @@ void UndermindClient::setStatus(const QString& status) {
     }
 }
 
+void UndermindClient::disconnectSession(const QString& reason) {
+    m_connected = false;
+    m_session.clear();
+    setStatus(QStringLiteral("Not connected: ") + reason);
+}
+
 void UndermindClient::connectAndList(std::function<void(bool, QJsonArray)> done) {
+    connectAndListImpl(true, std::move(done));
+}
+
+bool UndermindClient::hasSavedTokens() {
+    std::string unavailable;
+    if (!m_store->available(unavailable)) {
+        return false;
+    }
+    if (m_accessToken.isEmpty() && m_refreshToken.isEmpty()) {
+        loadTokens();
+    }
+    return !m_accessToken.isEmpty() || !m_refreshToken.isEmpty();
+}
+
+void UndermindClient::connectSavedAndList(std::function<void(bool, QJsonArray)> done) {
+    connectAndListImpl(false, std::move(done));
+}
+
+void UndermindClient::connectAndListImpl(bool allowInteractiveSignIn,
+                                         std::function<void(bool, QJsonArray)> done) {
+    if (m_connecting) {
+        done(false, QJsonArray{});
+        return;
+    }
+    m_connecting = true;
+    m_connected = false;
+    m_session.clear();
     setStatus(QStringLiteral("Connecting to Undermind..."));
     const auto fail = [this, done](const QString& reason) {
-        setStatus(QStringLiteral("Not connected: ") + reason);
+        m_connecting = false;
+        disconnectSession(reason);
         done(false, QJsonArray{});
     };
 
-    ensureToken([this, done, fail](bool ok, QString error) {
+    const auto authenticated = [this, done, fail](bool ok, QString error) {
         if (!ok) {
             fail(error);
             return;
         }
+        m_session.clear();
         const std::int64_t initId = m_nextId++;
         QJsonObject clientInfo;
         clientInfo.insert(QStringLiteral("name"), QStringLiteral("Kestrel"));
@@ -150,7 +207,10 @@ void UndermindClient::connectAndList(std::function<void(bool, QJsonArray)> done)
                         return;
                     }
                     const auto response = jsonRpcResponse(init.body, init.contentType, initId);
-                    if (!init.error.isEmpty() || !response || !response->contains(QStringLiteral("result"))) {
+                    if (!init.error.isEmpty() || !response || response->contains(QStringLiteral("error"))
+                        || !response->value(QStringLiteral("result")).isObject()
+                        || response->value(QStringLiteral("result")).toObject()
+                               .value(QStringLiteral("protocolVersion")).toString() != QString::fromLatin1(kProtocolVersion)) {
                         fail(init.error.isEmpty() ? QStringLiteral("Undermind did not answer the handshake.") : init.error);
                         return;
                     }
@@ -161,35 +221,68 @@ void UndermindClient::connectAndList(std::function<void(bool, QJsonArray)> done)
                     notice.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
                     notice.insert(QStringLiteral("method"), QStringLiteral("notifications/initialized"));
                     postMcp(notice, [this, done, fail](HttpResult ack) {
-                        if (ack.status >= 400) {
-                            fail(QStringLiteral("Undermind refused the session (HTTP %1).").arg(ack.status));
+                        if (ack.status == 401) {
+                            forgetTokens();
+                        }
+                        if (!ack.error.isEmpty() || ack.status < 200 || ack.status >= 300) {
+                            fail(ack.error.isEmpty()
+                                     ? QStringLiteral("Undermind refused the session (HTTP %1). Click Connect to retry.").arg(ack.status)
+                                     : ack.error);
                             return;
                         }
                         const std::int64_t listId = m_nextId++;
                         postMcp(rpcRequest(listId, QStringLiteral("tools/list"), QJsonObject{}),
                                 [this, done, fail, listId](HttpResult listing) {
                                     const auto response = jsonRpcResponse(listing.body, listing.contentType, listId);
+                                    if (listing.status == 401) {
+                                        forgetTokens();
+                                    }
                                     if (!listing.error.isEmpty() || !response
+                                        || response->contains(QStringLiteral("error"))
                                         || !response->value(QStringLiteral("result")).isObject()) {
                                         fail(listing.error.isEmpty()
                                                  ? QStringLiteral("Undermind did not list its tools.")
                                                  : listing.error);
                                         return;
                                     }
-                                    const QJsonArray tools = response->value(QStringLiteral("result"))
-                                                                 .toObject()
-                                                                 .value(QStringLiteral("tools"))
-                                                                 .toArray();
+                                    const QJsonValue listed = response->value(QStringLiteral("result"))
+                                                                  .toObject().value(QStringLiteral("tools"));
+                                    if (!listed.isArray()) {
+                                        fail(QStringLiteral("Undermind returned an invalid tool list. Click Connect to retry."));
+                                        return;
+                                    }
+                                    const QJsonArray tools = listed.toArray();
+                                    for (const QJsonValue& value : tools) {
+                                        const QJsonObject tool = value.toObject();
+                                        if (tool.value(QStringLiteral("name")).toString().trimmed().isEmpty()
+                                            || !tool.value(QStringLiteral("inputSchema")).isObject()) {
+                                            fail(QStringLiteral("Undermind returned an invalid tool definition. Click Connect to retry."));
+                                            return;
+                                        }
+                                    }
+                                    m_connecting = false;
+                                    m_connected = true;
                                     setStatus(QStringLiteral("Connected to Undermind, %1 tools").arg(tools.size()));
                                     done(true, tools);
                                 });
                     });
                 });
-    });
+    };
+    if (allowInteractiveSignIn) {
+        // An explicit Connect is a fresh PKCE authorization request, even
+        // when startup could have resumed an existing grant silently.
+        startSignIn(authenticated);
+    } else {
+        ensureToken(false, authenticated);
+    }
 }
 
 void UndermindClient::callTool(const std::string& name, const std::string& argumentsJson,
                                core::McpCompletion done) {
+    if (!m_connected) {
+        done(core::McpToolResult{true, "Undermind is not connected. Click Connect to sign in and discover tools."});
+        return;
+    }
     const QJsonDocument parsed = QJsonDocument::fromJson(QByteArray::fromStdString(argumentsJson));
     QJsonObject params;
     params.insert(QStringLiteral("name"), QString::fromStdString(name));
@@ -200,21 +293,24 @@ void UndermindClient::callTool(const std::string& name, const std::string& argum
             [this, id, done = std::move(done)](HttpResult reply) {
                 if (reply.status == 401) {
                     forgetTokens();
-                    setStatus(QStringLiteral("Not connected: sign in again"));
+                    disconnectSession(QStringLiteral("Undermind rejected the sign-in. Click Connect to sign in again."));
                     done(core::McpToolResult{true, "Undermind rejected the sign-in. Click Connect to sign in again."});
                     return;
                 }
                 if (reply.status == 404) {
                     // The server ended the session; the next connect starts a new one.
-                    m_session.clear();
+                    disconnectSession(QStringLiteral("Undermind's session ended. Click Connect to reconnect."));
                     done(core::McpToolResult{true, "Undermind's session ended. Click Connect to reconnect."});
                     return;
                 }
                 const auto response = jsonRpcResponse(reply.body, reply.contentType, id);
-                if (!response) {
-                    const std::string text = reply.error.isEmpty() ? "Undermind did not answer."
-                                                                   : reply.error.toStdString();
-                    done(core::McpToolResult{true, text});
+                if (!reply.error.isEmpty() || !response
+                    || (!response->value(QStringLiteral("result")).isObject()
+                        && !response->value(QStringLiteral("error")).isObject())) {
+                    const QString reason = reply.error.isEmpty()
+                        ? QStringLiteral("Undermind did not answer. Click Connect to reconnect.") : reply.error;
+                    disconnectSession(reason);
+                    done(core::McpToolResult{true, reason.toStdString()});
                     return;
                 }
                 if (const QJsonValue failure = response->value(QStringLiteral("error")); failure.isObject()) {
@@ -235,13 +331,13 @@ void UndermindClient::callTool(const std::string& name, const std::string& argum
             });
 }
 
-void UndermindClient::ensureToken(Done done) {
+void UndermindClient::ensureToken(bool allowInteractiveSignIn, Done done) {
     std::string unavailable;
     if (!m_store->available(unavailable)) {
         done(false, QString::fromStdString(unavailable));
         return;
     }
-    if (m_accessToken.isEmpty()) {
+    if (m_accessToken.isEmpty() && m_refreshToken.isEmpty()) {
         loadTokens();
     }
     const std::int64_t now = QDateTime::currentMSecsSinceEpoch();
@@ -255,20 +351,30 @@ void UndermindClient::ensureToken(Done done) {
         form.addQueryItem(QStringLiteral("refresh_token"), m_refreshToken);
         form.addQueryItem(QStringLiteral("client_id"), QString::fromLatin1(kClientId));
         form.addQueryItem(QStringLiteral("resource"), QString::fromLatin1(kResource));
-        requestTokens(form, [this, done](bool ok, QString) {
+        requestTokens(form, [this, allowInteractiveSignIn, done](bool ok, QString error) {
             if (ok) {
                 done(true, QString());
-            } else {
+            } else if (allowInteractiveSignIn) {
                 startSignIn(done);
+            } else {
+                done(false, error.isEmpty()
+                                ? QStringLiteral("Saved Undermind sign-in expired. Click Connect to sign in again.")
+                                : error);
             }
         });
+        return;
+    }
+    if (!allowInteractiveSignIn) {
+        done(false, QStringLiteral("No saved Undermind sign-in."));
         return;
     }
     startSignIn(done);
 }
 
 void UndermindClient::startSignIn(Done done) {
+    const std::uint64_t attempt = ++m_signInAttempt;
     closeListener();
+    finishSignIn(false, QStringLiteral("A new sign-in replaced this request."));
     m_verifier = pkceVerifier();
     m_state = pkceVerifier().left(32);
 
@@ -293,7 +399,6 @@ void UndermindClient::startSignIn(Done done) {
     QUrl url(QString::fromLatin1(kAuthorizeUrl));
     url.setQuery(query);
 
-    const std::uint64_t attempt = ++m_signInAttempt;
     m_signInDone = std::move(done);
 
     connect(m_listener, &QTcpServer::newConnection, this, [this, attempt] {
@@ -304,6 +409,9 @@ void UndermindClient::startSignIn(Done done) {
         if (socket == nullptr) {
             return;
         }
+        // The listener closes after a valid callback, but this socket must
+        // survive until the token exchange has a result for the browser.
+        socket->setParent(this);
         connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
         connect(socket, &QTcpSocket::readyRead, socket, [this, attempt, socket] {
             if (!socket->canReadLine()) {
@@ -313,36 +421,62 @@ void UndermindClient::startSignIn(Done done) {
             const QList<QByteArray> parts = socket->readLine().split(' ');
             const QUrl target(QStringLiteral("http://127.0.0.1:%1").arg(kRedirectPort)
                               + (parts.size() > 1 ? QString::fromUtf8(parts[1]) : QString()));
-            if (parts.size() < 2 || target.path() != QStringLiteral("/callback")) {
+            if (parts.size() < 3 || parts[0] != "GET" || target.path() != QStringLiteral("/callback")) {
                 socket->write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                 socket->disconnectFromHost();
                 return;
             }
+            if (attempt != m_signInAttempt || !m_signInDone) {
+                socket->disconnectFromHost();
+                return;
+            }
+            // Stop reading this socket before waiting for the token exchange:
+            // the browser may still send headers, but they are not a new callback.
+            socket->disconnect(socket, &QTcpSocket::readyRead, socket, nullptr);
+            const QPointer<QTcpSocket> callbackSocket(socket);
+            const auto answer = [callbackSocket](bool ok) {
+                if (callbackSocket && callbackSocket->state() == QAbstractSocket::ConnectedState) {
+                    callbackSocket->write(htmlPage(ok
+                        ? QStringLiteral("Kestrel is signed in to Undermind. Return to Kestrel to check tool discovery.")
+                        : QStringLiteral("Sign-in did not complete. Return to Kestrel for the error and click Connect to try again.")));
+                    callbackSocket->disconnectFromHost();
+                }
+            };
             const QUrlQuery returned(target);
-            socket->write(htmlPage(QStringLiteral("Kestrel is signed in to Undermind. You can close this tab.")));
-            socket->disconnectFromHost();
-            if (attempt != m_signInAttempt) {
+            if (returned.queryItemValue(QStringLiteral("state"), QUrl::FullyDecoded) != m_state) {
+                answer(false);
+                finishSignIn(false, QStringLiteral("the sign-in did not match this request. Click Connect to try again."));
                 return;
             }
             closeListener();
-
             if (returned.hasQueryItem(QStringLiteral("error"))) {
-                finishSignIn(false, QStringLiteral("Undermind did not approve access: %1")
-                                        .arg(returned.queryItemValue(QStringLiteral("error_description"))));
+                QString reason = returned.queryItemValue(QStringLiteral("error_description"), QUrl::FullyDecoded);
+                if (reason.isEmpty()) {
+                    reason = returned.queryItemValue(QStringLiteral("error"), QUrl::FullyDecoded);
+                }
+                answer(false);
+                finishSignIn(false, QStringLiteral("Undermind did not approve access: %1. Click Connect to retry.").arg(reason));
                 return;
             }
-            if (returned.queryItemValue(QStringLiteral("state")) != m_state) {
-                finishSignIn(false, QStringLiteral("the sign-in did not match this request. Click Connect to try again."));
+            const QString code = returned.queryItemValue(QStringLiteral("code"), QUrl::FullyDecoded);
+            if (code.isEmpty()) {
+                answer(false);
+                finishSignIn(false, QStringLiteral("Undermind returned no authorization code. Click Connect to try again."));
                 return;
             }
             QUrlQuery form;
             form.addQueryItem(QStringLiteral("grant_type"), QStringLiteral("authorization_code"));
-            form.addQueryItem(QStringLiteral("code"), returned.queryItemValue(QStringLiteral("code")));
+            form.addQueryItem(QStringLiteral("code"), code);
             form.addQueryItem(QStringLiteral("redirect_uri"), QString::fromLatin1(kRedirectUri));
             form.addQueryItem(QStringLiteral("client_id"), QString::fromLatin1(kClientId));
             form.addQueryItem(QStringLiteral("code_verifier"), m_verifier);
             form.addQueryItem(QStringLiteral("resource"), QString::fromLatin1(kResource));
-            requestTokens(form, [this](bool ok, QString error) { finishSignIn(ok, error); });
+            requestTokens(form, [this, attempt, answer](bool ok, QString error) {
+                answer(ok && attempt == m_signInAttempt);
+                if (attempt == m_signInAttempt) {
+                    finishSignIn(ok, error);
+                }
+            });
         });
     });
 
@@ -363,6 +497,7 @@ void UndermindClient::startSignIn(Done done) {
 }
 
 void UndermindClient::finishSignIn(bool ok, const QString& error) {
+    closeListener();
     Done done = std::exchange(m_signInDone, nullptr);
     if (done) {
         done(ok, error);
@@ -380,18 +515,29 @@ void UndermindClient::closeListener() {
 void UndermindClient::requestTokens(const QUrlQuery& form, Done done) {
     QNetworkRequest request{QUrl(QString::fromLatin1(kTokenUrl))};
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
-    QNetworkReply* reply = m_network->post(request, form.toString(QUrl::FullyEncoded).toUtf8());
+    request.setTransferTimeout(30000);
+    // QUrlQuery is URI-query encoding, not HTML form encoding: literal '+'
+    // must be escaped or the OAuth server decodes it as a space.
+    QByteArray encoded;
+    for (const auto& item : form.queryItems(QUrl::FullyDecoded)) {
+        if (!encoded.isEmpty()) { encoded += '&'; }
+        encoded += QUrl::toPercentEncoding(item.first) + '=' + QUrl::toPercentEncoding(item.second);
+    }
+    QNetworkReply* reply = m_network->post(request, encoded);
     connect(reply, &QNetworkReply::finished, this, [this, reply, done] {
         const QByteArray body = reply->readAll();
         const QString netError = reply->error() == QNetworkReply::NoError ? QString() : reply->errorString();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         reply->deleteLater();
 
         const QJsonObject object = QJsonDocument::fromJson(body).object();
-        if (!object.contains(QStringLiteral("access_token"))) {
+        if (status < 200 || status >= 300 || !netError.isEmpty()
+            || object.contains(QStringLiteral("error"))
+            || object.value(QStringLiteral("access_token")).toString().isEmpty()) {
             const QString reason = object.value(QStringLiteral("error_description")).toString();
             done(false, !reason.isEmpty() ? reason
                          : !netError.isEmpty() ? netError
-                                               : QStringLiteral("Undermind did not return a sign-in."));
+                                               : QStringLiteral("Undermind did not return a valid sign-in (HTTP %1). Click Connect to retry.").arg(status));
             return;
         }
         const QString previousRefresh = m_refreshToken;
@@ -436,7 +582,14 @@ void UndermindClient::postMcp(const QJsonObject& body, std::function<void(HttpRe
         result.body = reply->readAll();
         result.contentType = reply->header(QNetworkRequest::ContentTypeHeader).toByteArray();
         result.session = reply->rawHeader("Mcp-Session-Id");
-        if (reply->error() != QNetworkReply::NoError && result.status == 0) {
+        if (result.status == 401) {
+            result.error = QStringLiteral("Undermind rejected the sign-in. Click Connect to sign in again.");
+        } else if (result.status == 403) {
+            result.error = QStringLiteral("Undermind denied access. Check your account permissions, then click Connect.");
+        } else if (result.status < 200 || result.status >= 300) {
+            result.error = result.status == 0 ? reply->errorString()
+                : QStringLiteral("Undermind request failed (HTTP %1). Click Connect to retry.").arg(result.status);
+        } else if (reply->error() != QNetworkReply::NoError) {
             result.error = reply->errorString();
         }
         reply->deleteLater();
@@ -452,6 +605,16 @@ void UndermindClient::loadTokens() {
     }
     const QByteArray bytes(reinterpret_cast<const char*>(sealed->data()), static_cast<qsizetype>(sealed->size()));
     const QJsonObject record = QJsonDocument::fromJson(bytes).object();
+    // Tokens are issued to one client_id and one MCP resource. Ignore untagged
+    // legacy records or records saved under an older client identity so a
+    // refresh never mixes credentials across identities.
+    if (record.value(QStringLiteral("client_id")).toString() != QString::fromLatin1(kClientId)
+        || record.value(QStringLiteral("resource")).toString() != QString::fromLatin1(kResource)) {
+        m_accessToken.clear();
+        m_refreshToken.clear();
+        m_expiresAtMs = 0;
+        return;
+    }
     m_accessToken = record.value(QStringLiteral("access_token")).toString();
     m_refreshToken = record.value(QStringLiteral("refresh_token")).toString();
     m_expiresAtMs = static_cast<std::int64_t>(record.value(QStringLiteral("expires_at_ms")).toDouble(0.0));
@@ -459,6 +622,8 @@ void UndermindClient::loadTokens() {
 
 bool UndermindClient::saveTokens(QString& error) {
     QJsonObject record;
+    record.insert(QStringLiteral("client_id"), QString::fromLatin1(kClientId));
+    record.insert(QStringLiteral("resource"), QString::fromLatin1(kResource));
     record.insert(QStringLiteral("access_token"), m_accessToken);
     record.insert(QStringLiteral("refresh_token"), m_refreshToken);
     record.insert(QStringLiteral("expires_at_ms"), static_cast<double>(m_expiresAtMs));

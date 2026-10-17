@@ -460,6 +460,40 @@ void testRecallSurvivesARoundTrip() {
     check(!lone.empty(), "a profile with only recall switched on is not empty");
 }
 
+void testVersionThreeMemoryMetadataAndLegacyOptOut() {
+    Profile profile;
+    profile.recallEnabled = true;
+    StoredMemory memory;
+    memory.id = 7;
+    memory.kind = "episode";
+    memory.text = "sensitive example";
+    memory.createdAt = "2026-10-15";
+    memory.updatedAt = "2026-10-16";
+    memory.source = "conversation 2, user message 1";
+    memory.sensitive = true;
+    profile.memories.push_back(memory);
+    Profile loaded;
+    std::string error;
+    check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.loadedVersion == Profile::kCurrentVersion,
+          "source-aware memory loads in the current profile format");
+    check(loaded.memories.size() == 1 && loaded.memories.front().source == memory.source
+              && loaded.memories.front().updatedAt == memory.updatedAt && loaded.memories.front().sensitive,
+          "source, update time, and sensitive status survive persistence");
+    const std::string legacy = documentWithChecksumOf(R"({"version":2,"recallEnabled":false,"memories":[{"id":3,"kind":"fact","text":"legacy note","createdAt":"2026-10-12"}]})");
+    check(Profile::fromJson(legacy, loaded, error) && !loaded.recallEnabled && loaded.loadedVersion == 2,
+          "legacy explicit opt-out remains off");
+    check(loaded.memories.size() == 1 && loaded.memories.front().updatedAt == "2026-10-12",
+          "legacy memory acquires an update timestamp without losing its ID");
+    for (const std::string& bad : {
+            std::string(R"({"version":3,"memories":[{"id":-1,"kind":"fact","text":"bad"}]})"),
+            std::string(R"({"version":3,"memories":[{"id":1,"kind":"episode","text":"bad","sensitive":"yes"}]})"),
+            std::string(R"({"version":3,"memories":[{"id":1,"kind":"fact","text":"a"},{"id":1,"kind":"fact","text":"b"}]})"),
+            std::string(R"({"version":3,"memories":[{"id":1,"kind":"madeup","text":"bad"}]})")}) {
+        check(!Profile::fromJson(documentWithChecksumOf(bad), loaded, error) && loaded.empty(),
+              "invalid v3 metadata refuses the entire profile without partial loads");
+    }
+}
+
 // A document written before recall existed has neither field. It must load as
 // recall off with nothing remembered, not be refused.
 void testAVersionOneDocumentLoadsWithRecallOff() {
@@ -497,6 +531,30 @@ void testMistypedRecallIsRefused() {
     }
 }
 
+void testReviewedTrainingExamples() {
+    Profile profile = aFullProfile();
+    profile.trainingExamples.push_back({1, "How should you greet me?", "Formal greeting", "Hey, good to see you.", "2026-10-16"});
+    Profile loaded;
+    std::string error;
+    check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.loadedVersion == 4,
+          "v4 reviewed training examples round-trip");
+    check(loaded.trainingExamples.size() == 1 && loaded.trainingExamples.front().preferred == "Hey, good to see you."
+              && loaded.toJson() == profile.toJson(), "reviewed corrections and existing profile fields are preserved");
+    Profile onlyTraining;
+    onlyTraining.trainingExamples = profile.trainingExamples;
+    check(!onlyTraining.empty(), "reviewed examples alone make a profile nonempty");
+    check(Profile::fromJson(documentWithChecksumOf(R"({"version":3,"recallEnabled":false})"), loaded, error)
+              && loaded.trainingExamples.empty() && !loaded.recallEnabled, "v3 migration does not invent examples or enable recall");
+    for (const std::string& invalid : {
+        std::string(R"({"version":4,"trainingExamples":{}})"),
+        std::string(R"({"version":4,"trainingExamples":[{"id":1,"prompt":"a","preferred":""}]})"),
+        std::string(R"({"version":4,"trainingExamples":[{"id":1,"prompt":"a","preferred":"b"},{"id":1,"prompt":"c","preferred":"d"}]})"),
+        std::string(R"({"version":4,"trainingExamples":[{"id":1,"prompt":7,"preferred":"b"}]})")}) {
+        check(!Profile::fromJson(documentWithChecksumOf(invalid), loaded, error) && loaded.empty(),
+              "malformed reviewed data is refused without partial profile loads");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -517,6 +575,8 @@ int main() {
     testAwkwardContentSurvives();
     testARealisticProfileSurvives();
     testRecallSurvivesARoundTrip();
+    testVersionThreeMemoryMetadataAndLegacyOptOut();
+    testReviewedTrainingExamples();
     testAVersionOneDocumentLoadsWithRecallOff();
     testMistypedRecallIsRefused();
 

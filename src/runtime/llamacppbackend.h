@@ -39,6 +39,10 @@ public:
                   TokenCallback onToken,
                   CompletionCallback onComplete) override;
     void cancel() override;
+    // Explicit adapter activation; empty path removes it (rollback). Caller
+    // must keep generation idle. A failed load preserves the active adapter.
+    bool loadAdapter(const std::string& path, std::string& error);
+    [[nodiscard]] std::string adapterPath() const;
 
     // Real tokenizer when a model is loaded. Falls back to the shared
     // approximation otherwise, so callers always get a usable number.

@@ -1,5 +1,8 @@
 #include "runtime/chatformat.h"
 
+#include <algorithm>
+#include <utility>
+
 namespace kestrel::runtime {
 
 const char* toString(Role role) noexcept {
@@ -72,6 +75,35 @@ std::string renderPlainChat(const std::vector<ChatMessage>& messages, bool addAs
         }
     }
     return out;
+}
+
+std::string PlainTurnFilter::append(std::string_view text) {
+    if (m_stopped) { return {}; }
+    m_pending.append(text);
+    constexpr std::string_view markers[] = {"\nuser:", "\nUser:", "\nassistant:", "\nAssistant:",
+                                            "\nsystem:", "\nSystem:", "\ntool:"};
+    std::size_t stop = std::string::npos;
+    for (const auto marker : markers) { stop = std::min(stop, m_pending.find(marker)); }
+    if (stop != std::string::npos) {
+        std::string safe = m_pending.substr(0, stop);
+        m_pending.clear();
+        m_stopped = true;
+        return safe;
+    }
+    std::size_t held = 0;
+    for (const auto marker : markers) {
+        for (std::size_t length = 1; length < marker.size() && length <= m_pending.size(); ++length) {
+            if (m_pending.ends_with(marker.substr(0, length))) { held = std::max(held, length); }
+        }
+    }
+    const std::size_t ready = m_pending.size() - held;
+    std::string safe = m_pending.substr(0, ready);
+    m_pending.erase(0, ready);
+    return safe;
+}
+
+std::string PlainTurnFilter::finish() {
+    return m_stopped ? std::string{} : std::exchange(m_pending, {});
 }
 
 } // namespace kestrel::runtime

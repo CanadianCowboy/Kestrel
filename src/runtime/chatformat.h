@@ -34,6 +34,18 @@ std::string renderPlainPrefix(const std::vector<ChatMessage>& messages);
 // beginning of a reply rather than more user text.
 std::string renderPlainChat(const std::vector<ChatMessage>& messages, bool addAssistantCue);
 
+// Holds partial plain-transcript role markers across token boundaries, stopping
+// before a base model fabricates another speaker. Only used for base models.
+class PlainTurnFilter {
+public:
+    std::string append(std::string_view text);
+    std::string finish();
+    [[nodiscard]] bool stopped() const noexcept { return m_stopped; }
+private:
+    std::string m_pending;
+    bool m_stopped = false;
+};
+
 [[nodiscard]] const char* toString(Role role) noexcept;
 
 } // namespace kestrel::runtime

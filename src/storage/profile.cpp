@@ -5,6 +5,7 @@
 
 #include <limits>
 #include <utility>
+#include <unordered_set>
 
 namespace kestrel::storage {
 namespace {
@@ -54,9 +55,23 @@ Value bodyValue(const Profile& profile) {
         entry.set("kind", Value::makeString(memory.kind));
         entry.set("text", Value::makeString(memory.text));
         entry.set("createdAt", Value::makeString(memory.createdAt));
+        entry.set("updatedAt", Value::makeString(memory.updatedAt.empty() ? memory.createdAt : memory.updatedAt));
+        entry.set("source", Value::makeString(memory.source));
+        entry.set("sensitive", Value::makeBoolean(memory.sensitive));
         memories.push(std::move(entry));
     }
     document.set("memories", std::move(memories));
+    Value examples = Value::makeArray();
+    for (const StoredTrainingExample& example : profile.trainingExamples) {
+        Value entry = Value::makeObject();
+        entry.set("id", Value::makeInteger(example.id));
+        entry.set("prompt", Value::makeString(example.prompt));
+        entry.set("rejected", Value::makeString(example.rejected));
+        entry.set("preferred", Value::makeString(example.preferred));
+        entry.set("createdAt", Value::makeString(example.createdAt));
+        examples.push(std::move(entry));
+    }
+    document.set("trainingExamples", std::move(examples));
     return document;
 }
 
@@ -133,6 +148,11 @@ bool readRecall(const Value& body, Profile& profile, std::string& error) {
         error = "the profile's memories are not a list";
         return false;
     }
+    if (list->size() > 2000) {
+        error = "the profile exceeds the 2000-record memory limit; use a compatible build to manage it";
+        return false;
+    }
+    std::unordered_set<std::int64_t> ids;
     for (const json::Value& entry : *list) {
         if (!entry.isObject()) {
             error = "a memory in the profile is not a record";
@@ -150,10 +170,59 @@ bool readRecall(const Value& body, Profile& profile, std::string& error) {
         }
         if (!readOptionalString(entry, "kind", memory.kind, error) ||
             !readOptionalString(entry, "text", memory.text, error) ||
-            !readOptionalString(entry, "createdAt", memory.createdAt, error)) {
+            !readOptionalString(entry, "createdAt", memory.createdAt, error) ||
+            !readOptionalString(entry, "updatedAt", memory.updatedAt, error) ||
+            !readOptionalString(entry, "source", memory.source, error)) {
             return false;
         }
+        if (const Value* sensitivity = entry.find("sensitive")) {
+            const auto flag = sensitivity->asBoolean();
+            if (!flag) { error = "a memory sensitivity flag is not true or false"; return false; }
+            memory.sensitive = *flag;
+        }
+        if (memory.id <= 0 || memory.id == std::numeric_limits<std::int64_t>::max()
+            || !ids.insert(memory.id).second || memory.text.empty() || memory.text.size() > 500
+            || memory.source.size() > 200 || memory.createdAt.size() > 64 || memory.updatedAt.size() > 64
+            || (memory.kind != "fact" && memory.kind != "summary" && memory.kind != "episode")) {
+            error = "a memory has an invalid or duplicate ID, kind, text, timestamp, or source; nothing was loaded";
+            return false;
+        }
+        if (memory.updatedAt.empty()) { memory.updatedAt = memory.createdAt; }
         profile.memories.push_back(std::move(memory));
+    }
+    return true;
+}
+
+bool readTrainingExamples(const Value& body, Profile& profile, std::string& error) {
+    const Value* field = body.find("trainingExamples");
+    if (field == nullptr) { return true; }
+    const auto* list = field->asArray();
+    if (list == nullptr || list->size() > 1000) {
+        error = "trainingExamples must be a list of at most 1000 reviewed examples";
+        return false;
+    }
+    std::unordered_set<std::int64_t> ids;
+    for (const Value& entry : *list) {
+        StoredTrainingExample example;
+        const Value* id = entry.find("id");
+        const auto number = id != nullptr ? id->asInteger() : std::nullopt;
+        if (!entry.isObject() || !number || *number <= 0
+            || *number == std::numeric_limits<std::int64_t>::max() || !ids.insert(*number).second) {
+            error = "a reviewed training example has an invalid or duplicate ID";
+            return false;
+        }
+        example.id = *number;
+        if (!readOptionalString(entry, "prompt", example.prompt, error)
+            || !readOptionalString(entry, "rejected", example.rejected, error)
+            || !readOptionalString(entry, "preferred", example.preferred, error)
+            || !readOptionalString(entry, "createdAt", example.createdAt, error)) { return false; }
+        if (example.prompt.empty() || example.preferred.empty() || example.prompt.size() > 4000
+            || example.rejected.size() > 4000 || example.preferred.size() > 4000
+            || example.createdAt.size() > 64) {
+            error = "a reviewed training example has empty or oversized text";
+            return false;
+        }
+        profile.trainingExamples.push_back(std::move(example));
     }
     return true;
 }
@@ -245,6 +314,10 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         error = "the profile's version is not a number";
         return false;
     }
+    if (*versionNumber < 1) {
+        error = "the profile version must be positive";
+        return false;
+    }
     if (*versionNumber > kCurrentVersion) {
         // Refused rather than best-effort. A newer field that is quietly dropped
         // is a user losing something they can plainly see in the file.
@@ -259,9 +332,11 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
     // not sitting in a profile the caller was told is empty -- which is the
     // whole failure this function promises not to do.
     Profile assembled;
+    assembled.loadedVersion = *versionNumber;
     if (!readOptionalString(body, "modelPath", assembled.modelPath, error) ||
         !readOptionalString(body, "systemPrompt", assembled.systemPrompt, error) ||
-        !readRecall(body, assembled, error)) {
+        !readRecall(body, assembled, error) ||
+        !readTrainingExamples(body, assembled, error)) {
         return false;
     }
 

@@ -29,6 +29,7 @@
 #include "runtime/modelbackend.h"
 #include "runtime/speechrecognizer.h"
 #include "storage/secretstore.h"
+#include "storage/profile.h"
 
 namespace kestrel::app {
 
@@ -73,10 +74,16 @@ class AppController final : public QObject {
     Q_PROPERTY(bool canRegenerate READ canRegenerate NOTIFY canRegenerateChanged)
     Q_PROPERTY(bool sidebarOpen READ sidebarOpen WRITE setSidebarOpen NOTIFY sidebarOpenChanged)
     Q_PROPERTY(QString searchQuery READ searchQuery WRITE setSearchQuery NOTIFY searchQueryChanged)
-    // Recall is off until the user turns it on. recallMemories lists newest first.
+    // Fresh secure profiles enable automatic episodic recall; saved opt-outs
+    // are preserved. No storage means no recall. Lists are newest first.
     Q_PROPERTY(bool recallEnabled READ recallEnabled NOTIFY recallChanged)
     Q_PROPERTY(QVariantList recallMemories READ recallMemories NOTIFY recallChanged)
     Q_PROPERTY(QString recallError READ recallError NOTIFY recallChanged)
+    Q_PROPERTY(QString memoryNotice READ memoryNotice NOTIFY recallChanged)
+    Q_PROPERTY(QVariantList pendingMemories READ pendingMemories NOTIFY recallChanged)
+    Q_PROPERTY(QVariantList lastRecalledMemories READ lastRecalledMemories NOTIFY recallChanged)
+    Q_PROPERTY(QVariantList trainingExamples READ trainingExamples NOTIFY learningChanged)
+    Q_PROPERTY(QString learningNotice READ learningNotice NOTIFY learningChanged)
     // Every tool call the model makes and what came back, newest last. Bounded,
     // and shown in the activity panel so tool use is visible rather than only
     // implied by a reply.
@@ -198,6 +205,7 @@ class AppController final : public QObject {
     Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt NOTIFY systemPromptChanged)
 
     // Loading another local model from disk.
+    Q_PROPERTY(bool groqEnabled READ groqEnabled NOTIFY runtimeChanged)
     Q_PROPERTY(bool canLoadModel READ canLoadModel NOTIFY runtimeChanged)
     Q_PROPERTY(QString modelPath READ modelPath NOTIFY runtimeChanged)
     // Why the last load attempt failed, empty when it succeeded. Shown next to
@@ -243,6 +251,7 @@ public:
     // wait for an engine to announce itself. The production value is sized
     // against a measured model load; a test cannot wait that long.
     void setVoiceLoadTimeoutForTesting(int ms);
+    void setUndermindClientForTesting(UndermindClient* client);
 
     [[nodiscard]] MessageModel* messages() const noexcept;
     [[nodiscard]] ConversationModel* conversations() const noexcept;
@@ -256,6 +265,11 @@ public:
     [[nodiscard]] QString modelPath() const;
     /// Returns the latest model-switch error, cleared after a successful switch.
     [[nodiscard]] QString modelError() const;
+    [[nodiscard]] bool groqEnabled() const;
+    // Explicit cloud opt-in. An imported key is saved only in the OS keystore;
+    // environment credentials are session-only. Never scans the source tree.
+    Q_INVOKABLE bool configureGroq(const QString& keyFileUrl = QString(),
+                                  const QString& model = QStringLiteral("openai/gpt-oss-120b"));
     [[nodiscard]] bool generating() const noexcept;
     [[nodiscard]] bool canRegenerate() const noexcept;
     [[nodiscard]] bool sidebarOpen() const noexcept;
@@ -357,7 +371,8 @@ public:
 
     // The tools the chat model may call. Borrowed; the owner keeps it alive.
     // Calls go through the same dispatcher, so the same permissions apply.
-    void setAgentTools(core::McpDispatcher* tools);
+    void setAgentTools(core::McpDispatcher* tools, bool endpointRunning = false);
+    void refreshAgentCapabilitiesPrompt();
 
     Q_INVOKABLE void sendMessage(const QString& text);
     // Permissioned idle work. Both of these are deliberately string-keyed from
@@ -398,14 +413,30 @@ public:
     Q_INVOKABLE void renameConversation(int id, const QString& title);
     Q_INVOKABLE void deleteConversation(int id);
 
-    // Recall. Every change is saved to the encrypted profile before it is kept;
-    // if the save fails the change is undone and recallError says why.
+    // Recall mutations roll back on encrypted-save failure, except opt-out:
+    // stopping capture/retrieval takes effect immediately even if persistence fails.
     Q_INVOKABLE void setRecallEnabled(bool enabled);
+    // Explicit reviewed examples only; never auto-export recall or transcripts.
+    Q_INVOKABLE bool saveTrainingExample(const QString& prompt, const QString& rejected, const QString& preferred);
+    Q_INVOKABLE bool forgetTrainingExample(qlonglong id);
+    Q_INVOKABLE bool exportTrainingExamples(const QString& destination);
+    Q_INVOKABLE bool applyLoraAdapter(const QString& localFile); // Empty removes it.
+    Q_INVOKABLE QVariantMap latestTrainingTurn() const;
+    [[nodiscard]] QVariantList trainingExamples() const;
+    [[nodiscard]] QString learningNotice() const { return m_learningNotice; }
     Q_INVOKABLE bool rememberFact(const QString& text);
+    Q_INVOKABLE bool rememberPrivateFact(const QString& text);
+    Q_INVOKABLE bool editMemory(qlonglong id, const QString& text);
+    Q_INVOKABLE bool approveMemory(qlonglong proposalId);
+    Q_INVOKABLE void rejectMemory(qlonglong proposalId);
+    [[nodiscard]] QString memoryNotice() const { return m_memoryNotice; }
+    [[nodiscard]] QVariantList pendingMemories() const;
+    [[nodiscard]] QVariantList lastRecalledMemories() const;
     [[nodiscard]] QVariantList activityEntries() const { return m_activity; }
     Q_INVOKABLE void clearActivity();
     // Signs in to Undermind and makes its tools available to the agent.
     Q_INVOKABLE void connectUndermind();
+    void autoConnectUndermind();
     [[nodiscard]] QString undermindStatus() const;
     Q_INVOKABLE void forgetMemory(qlonglong id);
     Q_INVOKABLE void clearMemories();
@@ -465,6 +496,7 @@ signals:
     void presenceChanged();
     void idleToolsChanged();
     void recallChanged();
+    void learningChanged();
     void activityChanged();
     void undermindChanged();
     /// Notifies observers that audio availability or playback state changed.
@@ -538,7 +570,7 @@ private:
     // renders it, because only the backend knows the model's chat template --
     // and a rendered string here would have to be thrown away by anything that
     // later needs to address individual turns.
-    [[nodiscard]] std::vector<runtime::ChatMessage> buildMessages() const;
+    [[nodiscard]] std::vector<runtime::ChatMessage> buildMessages();
 
     // Spins the UI event loop until the in-flight generation reports back, or
     // the timeout expires. Needed before swapping or destroying a backend,
@@ -662,6 +694,24 @@ private:
     QString m_recallError = QStringLiteral("Recall needs the system keystore, so Kestrel cannot store anything.");
     void loadRecall();
     bool persistRecall();
+    void captureUserMemory(const QString& text);
+    bool storeMemoryText(const QString& text, core::MemoryKind kind, const QString& source,
+                         bool approvedSensitive = false, qlonglong editId = 0);
+    bool queuePrivateMemory(const QString& text, core::MemoryKind kind, const QString& source,
+                            qlonglong editId = 0);
+    struct PendingMemory {
+        qlonglong id = 0;
+        QString text;
+        core::MemoryKind kind = core::MemoryKind::Episode;
+        QString source;
+        qlonglong editId = 0;
+    };
+    std::vector<PendingMemory> m_pendingMemories;
+    qlonglong m_nextProposalId = 1;
+    std::vector<core::Memory> m_lastRecalledMemories;
+    QString m_memoryNotice;
+    std::vector<storage::StoredTrainingExample> m_trainingExamples;
+    QString m_learningNotice;
     core::IdlePersona m_idle;
     // The permission boundary for anything the loop does on its own. Held by
     // value: it is small, and sharing one would let a tool grant itself a
@@ -675,9 +725,14 @@ private:
     // "busy thinking on its own".
     quint64 m_toolRequestId = 0;
     core::McpDispatcher* m_agentTools = nullptr;
+    bool m_mcpEndpointRunning = false;
     int m_toolRounds = 0;
     QVariantList m_activity;
     UndermindClient* m_undermind = nullptr;
+    void ensureUndermindClient();
+    void registerUndermindTools(const QJsonArray& tools);
+    void disableUndermindTools();
+    void onUndermindStatusChanged();
     // The text a permissioned tool produced, accumulated from its own tokens.
     // It cannot come out of the streaming path, which only keeps the active
     // request, and it cannot be read back off the transcript, whose last row

@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 
 #include "app/generationworker.h"
+#include "app/groqbackend.h"
 #include "app/echocancelsession.h"
 #include "app/listensession.h"
 #include "app/speechsynthesizer.h"
@@ -25,7 +26,11 @@
 #include <QDateTime>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QFile>
 #include <QGuiApplication>
+#include <QPointer>
+#include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QTimer>
 #include <QUrl>
@@ -1486,6 +1491,19 @@ void AppController::setPersonaStateForTesting(const core::PersonaState& state) {
     emit presenceChanged();
 }
 
+void AppController::setUndermindClientForTesting(UndermindClient* client) {
+    disableUndermindTools();
+    if (m_undermind != nullptr && m_undermind != client) {
+        disconnect(m_undermind, nullptr, this, nullptr);
+    }
+    m_undermind = client;
+    if (m_undermind != nullptr) {
+        connect(m_undermind, &UndermindClient::statusChanged, this, &AppController::onUndermindStatusChanged,
+                Qt::UniqueConnection);
+    }
+    emit undermindChanged();
+}
+
 /// Returns whether this build provides an available llama.cpp backend.
 bool AppController::canLoadModel() const {
     // Ask a throwaway instance rather than caching a flag: whether a real model
@@ -1502,6 +1520,76 @@ QString AppController::modelPath() const {
 /// Returns the latest model-switch error, cleared after a successful switch.
 QString AppController::modelError() const {
     return m_modelError;
+}
+
+bool AppController::groqEnabled() const {
+    return m_backend->kind() == runtime::BackendKind::Groq;
+}
+
+bool AppController::configureGroq(const QString& keyFileUrl, const QString& model) {
+    const auto fail = [this](const QString& message) {
+        m_modelError = message;
+        emit modelErrorChanged();
+        return false;
+    };
+    if (workerBusy() || m_modelLoadThread) {
+        return fail(tr("Stop the current response or wait for model loading before switching to Groq."));
+    }
+    QByteArray key;
+    const QString environmentFile = qEnvironmentVariable("GROQ_API_KEY_FILE");
+    const bool importKey = !keyFileUrl.isEmpty();
+    const QString filePath = importKey ? QUrl(keyFileUrl).toLocalFile() : environmentFile;
+    if (!filePath.isEmpty()) {
+        QFile file(filePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return fail(tr("Cannot read the Groq API key file. Choose a readable plain-text key file."));
+        }
+        if (file.size() > 4096) {
+            return fail(tr("The Groq API key file is too large. It must contain only the API key."));
+        }
+        key = file.readAll().trimmed();
+    } else if (importKey) {
+        return fail(tr("Choose a local Groq API key file."));
+    } else {
+        key = qgetenv("GROQ_API_KEY").trimmed();
+    }
+    auto store = storage::makePlatformSecretStore();
+    std::string error;
+    if (key.isEmpty() && !importKey && filePath.isEmpty()) {
+        if (const auto saved = store->sealed("groq", "com.kestrel.inference", error)) {
+            key = QByteArray(reinterpret_cast<const char*>(saved->data()),
+                             static_cast<qsizetype>(saved->size()));
+        }
+    }
+    if (key.isEmpty()) {
+        return fail(tr("No Groq API key is configured. Import a key file or set GROQ_API_KEY / GROQ_API_KEY_FILE."));
+    }
+    if (!QRegularExpression(QStringLiteral("^gsk_[A-Za-z0-9]+$")).match(QString::fromLatin1(key)).hasMatch()) {
+        return fail(tr("Invalid Groq key format. The file must contain only a gsk_ API key."));
+    }
+    auto candidate = std::make_unique<GroqBackend>(key.toStdString());
+    if (!candidate->loadModel(model.toStdString(), error)) {
+        return fail(QString::fromStdString(error));
+    }
+    if (importKey) {
+        if (!store->available(error)
+            || !store->seal("groq", "com.kestrel.inference",
+                            std::vector<std::uint8_t>(key.cbegin(), key.cend()), error)) {
+            return fail(tr("Cannot save the Groq key securely: %1. Unlock your system keystore, "
+                           "or set GROQ_API_KEY_FILE for session-only use.").arg(QString::fromStdString(error)));
+        }
+    }
+    m_backend = std::move(candidate);
+    m_worker->setBackend(m_backend.get());
+    m_backend->setSystemPrompt(m_systemPrompt.toStdString());
+    m_modelPath.clear();
+    m_modelError.clear();
+    refreshCachedRuntime();
+    rebuildDiagnostics();
+    emit runtimeChanged();
+    emit metricsChanged();
+    emit modelErrorChanged();
+    return true;
 }
 
 /// Loads a candidate off the UI thread, then installs it through a queued signal.
@@ -1795,7 +1883,7 @@ void AppController::runIdleToolIfPermitted() {
     // prewarm. A tool that competed with a real question for the worker would
     // lose, and the user would watch their own answer stall behind a background
     // summary they may not even know is running.
-    if (m_idleTools.permits(core::kSummariseSessionTool) && runtimeAvailable()
+    if (!groqEnabled() && m_idleTools.permits(core::kSummariseSessionTool) && runtimeAvailable()
         && !workerBusy() && !m_speaking && !m_audioPaused) {
         startSessionSummary();
         return;
@@ -1877,7 +1965,7 @@ void AppController::onIdleTick() {
     // worker is free. Its tokens are discarded: the point is warm caches, not
     // something said.
     if (tick.produced && tick.task.kind == core::IdleTaskKind::ModelWarmup
-        && m_warmupRequestId == 0 && runtimeAvailable() && !m_generating) {
+        && m_warmupRequestId == 0 && runtimeAvailable() && !m_generating && !groqEnabled()) {
         m_warmupRequestId = m_nextRequestId++;
         m_worker->start(m_warmupRequestId, kWarmupPrompt, 0.1F, kWarmupMaxTokens);
     }
@@ -1972,8 +2060,20 @@ void AppController::onGenerationToken(quint64 requestId, const QString& token) {
     }
 }
 
-void AppController::setAgentTools(core::McpDispatcher* tools) {
+void AppController::setAgentTools(core::McpDispatcher* tools, bool endpointRunning) {
     m_agentTools = tools;
+    m_mcpEndpointRunning = endpointRunning;
+}
+
+void AppController::refreshAgentCapabilitiesPrompt() {
+    const core::McpDispatcher emptyDispatcher;
+    const core::McpDispatcher& dispatcher = m_agentTools != nullptr ? *m_agentTools : emptyDispatcher;
+    const QString capabilities = QString::fromStdString(
+        core::describeAgentCapabilities(dispatcher, m_mcpEndpointRunning));
+    const QString marker = QStringLiteral("\nKestrel's own capabilities:\n");
+    const qsizetype existing = m_systemPrompt.indexOf(marker);
+    const QString base = existing >= 0 ? m_systemPrompt.left(existing) : m_systemPrompt;
+    setSystemPrompt(base + QLatin1Char('\n') + capabilities);
 }
 
 // Runs one tool call the model wrote, then records the result in the transcript
@@ -2090,6 +2190,73 @@ QString AppController::undermindStatus() const {
     return m_undermind != nullptr ? m_undermind->status() : QStringLiteral("Not connected");
 }
 
+void AppController::ensureUndermindClient() {
+    if (m_undermind == nullptr) {
+        m_undermind = new UndermindClient(this);
+        connect(m_undermind, &UndermindClient::statusChanged, this, &AppController::onUndermindStatusChanged);
+    }
+}
+
+void AppController::disableUndermindTools() {
+    if (m_agentTools == nullptr) {
+        return;
+    }
+    bool changed = false;
+    for (const core::McpToolSummary& tool : m_agentTools->toolSummaries()) {
+        if (tool.enabled && tool.name.starts_with("undermind_")) {
+            m_agentTools->permissions().setEnabled(tool.name, false);
+            changed = true;
+        }
+    }
+    if (changed) {
+        refreshAgentCapabilitiesPrompt();
+    }
+}
+
+void AppController::onUndermindStatusChanged() {
+    if (m_undermind == nullptr || !m_undermind->connected()) {
+        disableUndermindTools();
+    }
+    emit undermindChanged();
+}
+
+void AppController::registerUndermindTools(const QJsonArray& tools) {
+    if (m_agentTools == nullptr || m_undermind == nullptr || !m_undermind->connected()) {
+        return;
+    }
+    disableUndermindTools();
+    const QPointer<UndermindClient> client(m_undermind);
+    for (const QJsonValue& value : tools) {
+        const QJsonObject tool = value.toObject();
+        const QString remote = tool.value(QStringLiteral("name")).toString();
+        if (remote.isEmpty()) {
+            continue;
+        }
+        const std::string remoteName = remote.toStdString();
+        const QByteArray schema = QJsonDocument(tool.value(QStringLiteral("inputSchema")).toObject())
+                                      .toJson(QJsonDocument::Compact);
+        const std::string description =
+            tool.value(QStringLiteral("description")).toString().toStdString()
+            + " Undermind tool. Arguments (JSON schema): " + std::string(schema.constData(), schema.size());
+        const std::string localName = "undermind_" + remoteName;
+        m_agentTools->addTool({
+            localName,
+            description,
+            {core::ToolPermission::Network},
+            nullptr,
+            [client, remoteName](const storage::json::Value& arguments, core::McpCompletion done) {
+                if (!client) {
+                    done(core::McpToolResult{true, "Undermind is not connected. Click Connect to sign in again."});
+                    return;
+                }
+                client->callTool(remoteName, arguments.serialize(), std::move(done));
+            }});
+        m_agentTools->permissions().setEnabled(localName, true);
+    }
+    m_agentTools->permissions().grant(core::ToolPermission::Network, true);
+    refreshAgentCapabilitiesPrompt();
+}
+
 // Signs in to Undermind, then registers each of its tools with the dispatcher.
 // Names are prefixed so they cannot shadow a local tool. Clicking Connect is the
 // user's grant of the Network permission these tools need.
@@ -2097,39 +2264,28 @@ void AppController::connectUndermind() {
     if (m_agentTools == nullptr) {
         return;
     }
-    if (m_undermind == nullptr) {
-        m_undermind = new UndermindClient(this);
-        connect(m_undermind, &UndermindClient::statusChanged, this, &AppController::undermindChanged);
-    }
+    ensureUndermindClient();
     m_undermind->connectAndList([this](bool ok, QJsonArray tools) {
-        if (!ok || m_agentTools == nullptr || m_undermind == nullptr) {
+        if (!ok) {
             return;
         }
-        UndermindClient* client = m_undermind;
-        for (const QJsonValue& value : tools) {
-            const QJsonObject tool = value.toObject();
-            const QString remote = tool.value(QStringLiteral("name")).toString();
-            if (remote.isEmpty()) {
-                continue;
-            }
-            const std::string remoteName = remote.toStdString();
-            const QByteArray schema = QJsonDocument(tool.value(QStringLiteral("inputSchema")).toObject())
-                                          .toJson(QJsonDocument::Compact);
-            const std::string description =
-                tool.value(QStringLiteral("description")).toString().toStdString()
-                + " Undermind tool. Arguments (JSON schema): " + std::string(schema.constData(), schema.size());
-            const std::string localName = "undermind_" + remoteName;
-            m_agentTools->addTool({
-                localName,
-                description,
-                {core::ToolPermission::Network},
-                nullptr,
-                [client, remoteName](const storage::json::Value& arguments, core::McpCompletion done) {
-                    client->callTool(remoteName, arguments.serialize(), std::move(done));
-                }});
-            m_agentTools->permissions().setEnabled(localName, true);
+        registerUndermindTools(tools);
+    });
+}
+
+void AppController::autoConnectUndermind() {
+    if (m_agentTools == nullptr) {
+        return;
+    }
+    ensureUndermindClient();
+    if (!m_undermind->hasSavedTokens()) {
+        return;
+    }
+    m_undermind->connectSavedAndList([this](bool ok, QJsonArray tools) {
+        if (!ok) {
+            return;
         }
-        m_agentTools->permissions().grant(core::ToolPermission::Network, true);
+        registerUndermindTools(tools);
     });
 }
 
@@ -2382,7 +2538,7 @@ void AppController::startGeneration(const QString& userText) {
     m_worker->start(m_activeRequestId, buildMessages(), 0.7F, 512);
 }
 
-std::vector<runtime::ChatMessage> AppController::buildMessages() const {
+std::vector<runtime::ChatMessage> AppController::buildMessages() {
     std::vector<runtime::ChatMessage> messages;
     const ConversationEntry* entry = activeEntry();
     if (entry != nullptr) {
@@ -2422,14 +2578,22 @@ std::vector<runtime::ChatMessage> AppController::buildMessages() const {
             messages.push_back(runtime::ChatMessage{role, message.content});
         }
     }
-    // Recalled material goes into the newest user turn of this request only. It
-    // is not in the transcript the user sees, and it is not in the shared system
-    // prompt, which is the cached prefix and must not change between turns.
-    constexpr std::size_t kRecallContextCharacters = 1200;
-    const std::string recalled = m_recall.contextBlock(kRecallContextCharacters);
-    if (!recalled.empty() && !messages.empty() && messages.back().role == runtime::Role::User) {
-        messages.back().content = recalled + "\n\n" + messages.back().content;
+    // Recalled material is request-only context, not a transcript mutation or
+    // a change to the backend's stable shared system prefix.
+    std::string query;
+    if (entry != nullptr) {
+        for (auto message = entry->conversation.messages().rbegin(); message != entry->conversation.messages().rend(); ++message) {
+            if (message->role == core::MessageRole::User) { query = message->content; break; }
+        }
     }
+    const std::string recalled = m_recall.contextBlock(query, groqEnabled(),
+        core::Recall::kMaxContextBytes, &m_lastRecalledMemories);
+    if (!recalled.empty()) {
+        // Add separate context even for tool follow-ups and resumptions. Never
+        // mutate the actual user message or the cached system prefix.
+        messages.insert(messages.begin(), runtime::ChatMessage{runtime::Role::User, recalled});
+    }
+    emit recallChanged();
     // The shared system prompt is not added here. It is the backend's cached
     // prefix, and repeating it in the conversation would both undo the caching
     // and let the renderer place it somewhere the model was not trained to
@@ -2533,6 +2697,9 @@ void AppController::sendMessage(const QString& text) {
     }
 
     startGeneration(trimmed);
+    // The request has already selected earlier memories; do not spend the
+    // retrieval budget echoing the message that was just typed.
+    captureUserMemory(trimmed);
 }
 
 void AppController::stopGeneration() {
@@ -2727,6 +2894,12 @@ void AppController::setProfileStore(std::unique_ptr<storage::SecretStore> store)
 
 void AppController::loadRecall() {
     m_recall.restore(false, {});
+    m_trainingExamples.clear();
+    m_learningNotice.clear();
+    emit learningChanged();
+    m_pendingMemories.clear();
+    m_lastRecalledMemories.clear();
+    m_memoryNotice.clear();
     m_recallError.clear();
     if (!m_profileStore) {
         m_recallError = QStringLiteral("Recall needs the system keystore, so Kestrel cannot store anything.");
@@ -2750,17 +2923,26 @@ void AppController::loadRecall() {
         emit recallChanged();
         return;
     }
+    m_trainingExamples = profile.trainingExamples;
+    emit learningChanged();
     std::vector<core::Memory> memories;
     memories.reserve(profile.memories.size());
     for (const storage::StoredMemory& stored : profile.memories) {
         core::Memory memory;
         memory.id = static_cast<std::uint64_t>(stored.id);
-        memory.kind = stored.kind == "summary" ? core::MemoryKind::Summary : core::MemoryKind::Fact;
+        memory.kind = stored.kind == "episode" ? core::MemoryKind::Episode
+            : stored.kind == "summary" ? core::MemoryKind::Summary : core::MemoryKind::Fact;
         memory.text = stored.text;
         memory.createdAt = stored.createdAt;
+        memory.updatedAt = stored.updatedAt;
+        memory.source = stored.source;
+        memory.sensitive = stored.sensitive;
         memories.push_back(std::move(memory));
     }
-    m_recall.restore(profile.recallEnabled, std::move(memories));
+    m_recall.restore(profile.loadedVersion == 0 ? true : profile.recallEnabled, std::move(memories));
+    if (profile.loadedVersion == 0 && !persistRecall()) {
+        m_recall.setEnabled(false);
+    }
     emit recallChanged();
 }
 
@@ -2780,6 +2962,7 @@ bool AppController::persistRecall() {
                                 storage::kProfileService, profile, error)) {
         return fail(QStringLiteral("Your saved profile could not be read, so nothing was saved: ") + qstring(error));
     }
+    profile.trainingExamples = m_trainingExamples;
     profile.recallEnabled = m_recall.enabled();
     profile.memories.clear();
     for (const core::Memory& memory : m_recall.memories()) {
@@ -2788,6 +2971,9 @@ bool AppController::persistRecall() {
         stored.kind = core::toString(memory.kind);
         stored.text = memory.text;
         stored.createdAt = memory.createdAt;
+        stored.updatedAt = memory.updatedAt;
+        stored.source = memory.source;
+        stored.sensitive = memory.sensitive;
         profile.memories.push_back(std::move(stored));
     }
     if (!profile.save(*m_profileStore, storage::Profile::kProfileAccount,
@@ -2796,6 +2982,139 @@ bool AppController::persistRecall() {
     }
     m_recallError.clear();
     emit recallChanged();
+    return true;
+}
+
+QVariantList AppController::trainingExamples() const {
+    QVariantList list;
+    for (const auto& example : m_trainingExamples) {
+        list.append(QVariantMap{{QStringLiteral("id"), static_cast<qlonglong>(example.id)},
+            {QStringLiteral("prompt"), qstring(example.prompt)},
+            {QStringLiteral("rejected"), qstring(example.rejected)},
+            {QStringLiteral("preferred"), qstring(example.preferred)}});
+    }
+    return list;
+}
+
+QVariantMap AppController::latestTrainingTurn() const {
+    if (m_generating) { return {}; }
+    const ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) { return {}; }
+    const auto& messages = entry->conversation.messages();
+    for (std::size_t i = messages.size(); i > 0; --i) {
+        if (messages[i - 1].role != core::MessageRole::Assistant) { continue; }
+        for (std::size_t j = i - 1; j > 0; --j) {
+            if (messages[j - 1].role == core::MessageRole::User) {
+                return {{QStringLiteral("prompt"), qstring(messages[j - 1].content)},
+                        {QStringLiteral("rejected"), qstring(messages[i - 1].content)}};
+            }
+        }
+    }
+    return {};
+}
+
+bool AppController::saveTrainingExample(const QString& prompt, const QString& rejected, const QString& preferred) {
+    const auto fail = [this](const QString& reason) {
+        m_learningNotice = reason;
+        emit learningChanged();
+        return false;
+    };
+    const std::string user = prompt.trimmed().toStdString();
+    const std::string original = rejected.trimmed().toStdString();
+    const std::string corrected = preferred.trimmed().toStdString();
+    if (user.empty() || corrected.empty() || user.size() > 4000 || original.size() > 4000 || corrected.size() > 4000) {
+        return fail(tr("Use a prompt and preferred answer of 1–4000 UTF-8 bytes; the original answer is optional and limited to 4000 bytes."));
+    }
+    if (core::memoryNeedsApproval(user) || core::memoryNeedsApproval(original) || core::memoryNeedsApproval(corrected)) {
+        return fail(tr("This example appears to contain private data. Remove private facts and credentials; keep them in editable memory, not training weights. Screening is best-effort."));
+    }
+    for (const auto& example : m_trainingExamples) {
+        if (example.prompt == user && example.preferred == corrected) {
+            return fail(tr("That reviewed example is already saved."));
+        }
+    }
+    if (m_trainingExamples.size() >= 1000) { return fail(tr("Training example limit reached (1000). Delete examples before adding more.")); }
+    const auto before = m_trainingExamples;
+    std::int64_t id = 1;
+    for (const auto& example : before) { id = std::max(id, example.id + 1); }
+    m_trainingExamples.push_back({id, user, original, corrected, utcNowIso().toStdString()});
+    if (!persistRecall()) {
+        m_trainingExamples = before;
+        return fail(tr("Example was not saved: ") + m_recallError);
+    }
+    m_learningNotice = tr("Reviewed example saved in encrypted local storage. Weights have NOT changed. Export explicitly for local LoRA training.");
+    emit learningChanged();
+    return true;
+}
+
+bool AppController::forgetTrainingExample(qlonglong id) {
+    const auto before = m_trainingExamples;
+    std::erase_if(m_trainingExamples, [id](const auto& example) { return example.id == id; });
+    if (before.size() == m_trainingExamples.size()) { return false; }
+    if (!persistRecall()) {
+        m_trainingExamples = before;
+        m_learningNotice = tr("Example was not deleted: ") + m_recallError;
+        emit learningChanged();
+        return false;
+    }
+    m_learningNotice = tr("Example deleted. Previously exported datasets or trained adapters are unchanged; remove or retrain those separately.");
+    emit learningChanged();
+    return true;
+}
+
+bool AppController::applyLoraAdapter(const QString& localFile) {
+    const auto fail = [this](const QString& reason) {
+        m_learningNotice = reason;
+        emit learningChanged();
+        return false;
+    };
+    if (workerBusy() || m_modelLoadThread) { return fail(tr("Stop generation and wait for model loading before changing adapters.")); }
+    auto* backend = dynamic_cast<runtime::LlamaCppBackend*>(m_backend.get());
+    if (backend == nullptr) { return fail(tr("LoRA activation requires a loaded local llama.cpp model, not cloud or preview inference.")); }
+    const QUrl url(localFile);
+    if (!url.scheme().isEmpty() && !url.isLocalFile()) { return fail(tr("Choose a local GGUF LoRA adapter, not a network URL.")); }
+    const QString path = url.isLocalFile() ? url.toLocalFile() : localFile;
+    std::string error;
+    if (!backend->loadAdapter(path.toStdString(), error)) { return fail(qstring(error)); }
+    refreshCachedRuntime();
+    rebuildDiagnostics();
+    m_learningNotice = path.isEmpty() ? tr("LoRA removed. Using unchanged base weights again.")
+        : tr("LoRA activated for this session. Start a new conversation to evaluate it; Remove LoRA rolls back to base weights.");
+    emit runtimeChanged();
+    emit metricsChanged();
+    emit learningChanged();
+    return true;
+}
+
+bool AppController::exportTrainingExamples(const QString& destination) {
+    const auto fail = [this](const QString& reason) {
+        m_learningNotice = reason;
+        emit learningChanged();
+        return false;
+    };
+    const QUrl url(destination);
+    if (!url.scheme().isEmpty() && !url.isLocalFile()) { return fail(tr("Choose a local file, not a network URL.")); }
+    const QString path = url.isLocalFile() ? url.toLocalFile() : destination;
+    if (path.isEmpty() || m_trainingExamples.empty()) { return fail(tr("Save reviewed training examples and choose a local JSONL file first.")); }
+    QByteArray lines;
+    for (const auto& example : m_trainingExamples) {
+        QJsonObject record{{QStringLiteral("schema_version"), 1}, {QStringLiteral("reviewed"), true},
+            {QStringLiteral("id"), static_cast<double>(example.id)},
+            {QStringLiteral("base_model"), QStringLiteral("Qwen/Qwen3-4B-Base")},
+            {QStringLiteral("prompt"), qstring(example.prompt)},
+            {QStringLiteral("rejected"), qstring(example.rejected)},
+            {QStringLiteral("preferred"), qstring(example.preferred)}};
+        lines += QJsonDocument(record).toJson(QJsonDocument::Compact) + '\n';
+    }
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)
+        || !file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner)
+        || file.write(lines) != lines.size() || !file.commit()) {
+        return fail(tr("Could not export training examples: ") + file.errorString());
+    }
+    m_learningNotice = tr("Exported %1 reviewed examples to %2. This file is plaintext and local; no upload or training was started.")
+        .arg(m_trainingExamples.size()).arg(path);
+    emit learningChanged();
     return true;
 }
 
@@ -2819,44 +3138,152 @@ QVariantList AppController::searchMemories(const QString& query) const {
         entry.insert(QStringLiteral("kind"), QString::fromLatin1(core::toString(memory.kind)));
         entry.insert(QStringLiteral("text"), qstring(memory.text));
         entry.insert(QStringLiteral("createdAt"), qstring(memory.createdAt));
+        entry.insert(QStringLiteral("updatedAt"), qstring(memory.updatedAt));
+        entry.insert(QStringLiteral("source"), qstring(memory.source));
+        entry.insert(QStringLiteral("sensitive"), memory.sensitive);
         list.append(entry);
     }
     return list;
 }
 
-// Every change below is saved before it is kept. If the save fails, the change
-// is undone, so what the panel shows is always what is on disk.
-
 void AppController::setRecallEnabled(bool enabled) {
     const bool wasEnabled = m_recall.enabled();
     m_recall.setEnabled(enabled);
+    if (!enabled) {
+        m_pendingMemories.clear();
+        m_lastRecalledMemories.clear();
+        m_memoryNotice = tr("Memory is off: capture and retrieval stopped. Existing memories are kept until you delete them.");
+    }
     if (!persistRecall()) {
-        m_recall.setEnabled(wasEnabled);
+        if (enabled) { m_recall.setEnabled(wasEnabled); }
+        else { m_recallError += tr(" Memory is stopped for this session, but the saved setting could not be changed. Retry before restarting."); }
         emit recallChanged();
     }
 }
 
-bool AppController::rememberFact(const QString& text) {
-    if (!m_recall.enabled()) {
-        m_recallError = QStringLiteral("Turn recall on before Kestrel can remember anything.");
+QVariantList AppController::pendingMemories() const {
+    QVariantList list;
+    for (const PendingMemory& memory : m_pendingMemories) {
+        list.append(QVariantMap{{QStringLiteral("id"), memory.id}, {QStringLiteral("text"), memory.text},
+            {QStringLiteral("source"), memory.source}});
+    }
+    return list;
+}
+
+QVariantList AppController::lastRecalledMemories() const {
+    QVariantList list;
+    for (const core::Memory& memory : m_lastRecalledMemories) {
+        list.append(QVariantMap{{QStringLiteral("id"), static_cast<qlonglong>(memory.id)},
+            {QStringLiteral("text"), qstring(memory.text)}, {QStringLiteral("source"), qstring(memory.source)}});
+    }
+    return list;
+}
+
+bool AppController::queuePrivateMemory(const QString& text, core::MemoryKind kind,
+                                        const QString& source, qlonglong editId) {
+    for (const PendingMemory& memory : m_pendingMemories) {
+        if (memory.text == text && memory.editId == editId) { return true; }
+    }
+    if (m_pendingMemories.size() >= 20) {
+        m_memoryNotice = tr("Private memory approval queue is full (20). Review it before adding more.");
         emit recallChanged();
         return false;
     }
-    const std::vector<core::Memory> before = m_recall.memories();
-    const std::uint64_t id = m_recall.remember(core::MemoryKind::Fact, text.toUtf8().toStdString(),
-                                               utcNowIso().toUtf8().toStdString());
-    if (id == 0) {
-        m_recallError = QStringLiteral("Nothing was remembered: the text is empty or longer than ")
-            + QString::number(static_cast<qulonglong>(core::Recall::kMaxTextLength)) + QStringLiteral(" characters.");
-        emit recallChanged();
-        return false;
-    }
-    if (!persistRecall()) {
-        m_recall.restore(m_recall.enabled(), before);
-        emit recallChanged();
-        return false;
-    }
+    m_pendingMemories.push_back({m_nextProposalId++, text, kind, source, editId});
+    m_memoryNotice = tr("Sensitive memory needs approval. It has not been saved. Approved private memories are local-only.");
+    emit recallChanged();
     return true;
+}
+
+bool AppController::storeMemoryText(const QString& text, core::MemoryKind kind, const QString& source,
+                                   bool approvedSensitive, qlonglong editId) {
+    if (!m_recall.enabled()) {
+        m_recallError = tr("Turn memory on before Kestrel can remember anything.");
+        emit recallChanged();
+        return false;
+    }
+    const std::string value = text.trimmed().toStdString();
+    if (value.empty() || (editId != 0 && value.size() > core::Recall::kMaxTextLength)) {
+        m_recallError = tr("Nothing remembered: use nonempty text; edits are limited to 500 UTF-8 bytes (characters may use multiple bytes).");
+        emit recallChanged();
+        return false;
+    }
+    const auto chunks = core::memoryChunks(value);
+    if (chunks.empty()) {
+        m_recallError = tr("Nothing remembered: this message exceeds 2000 UTF-8 bytes. Save a shorter note.");
+        emit recallChanged();
+        return false;
+    }
+    if (!approvedSensitive && core::memoryNeedsApproval(value)) {
+        return queuePrivateMemory(text.trimmed(), kind, source, editId);
+    }
+    const core::Recall before = m_recall;
+    bool ok = true;
+    if (editId > 0) {
+        ok = m_recall.edit(static_cast<std::uint64_t>(editId), value, utcNowIso().toStdString(), approvedSensitive);
+    } else {
+        for (const std::string& chunk : chunks) {
+            if (m_recall.remember(kind, chunk, utcNowIso().toStdString(), source.toStdString(), approvedSensitive) == 0) {
+                ok = false; break;
+            }
+        }
+    }
+    if (!ok) {
+        m_recall = before;
+        m_recallError = tr("Memory was not changed: the record is missing, invalid, or the 2000-record limit was reached. Review or delete older memories.");
+        emit recallChanged();
+        return false;
+    }
+    if (!persistRecall()) { m_recall = before; emit recallChanged(); return false; }
+    if (editId > 0) { m_lastRecalledMemories.clear(); }
+    m_memoryNotice = editId > 0 ? tr("Memory corrected. The previous text is no longer used.")
+        : approvedSensitive ? tr("Private memory saved in the OS keystore; excluded from cloud retrieval.")
+        : tr("Memory saved locally. Open Memory to review, correct, or forget it.");
+    emit recallChanged();
+    return true;
+}
+
+bool AppController::rememberFact(const QString& text) {
+    return storeMemoryText(text, core::MemoryKind::Fact, QStringLiteral("manual"));
+}
+
+bool AppController::rememberPrivateFact(const QString& text) {
+    if (!m_recall.enabled() || core::memoryChunks(text.trimmed().toStdString()).empty()) {
+        m_recallError = tr("Turn memory on and enter a private note of 1–2000 UTF-8 bytes before requesting approval.");
+        emit recallChanged();
+        return false;
+    }
+    return queuePrivateMemory(text.trimmed(), core::MemoryKind::Fact, QStringLiteral("manual private"));
+}
+
+bool AppController::editMemory(qlonglong id, const QString& text) {
+    if (id <= 0) { return false; }
+    return storeMemoryText(text, core::MemoryKind::Fact, QStringLiteral("manual edit"), false, id);
+}
+
+void AppController::captureUserMemory(const QString& text) {
+    if (!m_recall.enabled()) { return; }
+    const ConversationEntry* entry = activeEntry();
+    if (entry == nullptr) { return; }
+    std::size_t index = entry->conversation.size();
+    while (index > 0 && entry->conversation.messages()[index - 1].role != core::MessageRole::User) { --index; }
+    storeMemoryText(text, core::MemoryKind::Episode,
+        QStringLiteral("conversation %1, user message %2").arg(m_activeId).arg(index));
+}
+
+bool AppController::approveMemory(qlonglong proposalId) {
+    const auto found = std::find_if(m_pendingMemories.begin(), m_pendingMemories.end(),
+        [proposalId](const PendingMemory& memory) { return memory.id == proposalId; });
+    if (found == m_pendingMemories.end()) { return false; }
+    const PendingMemory proposal = *found;
+    if (!storeMemoryText(proposal.text, proposal.kind, proposal.source, true, proposal.editId)) { return false; }
+    rejectMemory(proposalId);
+    return true;
+}
+
+void AppController::rejectMemory(qlonglong proposalId) {
+    std::erase_if(m_pendingMemories, [proposalId](const PendingMemory& memory) { return memory.id == proposalId; });
+    emit recallChanged();
 }
 
 void AppController::forgetMemory(qlonglong id) {
@@ -2864,6 +3291,8 @@ void AppController::forgetMemory(qlonglong id) {
         return;
     }
     const std::vector<core::Memory> before = m_recall.memories();
+    std::erase_if(m_pendingMemories, [id](const PendingMemory& memory) { return memory.editId == id; });
+    m_lastRecalledMemories.clear();
     if (!m_recall.forget(static_cast<std::uint64_t>(id))) {
         return;
     }
@@ -2874,6 +3303,10 @@ void AppController::forgetMemory(qlonglong id) {
 }
 
 void AppController::clearMemories() {
+    m_pendingMemories.clear();
+    m_lastRecalledMemories.clear();
+    m_memoryNotice.clear();
+    emit recallChanged();
     if (m_recall.memories().empty()) {
         return;
     }
@@ -2994,6 +3427,14 @@ void AppController::rebuildDiagnostics() {
                                         std::string(backendName))));
         }
         m_runtimeDiagnostics.append(entry);
+    }
+    if (groqEnabled()) {
+        QVariantMap cloud;
+        cloud.insert(QStringLiteral("label"), tr("Active backend: groq"));
+        cloud.insert(QStringLiteral("value"), QString::fromStdString(m_cachedStatus.detail));
+        cloud.insert(QStringLiteral("active"), true);
+        cloud.insert(QStringLiteral("ok"), m_cachedStatus.available);
+        m_runtimeDiagnostics.prepend(cloud);
     }
     if (!m_cachedStatus.modelLoaded) {
         QVariantMap state;

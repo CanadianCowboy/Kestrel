@@ -16,6 +16,7 @@ std::unique_ptr<ModelBackend> makeBackend(BackendKind kind) {
     case BackendKind::Mock: return std::make_unique<MockBackend>();
     case BackendKind::LlamaCpp: return std::make_unique<LlamaCppBackend>();
     case BackendKind::OrtGenAI: return std::make_unique<OrtGenAiBackend>();
+    case BackendKind::Groq: return nullptr; // The desktop owns the opt-in network adapter.
     }
     return nullptr;
 }
@@ -64,6 +65,7 @@ std::string_view toString(BackendKind kind) noexcept {
     case BackendKind::Mock: return "mock";
     case BackendKind::LlamaCpp: return "llamacpp";
     case BackendKind::OrtGenAI: return "onnx-genai";
+    case BackendKind::Groq: return "groq";
     }
     return "unknown";
 }

@@ -93,6 +93,19 @@ void testModelDiscoveryAndPlainContinuation() {
            == "Instruction\n\nuser: Question\nassistant:");
     assert(runtime::renderPlainChat({{runtime::Role::Assistant, ""}}, false) == "assistant:");
     assert(runtime::selectBackend(runtime::BackendKind::Mock)->kind() == runtime::BackendKind::Mock);
+    runtime::PlainTurnFilter filter;
+    assert(filter.append("Hello.\nu") == "Hello.");
+    assert(filter.append("se").empty());
+    assert(filter.append("r: invented question").empty());
+    assert(filter.stopped() && filter.finish().empty());
+    assert(filter.append("more fabricated text").empty());
+    runtime::PlainTurnFilter ordinary;
+    assert(ordinary.append("A line\n") == "A line");
+    assert(ordinary.append("under the sky") == "\nunder the sky");
+    assert(ordinary.finish().empty() && !ordinary.stopped());
+    runtime::PlainTurnFilter partial;
+    assert(partial.append("Answer\nus") == "Answer");
+    assert(partial.finish() == "\nus");
 }
 
 void testVersionAndByteFormatting() {
@@ -563,7 +576,33 @@ void testLlamaCppGeneratesFromRealModel() {
 
     const runtime::RuntimeStatus loaded = backend.status();
     assert(loaded.modelLoaded);
-    assert(loaded.contextLimit > 0);
+    assert(!backend.loadAdapter(modelPath + ".missing-adapter.gguf", error));
+    assert(backend.adapterPath().empty() && backend.status().modelLoaded);
+    assert(backend.loadAdapter("", error));
+    assert(backend.adapterPath().empty());
+    const std::string adapterPath = environmentOrEmpty("KESTREL_TEST_LORA");
+    if (!adapterPath.empty()) {
+        assert(backend.loadAdapter(adapterPath, error));
+        assert(backend.adapterPath() == adapterPath);
+        assert(backend.status().detail.find("LoRA:") != std::string::npos);
+        assert(!backend.loadAdapter(adapterPath + ".missing", error));
+        assert(backend.adapterPath() == adapterPath);
+        std::string adaptedReply;
+        bool adaptedOk = false;
+        backend.generate(ask("Say hello briefly.", 0.0F, 16),
+            [&](std::string_view token) { adaptedReply.append(token); },
+            [&](bool ok, std::string_view) { adaptedOk = ok; });
+        assert(adaptedOk && !adaptedReply.empty());
+        assert(backend.loadAdapter("", error));
+        assert(backend.adapterPath().empty() && backend.status().contextUsed == 0);
+    }
+    assert(loaded.contextLimit > 0 && loaded.contextLimit <= 4096);
+    if (loaded.modelName.find("Qwen3-4B-Base") != std::string::npos) {
+        // 36 layers * 8 KV heads * 128 head dimension * K+V * FP16.
+        // embedding / heads is only 80 on Qwen3 4B and undercounts the cache.
+        assert(loaded.kvCacheBytes == loaded.contextLimit * 36ULL * 8ULL * 128ULL * 2ULL * 2ULL);
+        assert(loaded.detail.find("base model: plain transcript") != std::string::npos);
+    }
 
     // The tokenizer must be real: it is the whole point of moving counting
     // behind the backend. A fixed chars-per-token ratio cannot tell two

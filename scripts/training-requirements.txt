@@ -1,0 +1,7 @@
+# Optional local-only training environment, not required by Kestrel inference.
+# Install in a project-local venv; these include CUDA dependencies and are large.
+torch==2.14.1
+transformers==5.20.1
+peft==0.21.2
+bitsandbytes==0.50.2
+accelerate==1.15.0

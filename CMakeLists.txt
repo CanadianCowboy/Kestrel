@@ -799,7 +799,8 @@ if(KESTREL_BUILD_UI)
         # The Undermind connection is part of the desktop app, so Qt Network is
         # required for it; the app cannot link without it.
         find_package(Qt6Network REQUIRED)
-        target_sources(kestrel PRIVATE src/app/undermindclient.cpp src/app/undermindclient.h)
+        target_sources(kestrel PRIVATE src/app/undermindclient.cpp src/app/undermindclient.h
+            src/app/groqbackend.cpp src/app/groqbackend.h)
         target_sources(kestrel PRIVATE src/app/shellcommand.cpp src/app/shellcommand.h
             src/app/browsertools.cpp src/app/browsertools.h
             src/app/paperlibrary.cpp src/app/paperlibrary.h)
@@ -855,6 +856,8 @@ if(KESTREL_BUILD_UI)
                 src/app/appcontroller.h
                 src/app/undermindclient.cpp
                 src/app/undermindclient.h
+                src/app/groqbackend.cpp
+                src/app/groqbackend.h
                 src/app/shellcommand.cpp
                 src/app/shellcommand.h
                 src/app/paperlibrary.cpp
@@ -1021,6 +1024,14 @@ if(KESTREL_TENSORRT_ENABLED)
 endif()
 
 if(KESTREL_BUILD_TESTS)
+    # Reviewed-data validation needs no ML packages. Keep Python optional for
+    # portable C++ builds, but register its tests when an interpreter is present.
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME kestrel_training_data_tests
+            COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p train_persona_tests.py -v)
+    endif()
     # Assertions in these suites also perform setup calls. Release must not
     # compile them away and report success without exercising the behavior.
     if(MSVC)

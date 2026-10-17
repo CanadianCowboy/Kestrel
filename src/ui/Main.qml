@@ -291,13 +291,18 @@ ApplicationWindow {
                             anchors.fill: parent
                             anchors.margins: 13
                             spacing: 7
-                            Text { text: "LOCAL RUNTIME"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                            Text { text: appController.groqEnabled ? "CLOUD RUNTIME" : "LOCAL RUNTIME"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
                             Row {
                                 spacing: 8
                                 Rectangle { width: 7; height: 7; radius: 4; color: window.accent; anchors.verticalCenter: parent.verticalCenter }
-                                Text { text: appController.modelName; color: window.ink; font.pixelSize: 12 }
+                                Text { text: appController.modelName; color: window.ink; font.pixelSize: 12; width: runtimeColumn.width - 20; elide: Text.ElideRight }
                             }
                             Text { text: appController.backendName; color: window.muted; font.pixelSize: 11 }
+                            Button {
+                                objectName: "groqSettingsButton"
+                                text: "Groq cloud…"
+                                onClicked: groqDialog.open()
+                            }
                             Row {
                                 spacing: 8
                                 visible: appController.canLoadModel
@@ -479,7 +484,7 @@ ApplicationWindow {
                         Accessible.name: "Open memory panel"
                         Text {
                             anchors.centerIn: parent
-                            text: "MEMORY"
+                            text: appController.pendingMemories.length > 0 ? "MEMORY •" : "MEMORY"
                             color: appController.recallEnabled ? window.accent : "#b5909c"
                             font.pixelSize: 10
                             font.weight: Font.DemiBold
@@ -1201,6 +1206,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     spacing: 10
                     Text {
+                        objectName: "undermindStatusText"
                         text: appController.undermindStatus
                         color: "#8b93a3"
                         font.pixelSize: 11
@@ -1216,6 +1222,7 @@ ApplicationWindow {
                         Accessible.name: "Connect Undermind"
                         Text { anchors.centerIn: parent; text: "Connect Undermind"; color: window.accent; font.pixelSize: 11 }
                         MouseArea {
+                            objectName: "connectUndermindButton"
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: appController.connectUndermind()
@@ -1284,7 +1291,7 @@ ApplicationWindow {
         }
 
         // What Kestrel remembers. Stored in the profile in the system keystore, and
-        // off until recall is switched on here. Every change is saved before it is
+        // on for fresh secure profiles; saved opt-outs are preserved. Changes are
         // shown as kept; a change that cannot be saved is undone and says why.
         Rectangle {
             id: memoryPanel
@@ -1322,7 +1329,7 @@ ApplicationWindow {
                         Column {
                             spacing: 3
                             Text { text: "Memory"; color: window.ink; font.pixelSize: 14; font.weight: Font.DemiBold }
-                            Text { text: "Ctrl+M to close  ·  kept only on this machine"; color: window.muted; font.pixelSize: 10 }
+                            Text { text: "Ctrl+M to close  ·  encrypted local storage"; color: window.muted; font.pixelSize: 10 }
                         }
                         Item { Layout.fillWidth: true }
                         Button {
@@ -1340,8 +1347,8 @@ ApplicationWindow {
                     IdleToggle {
                         label: "Remember across sessions"
                         hint: appController.recallEnabled
-                              ? "on: facts you add are kept on this machine"
-                              : "off: nothing new is stored"
+                              ? "on: user messages are saved as observations"
+                              : "off: capture and retrieval are stopped"
                         checked: appController.recallEnabled
                         onToggled: appController.setRecallEnabled(!appController.recallEnabled)
                     }
@@ -1355,6 +1362,71 @@ ApplicationWindow {
                         wrapMode: Text.WordWrap
                     }
 
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Automatic memory is on for new profiles. Sensitive-content detection is best-effort: review your memories. Approval saves private notes locally, never in cloud recall. What you type into a cloud chat still goes to that provider."
+                        color: window.muted
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                    Text {
+                        objectName: "memoryNotice"
+                        Layout.fillWidth: true
+                        text: appController.memoryNotice
+                        visible: text.length > 0
+                        color: window.accent
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                    Repeater {
+                        model: appController.pendingMemories
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            Text {
+                                text: "PRIVATE MEMORY · approval required"
+                                color: "#c58b98"
+                                font.pixelSize: 10
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: modelData.text
+                                textFormat: Text.PlainText
+                                color: window.ink
+                                wrapMode: Text.WordWrap
+                            }
+                            RowLayout {
+                                Button {
+                                    objectName: "approveMemoryButton"
+                                    text: "Approve locally"
+                                    onClicked: appController.approveMemory(modelData.id)
+                                }
+                                Button {
+                                    objectName: "rejectMemoryButton"
+                                    text: "Reject"
+                                    onClicked: appController.rejectMemory(modelData.id)
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Used in last model request: " + appController.lastRecalledMemories.length + " memories"
+                        color: window.muted
+                        font.pixelSize: 10
+                    }
+                    Repeater {
+                        model: appController.lastRecalledMemories
+                        delegate: Text {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            text: "#" + modelData.id + " · " + modelData.text
+                            textFormat: Text.PlainText
+                            color: window.muted
+                            font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                        }
+                    }
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 8
@@ -1367,18 +1439,25 @@ ApplicationWindow {
                         }
                         Button {
                             id: rememberButton
+                            objectName: "rememberMemoryButton"
                             text: "Remember"
                             enabled: appController.recallEnabled && memoryInput.text.trim().length > 0
                             onClicked: {
-                                if (appController.rememberFact(memoryInput.text)) {
-                                    memoryInput.text = ""
-                                }
+                                const accepted = memoryPrivate.checked
+                                    ? appController.rememberPrivateFact(memoryInput.text)
+                                    : appController.rememberFact(memoryInput.text)
+                                if (accepted) { memoryInput.text = "" }
                             }
                             contentItem: Text { text: parent.text; color: window.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             background: Rectangle { radius: 9; color: "#1e222a"; border.color: window.line }
                         }
                     }
 
+                    CheckBox {
+                        id: memoryPrivate
+                        objectName: "privateMemoryCheckBox"
+                        text: "Private / local only (requires approval)"
+                    }
                     TextField {
                         id: memorySearch
                         Layout.fillWidth: true
@@ -1412,18 +1491,38 @@ ApplicationWindow {
                             spacing: 4
 
                             Text {
-                                text: modelData.kind + "  ·  " + modelData.createdAt
+                                Layout.fillWidth: true
+                                text: modelData.kind + (modelData.sensitive ? " · private/local-only" : "")
+                                    + " · " + modelData.updatedAt + " · " + modelData.source
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
                                 color: window.muted
                                 font.pixelSize: 10
                             }
                             Text {
                                 Layout.fillWidth: true
                                 text: modelData.text
+                                textFormat: Text.PlainText
                                 color: window.ink
                                 font.pixelSize: 12
                                 wrapMode: Text.WordWrap
                             }
+                            TextField {
+                                id: memoryEdit
+                                objectName: "memoryEditField"
+                                Layout.fillWidth: true
+                                text: modelData.text
+                                placeholderText: "Correct this memory"
+                                enabled: appController.recallEnabled
+                            }
                             Button {
+                                objectName: "saveMemoryEditButton"
+                                text: "Save correction"
+                                enabled: appController.recallEnabled
+                                onClicked: appController.editMemory(modelData.id, memoryEdit.text)
+                            }
+                            Button {
+                                objectName: "forgetMemoryButton"
                                 text: "Forget"
                                 implicitHeight: 26
                                 Accessible.name: "Forget this memory"
@@ -1434,13 +1533,133 @@ ApplicationWindow {
                         }
                     }
 
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Behavior learning · " + appController.trainingExamples.length + " reviewed examples"
+                        color: window.ink
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        wrapMode: Text.WordWrap
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Memory is not weight training. Review a prompt and the answer you wanted, then save explicitly. Keep private facts out: deleting an example cannot undo a trained adapter. No automatic training or uploads."
+                        color: window.muted
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                    Button {
+                        objectName: "reviewLatestTrainingButton"
+                        text: "Review latest chat answer"
+                        enabled: !appController.generating
+                        onClicked: {
+                            const turn = appController.latestTrainingTurn()
+                            learningPrompt.text = turn.prompt || ""
+                            learningRejected.text = turn.rejected || ""
+                            learningPreferred.text = ""
+                            learningConsent.checked = false
+                        }
+                    }
+                    TextArea {
+                        id: learningPrompt
+                        objectName: "learningPromptField"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 72
+                        placeholderText: "Prompt (review and remove private facts)"
+                        wrapMode: TextEdit.Wrap
+                    }
+                    TextArea {
+                        id: learningRejected
+                        objectName: "learningRejectedField"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 72
+                        placeholderText: "Original answer (optional; not trained as the target)"
+                        wrapMode: TextEdit.Wrap
+                    }
+                    TextArea {
+                        id: learningPreferred
+                        objectName: "learningPreferredField"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 88
+                        placeholderText: "The answer I wanted Kestrel to give"
+                        wrapMode: TextEdit.Wrap
+                    }
+                    CheckBox {
+                        id: learningConsent
+                        objectName: "learningReviewCheckBox"
+                        text: "Reviewed: no private facts or credentials"
+                    }
+                    Button {
+                        objectName: "saveTrainingExampleButton"
+                        text: "Save reviewed example"
+                        enabled: learningConsent.checked && learningPrompt.text.trim().length > 0
+                            && learningPreferred.text.trim().length > 0
+                        onClicked: {
+                            if (appController.saveTrainingExample(learningPrompt.text, learningRejected.text, learningPreferred.text)) {
+                                learningPrompt.text = ""
+                                learningRejected.text = ""
+                                learningPreferred.text = ""
+                                learningConsent.checked = false
+                            }
+                        }
+                    }
+                    Text {
+                        objectName: "learningNoticeText"
+                        Layout.fillWidth: true
+                        text: appController.learningNotice
+                        visible: text.length > 0
+                        color: window.accent
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+                    Repeater {
+                        model: appController.trainingExamples
+                        delegate: ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            Text {
+                                Layout.fillWidth: true
+                                text: "#" + modelData.id + " · " + modelData.prompt + "\nPreferred: " + modelData.preferred
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: window.ink
+                                font.pixelSize: 11
+                            }
+                            Button {
+                                objectName: "deleteTrainingExampleButton"
+                                text: "Delete example"
+                                onClicked: appController.forgetTrainingExample(modelData.id)
+                            }
+                        }
+                    }
+                    Button {
+                        objectName: "exportTrainingExamplesButton"
+                        text: "Export reviewed JSONL (plaintext)"
+                        enabled: appController.trainingExamples.length > 0
+                        onClicked: trainingExportDialog.open()
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Button {
+                            objectName: "loadLoraAdapterButton"
+                            text: "Load GGUF LoRA…"
+                            onClicked: loraAdapterDialog.open()
+                        }
+                        Button {
+                            objectName: "removeLoraAdapterButton"
+                            text: "Remove LoRA"
+                            onClicked: appController.applyLoraAdapter("")
+                        }
+                    }
+
                     // Clearing everything takes two presses, so a stray click
                     // cannot wipe what Kestrel has learned.
                     Button {
                         id: clearButton
                         property bool armed: false
                         text: armed ? "Confirm: forget everything" : "Clear all"
-                        enabled: appController.recallMemories.length > 0
+                        enabled: appController.recallMemories.length > 0 || appController.pendingMemories.length > 0
                         Accessible.name: "Clear all memories"
                         onClicked: {
                             if (armed) {
@@ -2203,6 +2422,91 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+    }
+
+    Dialog {
+        id: groqDialog
+        objectName: "groqSettingsDialog"
+        anchors.centerIn: parent
+        width: Math.min(440, window.width - 40)
+        modal: true
+        title: "Groq cloud inference"
+        standardButtons: Dialog.Close
+        padding: 20
+        background: Rectangle { radius: 16; color: window.panelRaised; border.color: window.line }
+        header: Text {
+            text: groqDialog.title
+            color: window.ink
+            font.pixelSize: 16
+            padding: 20
+        }
+        ColumnLayout {
+            width: parent.width
+            spacing: 12
+            Text {
+                Layout.fillWidth: true
+                text: "Cloud chats send your conversation, Kestrel instructions, and tool results to Groq. Local models remain available via Load model. Idle warmup and background session summaries do not use Groq."
+                color: window.ink
+                wrapMode: Text.Wrap
+            }
+            ComboBox {
+                id: groqModel
+                Layout.fillWidth: true
+                model: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+            }
+            Button {
+                objectName: "groqUseConfiguredButton"
+                text: "Use Groq with configured key"
+                onClicked: {
+                    if (appController.configureGroq("", groqModel.currentText))
+                        groqDialog.close()
+                }
+            }
+            Button {
+                text: "Import API key file…"
+                onClicked: groqKeyDialog.open()
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Imported keys are saved in your OS keystore, never in app settings. Alternatively set GROQ_API_KEY or GROQ_API_KEY_FILE for this session."
+                color: window.muted
+                wrapMode: Text.Wrap
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: appController.modelError.length > 0
+                text: appController.modelError
+                color: "#c08a95"
+                wrapMode: Text.Wrap
+            }
+        }
+    }
+
+    FileDialog {
+        id: loraAdapterDialog
+        title: "Activate a reviewed GGUF LoRA for the loaded base model"
+        nameFilters: ["GGUF LoRA adapters (*.gguf)"]
+        onAccepted: appController.applyLoraAdapter(selectedFile.toString())
+    }
+
+    FileDialog {
+        id: trainingExportDialog
+        objectName: "trainingExportDialog"
+        title: "Export reviewed training examples — plaintext, local only"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Training dataset (*.jsonl)"]
+        defaultSuffix: "jsonl"
+        onAccepted: appController.exportTrainingExamples(selectedFile.toString())
+    }
+
+    FileDialog {
+        id: groqKeyDialog
+        title: "Choose a plain-text Groq API key file"
+        nameFilters: ["Text files (*.txt *.kestrel-key)", "All files (*)"]
+        onAccepted: {
+            if (appController.configureGroq(selectedFile.toString(), groqModel.currentText))
+                groqDialog.close()
         }
     }
 

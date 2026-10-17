@@ -27,6 +27,9 @@ namespace kestrel::app {
 // system's cryptographic generator.
 [[nodiscard]] QString pkceVerifier();
 
+// The OAuth Client ID Metadata Document URL for this build's platform.
+[[nodiscard]] QString undermindClientId();
+
 // The JSON-RPC response with `id` from a reply body. The body is either one
 // JSON object, or a server-sent event stream where the answer is in a data line.
 [[nodiscard]] std::optional<QJsonObject> jsonRpcResponse(const QByteArray& body,
@@ -41,17 +44,31 @@ class UndermindClient final : public QObject {
 
 public:
     explicit UndermindClient(QObject* parent = nullptr);
+    // Injectable transport and storage for protocol tests. The network must
+    // outlive this client; the normal constructor always uses the OS keystore.
+    UndermindClient(QNetworkAccessManager& network, std::unique_ptr<storage::SecretStore> store,
+                    QObject* parent = nullptr);
     ~UndermindClient() override;
 
     // Signs in if needed, then lists the tools. `done` receives the tools on
     // success, and an empty array when the connection failed.
     void connectAndList(std::function<void(bool ok, QJsonArray tools)> done);
 
+    // True when a saved access or refresh token is already in the keystore for
+    // this client_id and MCP resource.
+    [[nodiscard]] bool hasSavedTokens();
+
+    // Connects and lists tools using only saved tokens (and refresh_token if
+    // expired), without opening a browser if no valid token is available.
+    void connectSavedAndList(std::function<void(bool ok, QJsonArray tools)> done);
+
     // Runs one tool on the server. Arguments are the JSON the model wrote.
     void callTool(const std::string& name, const std::string& argumentsJson,
                   core::McpCompletion done);
 
     [[nodiscard]] QString status() const { return m_status; }
+    // True only after authenticated initialization and valid tool discovery.
+    [[nodiscard]] bool connected() const { return m_connected; }
 
 signals:
     void statusChanged();
@@ -68,7 +85,10 @@ private:
     using Done = std::function<void(bool ok, QString error)>;
 
     void setStatus(const QString& status);
-    void ensureToken(Done done);
+    void disconnectSession(const QString& reason);
+    void connectAndListImpl(bool allowInteractiveSignIn,
+                            std::function<void(bool ok, QJsonArray tools)> done);
+    void ensureToken(bool allowInteractiveSignIn, Done done);
     void startSignIn(Done done);
     void finishSignIn(bool ok, const QString& error);
     void closeListener();
@@ -93,6 +113,8 @@ private:
     QByteArray m_session;
     std::int64_t m_nextId = 1;
     QString m_status;
+    bool m_connected = false;
+    bool m_connecting = false;
 };
 
 } // namespace kestrel::app

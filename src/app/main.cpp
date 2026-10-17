@@ -213,9 +213,9 @@ int runSmokeTest(kestrel::app::AppController& controller, int timeoutMs, bool mo
     // here let the whole check pass against a canned reply -- which is the one
     // outcome this function exists to rule out. modelPath() is empty until a
     // GGUF is actually loaded, so it is the question worth asking.
-    if (controller.modelPath().isEmpty()) {
+    if (!controller.runtimeAvailable() || (controller.modelPath().isEmpty() && !controller.groqEnabled())) {
         out << "  FAIL    no model is loaded, so there is nothing to exercise.\n"
-               "          Pass --model <path> to run this against a real model.\n";
+               "          Pass --model <path> or --groq to exercise a real model.\n";
         out.flush();
         return 2;
     }
@@ -376,8 +376,20 @@ int main(int argc, char* argv[]) {
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    const QStringList modelCandidates =
-        modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
+    const bool useGroq = arguments.contains(QStringLiteral("--groq"));
+    if (useGroq && arguments.contains(QStringLiteral("--model"))) {
+        QTextStream(stderr) << "Choose either --groq (cloud) or --model (local), not both.\n";
+        return 2;
+    }
+    if (useGroq && !controller.configureGroq(QString(),
+            valueAfter(arguments, QStringLiteral("--groq-model")).isEmpty()
+                ? QStringLiteral("openai/gpt-oss-120b")
+                : valueAfter(arguments, QStringLiteral("--groq-model")))) {
+        QTextStream(stderr) << "Groq: " << controller.modelError() << "\n";
+        return 2;
+    }
+    const QStringList modelCandidates = useGroq ? QStringList{}
+        : modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
     if (reportRuntime && modelCandidates.isEmpty()) {
         attachToLaunchConsole();
@@ -764,22 +776,27 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Tell the model what Kestrel can do, so it answers truthfully when asked.
-    // The description is appended to the shared prefix once, at startup, and
-    // reflects the tools and endpoint as they are launched.
+    // The description is appended to the shared prefix at startup and refreshed
+    // whenever external MCP tools (such as Undermind) connect.
     {
 #if KESTREL_HAS_MCP_SERVER
         const bool endpointRunning = mcpServer != nullptr;
-        const kestrel::core::McpDispatcher& capabilityDispatcher = mcpDispatcher;
         // The chat model may call the same tools the endpoint offers, through the
         // same dispatcher and permissions.
-        controller.setAgentTools(&mcpDispatcher);
+        controller.setAgentTools(&mcpDispatcher, endpointRunning);
 #else
-        const bool endpointRunning = false;
-        const kestrel::core::McpDispatcher capabilityDispatcher;
+        controller.setAgentTools(nullptr, false);
 #endif
-        const QString capabilities = QString::fromStdString(
-            kestrel::core::describeAgentCapabilities(capabilityDispatcher, endpointRunning));
-        controller.setSystemPrompt(controller.systemPrompt() + QLatin1Char('\n') + capabilities);
+        controller.refreshAgentCapabilitiesPrompt();
+#if KESTREL_HAS_MCP_SERVER
+        if (!arguments.contains(QStringLiteral("--smoke-test"))
+            && qEnvironmentVariable("KESTREL_SCREENSHOT").isEmpty()
+            && qEnvironmentVariable("KESTREL_DEMO").isEmpty()) {
+            QTimer::singleShot(0, &controller, [&controller] {
+                controller.autoConnectUndermind();
+            });
+        }
+#endif
     }
 
     QQmlApplicationEngine engine;

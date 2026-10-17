@@ -82,25 +82,48 @@ int tokenizeInto(const llama_vocab* vocab,
     return written;
 }
 
+// Qwen3 uses an explicit head dimension (128), not embedding/head-count
+// (80 on 4B). Read GGUF dimensions before falling back to the conventional ratio.
+int64_t attentionHeadLength(const llama_model* model, const char* suffix) {
+    char architecture[64]{};
+    char value[32]{};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) > 0) {
+        const std::string key = std::string(architecture) + suffix;
+        if (llama_model_meta_val_str(model, key.c_str(), value, sizeof(value)) > 0) {
+            try {
+                const int64_t length = std::stoll(value);
+                if (length > 0 && length <= 65536) { return length; }
+            } catch (const std::exception&) {
+                return 0;
+            }
+        }
+    }
+    const int32_t heads = llama_model_n_head(model);
+    const int32_t embd = llama_model_n_embd(model);
+    return heads > 0 && embd > 0 && embd % heads == 0 ? embd / heads : 0;
+}
+
+bool isBaseModel(const llama_model* model) {
+    char finetune[64]{};
+    return llama_model_meta_val_str(model, "general.finetune", finetune, sizeof(finetune)) > 0
+        && (std::string_view(finetune) == "Base" || std::string_view(finetune) == "base");
+}
+
 // Bytes of KV cache one token occupies for `model`, or zero when the model's
 // shape is not something the arithmetic can be trusted for.
 //
 // One K row and one V row per layer per cached token, each
-// (embedding / heads) * kvHeads elements. Under grouped-query attention those
+// headDimension * kvHeads elements. Under grouped-query attention those
 // rows are far narrower than the model's embedding, which is the only reason a
 // long context is affordable at all on a card this size.
 std::size_t kvBytesPerTokenFor(const llama_model* model) {
     const int32_t layers = llama_model_n_layer(model);
-    const int32_t heads = llama_model_n_head(model);
     const int32_t headsKv = llama_model_n_head_kv(model);
-    const int32_t embd = llama_model_n_embd(model);
-    if (layers <= 0 || heads <= 0 || headsKv <= 0 || embd <= 0 || embd % heads != 0) {
-        // Without a clean head dimension any figure here would be invented.
-        return 0;
-    }
-    const auto rowElements = static_cast<int64_t>(embd / heads) * headsKv;
-    return static_cast<std::size_t>(layers) * (ggml_row_size(GGML_TYPE_F16, rowElements)
-                                              + ggml_row_size(GGML_TYPE_F16, rowElements));
+    const int64_t key = attentionHeadLength(model, ".attention.key_length");
+    const int64_t value = attentionHeadLength(model, ".attention.value_length");
+    if (layers <= 0 || headsKv <= 0 || key <= 0 || value <= 0) { return 0; }
+    return static_cast<std::size_t>(layers) * (ggml_row_size(GGML_TYPE_F16, key * headsKv)
+                                              + ggml_row_size(GGML_TYPE_F16, value * headsKv));
 }
 
 // How much of the device's memory the KV cache may take, once the weights are
@@ -120,11 +143,13 @@ constexpr std::size_t kFixedOverheadBytes = 512ULL * 1024ULL * 1024ULL;
 // this machine can hold, and a floor for a machine that can be asked neither.
 int chooseContextLength(const llama_model* model) {
     const int trained = llama_model_n_ctx_train(model);
-    const int ceiling = trained > 0 ? trained : 8192;
+    // Desktop VRAM is shared with the compositor and other apps. A modest
+    // default leaves room for those and for prompt-processing work buffers.
+    const int ceiling = std::min(trained > 0 ? trained : 4096, 4096);
 
     const std::size_t perToken = kvBytesPerTokenFor(model);
     if (perToken == 0) {
-        return std::min(ceiling, 8192);
+        return ceiling;
     }
 
     const CudaProbe probe = probeCuda();
@@ -132,8 +157,8 @@ int chooseContextLength(const llama_model* model) {
     if (device == nullptr || device->totalMemoryBytes == 0) {
         // No GPU to budget against. System RAM is the next honest thing to size
         // against, and llama.cpp will place the KV there, but it is not known
-        // cheaply and a wrong guess is expensive; 8192 is safe everywhere.
-        return std::min(ceiling, 8192);
+        // cheaply and a wrong guess is expensive; retain the modest ceiling.
+        return ceiling;
     }
 
     const std::size_t total = device->totalMemoryBytes;
@@ -153,7 +178,7 @@ int chooseContextLength(const llama_model* model) {
         // -- enough for a system prompt and a short reply -- and the caller
         // will see a small window reported rather than a load that failed for a
         // reason nobody could act on.
-        return 1024;
+        return std::min(ceiling, 1024);
     }
     // Rounded down to a multiple of 1024 so the reported figure reads as a
     // deliberate choice rather than the residue of a division.
@@ -167,6 +192,8 @@ struct LlamaCppBackend::Impl {
     llama_model* model = nullptr;
     llama_context* context = nullptr;
     std::string modelPath;
+    llama_adapter_lora* adapter = nullptr;
+    std::string adapterPath;
 
     // The KV element types the context was created with. Kept because llama.cpp
     // exposes no accessor for the resolved types, and the KV byte total is
@@ -212,6 +239,41 @@ LlamaCppBackend::~LlamaCppBackend() {
     }
 }
 
+bool LlamaCppBackend::loadAdapter(const std::string& path, std::string& error) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_impl->model == nullptr || m_impl->context == nullptr) {
+        error = "Load the matching local base model before selecting a GGUF LoRA adapter.";
+        return false;
+    }
+    llama_adapter_lora* candidate = path.empty() ? nullptr : llama_adapter_lora_init(m_impl->model, path.c_str());
+    if (!path.empty() && candidate == nullptr) {
+        error = "Could not load the GGUF LoRA adapter. Convert a PEFT adapter for this exact base model; the current adapter is unchanged.";
+        return false;
+    }
+    float scale = 1.0F;
+    if (llama_set_adapters_lora(m_impl->context, candidate != nullptr ? &candidate : nullptr,
+                                candidate != nullptr ? 1 : 0, candidate != nullptr ? &scale : nullptr) != 0) {
+        if (candidate != nullptr) { llama_adapter_lora_free(candidate); }
+        error = "llama.cpp could not activate this adapter. The current adapter is unchanged.";
+        return false;
+    }
+    if (m_impl->adapter != nullptr) { llama_adapter_lora_free(m_impl->adapter); }
+    m_impl->adapter = candidate;
+    m_impl->adapterPath = path;
+    llama_memory_clear(llama_get_memory(m_impl->context), true);
+    m_impl->prefixTokens.clear();
+    m_impl->prefixDirty = true;
+    m_contextUsed = 0;
+    refreshStatus();
+    error.clear();
+    return true;
+}
+
+std::string LlamaCppBackend::adapterPath() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_impl->adapterPath;
+}
+
 // Identifies this as the llama.cpp backend.
 BackendKind LlamaCppBackend::kind() const noexcept {
     return BackendKind::LlamaCpp;
@@ -245,6 +307,8 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
         m_impl->model = nullptr;
     }
     m_impl->modelPath.clear();
+    m_impl->adapter = nullptr;
+    m_impl->adapterPath.clear();
     refreshStatus();
 
     llama_model_params modelParams = llama_model_default_params();
@@ -260,17 +324,9 @@ bool LlamaCppBackend::loadModel(const std::string& modelPath, std::string& error
     }
 
     llama_context_params contextParams = llama_context_default_params();
-    // The context used to be a literal 4096 with the comment "the training
-    // context is not a sensible default for chat". True as far as it went, and
-    // it left the question of what *is* sensible unanswered -- so every model
-    // got the same 4K window regardless of the machine, and a conversation
-    // longer than that silently lost its oldest turns. Qwen3.5 declares
-    // 262144; the useful range on real hardware is set by VRAM, not by the
-    // model card, so the number is derived from the device rather than chosen.
-    //
-    // Fallback when there is no device to reason about: 8192, which holds a
-    // system prompt and a long conversation on any machine Kestrel runs on and
-    // is still small enough for an 8 GB card with a 4B model resident.
+    // A laptop shares VRAM with the desktop. Budget with the model's actual
+    // K/V dimensions and cap at 4K until a larger context has been measured.
+    // Advertised training context lengths are not a hardware-fit guarantee.
     const int contextLength = chooseContextLength(model);
     contextParams.n_ctx = contextLength;
 
@@ -327,6 +383,10 @@ void LlamaCppBackend::refreshStatus() {
                 ? total * m_contextUsed / m_status.contextLimit
                 : 0;
         m_status.detail = "Loaded " + m_status.modelName;
+        if (!m_impl->adapterPath.empty()) { m_status.detail += "; LoRA: " + m_impl->adapterPath; }
+        if (isBaseModel(m_impl->model)) {
+            m_status.detail += "; base model: plain transcript prompting, chat/tool behavior is not trained";
+        }
     } else {
         m_status.modelName = "No model loaded";
         m_status.contextLimit = 0;
@@ -402,11 +462,10 @@ std::size_t LlamaCppBackend::kvCacheBytes() const {
         return 0;
     }
     const int32_t layers = llama_model_n_layer(m_impl->model);
-    const int32_t heads = llama_model_n_head(m_impl->model);
     const int32_t headsKv = llama_model_n_head_kv(m_impl->model);
-    const int32_t embd = llama_model_n_embd(m_impl->model);
-    if (layers <= 0 || heads <= 0 || headsKv <= 0 || embd <= 0
-        || embd % heads != 0) {
+    const int64_t key = attentionHeadLength(m_impl->model, ".attention.key_length");
+    const int64_t value = attentionHeadLength(m_impl->model, ".attention.value_length");
+    if (layers <= 0 || headsKv <= 0 || key <= 0 || value <= 0) {
         // Without a clean head dimension any figure here would be invented.
         return 0;
     }
@@ -414,13 +473,12 @@ std::size_t LlamaCppBackend::kvCacheBytes() const {
     // One K row and one V row per layer per cached token. Under grouped-query
     // attention the rows are narrower than the model's embedding, which is
     // exactly why a KV cache is much smaller than the weights it serves.
-    const int64_t rowElements = static_cast<int64_t>(embd / heads) * headsKv;
     const auto cells = static_cast<std::size_t>(llama_n_ctx(m_impl->context));
     if (cells == 0) {
         return 0;
     }
-    const std::size_t rowK = ggml_row_size(m_impl->typeK, rowElements);
-    const std::size_t rowV = ggml_row_size(m_impl->typeV, rowElements);
+    const std::size_t rowK = ggml_row_size(m_impl->typeK, key * headsKv);
+    const std::size_t rowV = ggml_row_size(m_impl->typeV, value * headsKv);
     if (rowK == 0 || rowV == 0) {
         return 0;
     }
@@ -506,7 +564,7 @@ bool LlamaCppBackend::hasChatTemplate() const {
     if (m_impl == nullptr || m_impl->model == nullptr) {
         return false;
     }
-    return llama_model_chat_template(m_impl->model, nullptr) != nullptr;
+    return !isBaseModel(m_impl->model) && llama_model_chat_template(m_impl->model, nullptr) != nullptr;
 }
 
 std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>& messages,
@@ -515,7 +573,7 @@ std::string LlamaCppBackend::renderChat(const std::vector<ChatMessage>& messages
         return renderPlainChat(messages, addAssistantCue);
     }
     const char* tmpl = llama_model_chat_template(m_impl->model, nullptr);
-    if (tmpl == nullptr) {
+    if (tmpl == nullptr || isBaseModel(m_impl->model)) {
         return renderPlainChat(messages, addAssistantCue);
     }
 
@@ -686,6 +744,8 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     std::string piece;
     std::size_t produced = 0;
     bool sawStop = false;
+    const bool plainBase = isBaseModel(m_impl->model);
+    PlainTurnFilter turnFilter;
 
     for (int i = 0; i < maxTokens; ++i) {
         // Cooperative cancellation, checked before every decode so a stop
@@ -723,7 +783,9 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
                                                 /* lstrip */ 0, /* special */ true);
         if (length > 0) {
             piece.assign(buffer, static_cast<std::size_t>(length));
-            onToken(piece);
+            const std::string safe = plainBase ? turnFilter.append(piece) : piece;
+            if (!safe.empty()) { onToken(safe); }
+            if (plainBase && turnFilter.stopped()) { break; }
         }
 
         // One token, at its true position in the sequence. n_seq_id is a
@@ -744,6 +806,10 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
         }
     }
 
+    if (plainBase && !sawStop) {
+        const std::string remaining = turnFilter.finish();
+        if (!remaining.empty()) { onToken(remaining); }
+    }
     llama_batch_free(step);
     llama_sampler_free(chain);
 
@@ -795,6 +861,13 @@ bool LlamaCppBackend::loadModel(const std::string&, std::string& error) {
             "-DKESTREL_ENABLE_LLAMA_CPP=ON -DKESTREL_LLAMA_CPP_ROOT=<path> and rebuild.";
     return false;
 }
+
+bool LlamaCppBackend::loadAdapter(const std::string&, std::string& error) {
+    error = "Build with llama.cpp before loading a GGUF LoRA adapter.";
+    return false;
+}
+
+std::string LlamaCppBackend::adapterPath() const { return {}; }
 
 // Always fails: llama.cpp is not linked in this build.
 void LlamaCppBackend::generate(const GenerationRequest&, TokenCallback,

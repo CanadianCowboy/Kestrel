@@ -7,6 +7,10 @@
 
 #include <QCoreApplication>
 #include <QDataStream>
+#include <QDesktopServices>
+#include <QJsonDocument>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QFile>
 #include <QProcess>
 #include <cmath>
@@ -30,6 +34,7 @@
 #include <QTimer>
 #include <QUrl>
 
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <mutex>
@@ -51,6 +56,7 @@
 #include <optional>
 #include "ui/layoutaudit.h"
 #include "app/generationworker.h"
+#include "app/groqbackend.h"
 #include "app/messagemodel.h"
 #include "app/privilegedcommand.h"
 #include "app/listensession.h"
@@ -208,7 +214,12 @@ public:
     bool success = false;
     QString error;
     quint64 startedId = 0;
+    QUrl openedUrl;
 
+public slots:
+    void captureUrl(const QUrl& url) { openedUrl = url; }
+
+public:
     [[nodiscard]] int totalCharacters() const {
         int total = 0;
         for (const QString& token : tokens) {
@@ -1029,14 +1040,15 @@ std::unique_ptr<kestrel::storage::SecretStore> storeOn(kestrel::storage::InMemor
     return std::make_unique<SharedMemoryStore>(keystore, failSeals);
 }
 
-void testRecallIsOffUntilTurnedOnAndPersists() {
-    std::cout << "recall is off until turned on, and what it keeps survives a restart\n";
+void testRecallDefaultsOnWithSecureStorageAndPersists() {
+    std::cout << "recall defaults on with secure storage, preserves opt-out, and survives restart\n";
     kestrel::storage::InMemorySecretStore keystore;
     bool failSeals = false;
     {
         kestrel::app::AppController controller;
         controller.setProfileStore(storeOn(keystore, &failSeals));
-        check(!controller.recallEnabled(), "recall starts off");
+        check(controller.recallEnabled(), "fresh secure profiles enable memory by default");
+        controller.setRecallEnabled(false);
         check(!controller.rememberFact(QStringLiteral("Prefers metric units.")),
               "nothing is remembered while recall is off");
         controller.setRecallEnabled(true);
@@ -1081,7 +1093,8 @@ void testAFailedSaveUndoesTheChange() {
     check(controller.recallMemories().size() == 1, "and it is not left in the panel");
     check(!controller.recallError().isEmpty(), "with the reason shown");
     controller.setRecallEnabled(false);
-    check(controller.recallEnabled(), "turning recall off is refused while saves fail");
+    check(!controller.recallEnabled(), "privacy opt-out stops recall immediately even while saves fail");
+    check(controller.recallError().contains(QStringLiteral("session")), "an unsaved opt-out warns about restart");
     failSeals = false;
     controller.setRecallEnabled(false);
     check(!controller.recallEnabled(), "and it works again once saves do");
@@ -1172,8 +1185,9 @@ void testRecalledFactReachesTheModelButNotTheTranscript() {
     check(!requests.empty(), "the model is asked");
     if (!requests.empty() && !requests.front().messages.empty()) {
         const auto& turn = requests.front().messages.back();
+        const auto& recalled = requests.front().messages.front();
         check(turn.role == kestrel::runtime::Role::User, "the newest message is the user's");
-        check(turn.content.find("Prefers metric units.") != std::string::npos,
+        check(recalled.content.find("Prefers metric units.") != std::string::npos,
               "the model is told the remembered fact");
         check(turn.content.find("How far is it to the coast?") != std::string::npos,
               "and it still sees the question");
@@ -1186,6 +1200,231 @@ void testRecalledFactReachesTheModelButNotTheTranscript() {
                                              kestrel::app::MessageModel::ContentRole).toString();
         check(shown == QStringLiteral("How far is it to the coast?"),
               "the transcript shows only what the user typed");
+    }
+}
+
+void testAutomaticMemoryApprovalCorrectionAndCloudPrivacy() {
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    useSilentVoice(controller);
+    useImmediateModel(controller);
+    controller.sendMessage(QStringLiteral("My kestrel project uses CMake."));
+    runTurnToCompletion(controller);
+    check(controller.recallMemories().size() == 1
+              && controller.recallMemories().first().toMap().value(QStringLiteral("kind")).toString() == QStringLiteral("episode"),
+          "only the user's message is automatically stored as an episode, not assistant text");
+    controller.sendMessage(QStringLiteral("My email is example@example.invalid"));
+    runTurnToCompletion(controller);
+    check(controller.recallMemories().size() == 1 && controller.pendingMemories().size() == 1,
+          "recognized sensitive information waits for approval without persistence");
+    std::string error;
+    kestrel::storage::Profile disk;
+    check(kestrel::storage::Profile::load(keystore, kestrel::storage::Profile::kProfileAccount,
+              kestrel::storage::kProfileService, disk, error) && disk.memories.size() == 1,
+          "pending sensitive text is absent from the persisted profile");
+    const auto proposal = controller.pendingMemories().first().toMap().value(QStringLiteral("id")).toLongLong();
+    failSeals = true;
+    check(!controller.approveMemory(proposal) && controller.pendingMemories().size() == 1
+              && controller.recallMemories().size() == 1,
+          "failed private-memory save rolls back and retains approval for retry");
+    failSeals = false;
+    check(controller.approveMemory(proposal) && controller.pendingMemories().isEmpty(),
+          "explicit approval stores the private memory");
+    auto privateRecord = controller.recallMemories().first().toMap();
+    check(privateRecord.value(QStringLiteral("sensitive")).toBool(), "approved private memory is marked local-only");
+    const auto id = privateRecord.value(QStringLiteral("id")).toLongLong();
+    failSeals = true;
+    check(!controller.editMemory(id, QStringLiteral("Replacement note"))
+              && controller.recallMemories().first().toMap().value(QStringLiteral("text")).toString()
+                    == QStringLiteral("My email is example@example.invalid"),
+          "failed correction preserves the original authoritative memory");
+    failSeals = false;
+    check(controller.editMemory(id, QStringLiteral("My email is changed@example.invalid"))
+              && controller.pendingMemories().size() == 1,
+          "sensitive corrections also require approval");
+    check(controller.approveMemory(controller.pendingMemories().first().toMap().value(QStringLiteral("id")).toLongLong()),
+          "approved correction replaces the original private text");
+    controller.newConversation();
+    auto backend = std::make_unique<SlowBackend>(1, 0, BackendKind::Groq);
+    auto* observed = backend.get();
+    controller.setBackendForTesting(std::move(backend));
+    controller.sendMessage(QStringLiteral("What email did I save?"));
+    runTurnToCompletion(controller);
+    const auto requests = observed->requests();
+    std::string payload;
+    for (const auto& request : requests) { for (const auto& message : request.messages) { payload += message.content; } }
+    check(payload.find("changed@example.invalid") == std::string::npos
+              && payload.find("example@example.invalid") == std::string::npos,
+          "private memory is not retrieved into cloud requests in a new conversation");
+    controller.setRecallEnabled(false);
+    const int count = controller.recallMemories().size();
+    controller.sendMessage(QStringLiteral("Do not save this new observation."));
+    runTurnToCompletion(controller);
+    check(controller.recallMemories().size() == count && controller.lastRecalledMemories().isEmpty(),
+          "opt-out stops capture and prompt retrieval");
+    AppController reopened;
+    reopened.setProfileStore(storeOn(keystore, &failSeals));
+    check(!reopened.recallEnabled() && reopened.recallMemories().size() == count,
+          "opt-out survives restart without deleting existing records");
+    reopened.clearMemories();
+    check(reopened.recallMemories().isEmpty(), "clear removes persisted private and ordinary records");
+}
+
+QQuickItem* memoryControl(QQuickItem* item, const QString& name) {
+    if (item->objectName() == name) { return item; }
+    for (QQuickItem* child : item->childItems()) {
+        if (auto* found = memoryControl(child, name)) { return found; }
+    }
+    return nullptr;
+}
+
+void testMemoryControlsThroughQml() {
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    check(controller.rememberFact(QStringLiteral("My password is synthetic-test-only")), "sensitive manual notes enter approval");
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the real memory scene loads");
+    if (!scene) { return; }
+    scene->setProperty("memoryOpen", true);
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    check(window != nullptr, "memory controls belong to a real desktop window");
+    if (window == nullptr) { return; }
+    window->resize(980, 640);
+    QEventLoop layout;
+    QTimer::singleShot(150, &layout, &QEventLoop::quit);
+    layout.exec();
+    auto* approve = memoryControl(window->contentItem(), QStringLiteral("approveMemoryButton"));
+    check(approve && QMetaObject::invokeMethod(approve, "clicked"), "the real QML private-memory approval action works");
+    QCoreApplication::processEvents();
+    check(controller.pendingMemories().isEmpty() && controller.recallMemories().size() == 1,
+          "QML approval persists a memory and removes its pending row");
+    auto* edit = memoryControl(window->contentItem(), QStringLiteral("memoryEditField"));
+    auto* save = memoryControl(window->contentItem(), QStringLiteral("saveMemoryEditButton"));
+    check(edit && save, "the Memory panel exposes correction controls");
+    if (edit && save) {
+        edit->setProperty("text", QStringLiteral("Updated user note"));
+        check(QMetaObject::invokeMethod(save, "clicked"), "the QML correction action runs");
+        QCoreApplication::processEvents();
+        check(controller.recallMemories().first().toMap().value(QStringLiteral("text")).toString() == QStringLiteral("Updated user note"),
+              "the corrected text is authoritative in the real memory panel");
+    }
+    check(controller.rememberPrivateFact(QStringLiteral("A manually protected ordinary-looking note")),
+          "a user can mark ordinary-looking content private regardless of heuristics");
+    QCoreApplication::processEvents();
+    auto* reject = memoryControl(window->contentItem(), QStringLiteral("rejectMemoryButton"));
+    check(reject && QMetaObject::invokeMethod(reject, "clicked"), "the QML rejection action runs");
+    QCoreApplication::processEvents();
+    check(controller.pendingMemories().isEmpty() && controller.recallMemories().size() == 1,
+          "reject never persists the proposed memory");
+    check(controller.rememberPrivateFact(QStringLiteral("Protected manual fact"))
+              && controller.approveMemory(controller.pendingMemories().first().toMap().value(QStringLiteral("id")).toLongLong())
+              && controller.recallMemories().first().toMap().value(QStringLiteral("sensitive")).toBool(),
+          "manually marked privacy survives approval even without a screening match");
+    QEventLoop settled;
+    QTimer::singleShot(150, &settled, &QEventLoop::quit);
+    settled.exec();
+    const auto problems = kestrel::ui::auditLayouts(window->contentItem());
+    for (const auto& problem : problems) { std::cout << problem.where.toStdString() << ": " << problem.what.toStdString() << '\n'; }
+    check(problems.isEmpty(), "the visible memory controls fit the minimum desktop layout");
+    controller.clearMemories();
+}
+
+void testReviewedLearningThroughQml() {
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    const auto originalPrompt = controller.systemPrompt();
+    check(!controller.applyLoraAdapter(QStringLiteral("missing.gguf")),
+          "LoRA cannot be activated on a preview or cloud backend");
+    check(!controller.saveTrainingExample(QString(), QString(), QStringLiteral("Hi")),
+          "learning refuses an empty prompt");
+    check(!controller.saveTrainingExample(QStringLiteral("My password is secret123"), QString(), QStringLiteral("Hi")),
+          "recognized private data is refused for weight training");
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the real behavior-learning panel loads");
+    if (!scene) { return; }
+    scene->setProperty("memoryOpen", true);
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    if (!window) { check(false, "learning belongs to a real window"); return; }
+    auto* prompt = memoryControl(window->contentItem(), QStringLiteral("learningPromptField"));
+    auto* rejected = memoryControl(window->contentItem(), QStringLiteral("learningRejectedField"));
+    auto* preferred = memoryControl(window->contentItem(), QStringLiteral("learningPreferredField"));
+    auto* consent = memoryControl(window->contentItem(), QStringLiteral("learningReviewCheckBox"));
+    auto* save = memoryControl(window->contentItem(), QStringLiteral("saveTrainingExampleButton"));
+    check(prompt && rejected && preferred && consent && save, "the panel exposes review, correction and explicit approval controls");
+    if (!prompt || !rejected || !preferred || !consent || !save) { return; }
+    prompt->setProperty("text", QStringLiteral("How should you greet me?"));
+    rejected->setProperty("text", QStringLiteral("Formal greeting"));
+    preferred->setProperty("text", QStringLiteral("Hey, good to see you."));
+    check(!save->property("enabled").toBool(), "learning cannot be saved before review approval");
+    consent->setProperty("checked", true);
+    check(save->property("enabled").toBool() && QMetaObject::invokeMethod(save, "clicked"),
+          "the real reviewed correction action saves an example");
+    check(controller.trainingExamples().size() == 1 && controller.systemPrompt() == originalPrompt,
+          "saving a correction does not silently change prompts or weights");
+    check(!controller.saveTrainingExample(QStringLiteral("How should you greet me?"), QString(), QStringLiteral("Hey, good to see you.")),
+          "duplicate reviewed corrections are refused");
+    failSeals = true;
+    check(!controller.saveTrainingExample(QStringLiteral("Say goodbye"), QString(), QStringLiteral("See you later."))
+              && controller.trainingExamples().size() == 1, "failed secure saves roll back reviewed data");
+    failSeals = false;
+    AppController reopened;
+    reopened.setIdleLoopEnabled(false);
+    reopened.setProfileStore(storeOn(keystore, &failSeals));
+    check(reopened.trainingExamples().size() == 1, "reviewed corrections survive restart in encrypted storage");
+    QTemporaryDir output;
+    const QString destination = output.filePath(QStringLiteral("reviewed.jsonl"));
+    check(reopened.exportTrainingExamples(QUrl::fromLocalFile(destination).toString()), "explicit local JSONL export succeeds");
+    QFile file(destination);
+    check(file.open(QIODevice::ReadOnly), "the exported artifact is readable");
+    const QByteArray bytes = file.readAll();
+    const auto record = QJsonDocument::fromJson(bytes.trimmed()).object();
+    check(record.value(QStringLiteral("reviewed")).toBool()
+              && record.value(QStringLiteral("base_model")).toString() == QStringLiteral("Qwen/Qwen3-4B-Base")
+              && record.value(QStringLiteral("preferred")).toString() == QStringLiteral("Hey, good to see you.")
+              && bytes.endsWith('\n'), "export uses the reviewed Base-model training schema and newline format");
+#if !defined(_WIN32)
+    check(!(file.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther | QFileDevice::WriteGroup | QFileDevice::WriteOther)),
+          "plaintext training export is owner-only");
+#endif
+    check(!reopened.exportTrainingExamples(QStringLiteral("https://example.invalid/upload")),
+          "learning refuses network export destinations");
+    const auto id = reopened.trainingExamples().front().toMap().value(QStringLiteral("id")).toLongLong();
+    check(reopened.forgetTrainingExample(id) && reopened.trainingExamples().isEmpty(), "reviewed examples can be deleted");
+    AppController cleared;
+    cleared.setProfileStore(storeOn(keystore, &failSeals));
+    check(cleared.trainingExamples().isEmpty(), "training example deletion survives restart");
+
+    const QString realModel = qEnvironmentVariable("KESTREL_TEST_GGUF");
+    const QString realAdapter = qEnvironmentVariable("KESTREL_TEST_LORA");
+    if (!realModel.isEmpty() && !realAdapter.isEmpty()) {
+        auto local = std::make_unique<kestrel::runtime::LlamaCppBackend>();
+        std::string error;
+        check(local->loadModel(realModel.toStdString(), error), "the local model loads for the real QML LoRA path");
+        auto* observed = local.get();
+        controller.setBackendForTesting(std::move(local));
+        check(controller.applyLoraAdapter(QUrl::fromLocalFile(realAdapter).toString())
+                  && observed->adapterPath() == realAdapter.toStdString(),
+              "the desktop adapter interface activates the actual converted GGUF");
+        auto* remove = memoryControl(window->contentItem(), QStringLiteral("removeLoraAdapterButton"));
+        check(remove && QMetaObject::invokeMethod(remove, "clicked") && observed->adapterPath().empty(),
+              "the real Remove LoRA control restores unchanged base weights");
     }
 }
 
@@ -2998,6 +3237,765 @@ void testPkceAndJsonRpcFraming() {
     check(kestrel::app::jsonRpcResponse(QByteArray(R"({"jsonrpc":"2.0","id":5,"result":{}})"),
                                         "application/json", 5).has_value(),
           "a plain JSON reply is found by its id");
+    check(!kestrel::app::jsonRpcResponse(QByteArray(R"({"jsonrpc":"2.0","id":5.5,"result":{}})"),
+                                         "application/json", 5).has_value(),
+          "a fractional response ID cannot impersonate an integer request ID");
+    check(!kestrel::app::jsonRpcResponse(QByteArray(R"({"id":5,"result":{}})"),
+                                         "application/json", 5).has_value(),
+          "a response without the JSON-RPC version is refused");
+}
+
+// Script only the remote HTTP replies. The client still opens its browser URL,
+// listens on real loopback TCP, handles the callback, and sends real OAuth/MCP
+// requests through QNetworkAccessManager. No account or real keystore is used.
+class UndermindReply final : public QNetworkReply {
+public:
+    UndermindReply(const QNetworkRequest& request, int status, QByteArray body,
+                    const QByteArray& type, QObject* parent)
+        : QNetworkReply(parent), m_body(std::move(body)) {
+        setRequest(request);
+        setUrl(request.url());
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, status);
+        setHeader(QNetworkRequest::ContentTypeHeader, type);
+        setRawHeader("Mcp-Session-Id", "test-session");
+        open(QIODevice::ReadOnly);
+        QTimer::singleShot(0, this, [this] {
+            setFinished(true);
+            emit readyRead();
+            emit finished();
+        });
+    }
+    void abort() override {}
+    qint64 bytesAvailable() const override {
+        return static_cast<qint64>(m_body.size()) - m_offset + QNetworkReply::bytesAvailable();
+    }
+
+protected:
+    qint64 readData(char* data, qint64 maximum) override {
+        const qint64 size = std::min(maximum, static_cast<qint64>(m_body.size()) - m_offset);
+        if (size <= 0) { return -1; }
+        std::memcpy(data, m_body.constData() + m_offset, static_cast<std::size_t>(size));
+        m_offset += size;
+        return size;
+    }
+
+private:
+    QByteArray m_body;
+    qint64 m_offset = 0;
+};
+
+class UndermindNetwork final : public QNetworkAccessManager {
+public:
+    struct Request { QNetworkRequest headers; QByteArray body; };
+    std::vector<Request> requests;
+    QString failure;
+    bool eventStream = false;
+    QString toolName = QStringLiteral("list_workspaces");
+    int toolStatus = 200;
+
+protected:
+    QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
+                                 QIODevice* outgoing) override {
+        if (request.url().host() == QStringLiteral("127.0.0.1")) {
+            return QNetworkAccessManager::createRequest(operation, request, outgoing);
+        }
+        const QByteArray body = outgoing != nullptr ? outgoing->readAll() : QByteArray();
+        requests.push_back({request, body});
+        int status = 200;
+        QByteArray type = "application/json";
+        QByteArray response;
+        if (request.url().path() == QStringLiteral("/o/token/")) {
+            response = R"({"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600,"token_type":"Bearer"})";
+            if (failure == QStringLiteral("token-http")) {
+                status = 503;
+            }
+            if (failure == QStringLiteral("token")) {
+                status = 400;
+                response = R"({"error":"invalid_grant","error_description":"The code expired. Connect again."})";
+            }
+        } else {
+            const QJsonObject rpc = QJsonDocument::fromJson(body).object();
+            const QString method = rpc.value(QStringLiteral("method")).toString();
+            QJsonObject result;
+            if (method == QStringLiteral("initialize")) {
+                result.insert(QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18"));
+                result.insert(QStringLiteral("capabilities"), QJsonObject{});
+                result.insert(QStringLiteral("serverInfo"), QJsonObject{{QStringLiteral("name"), QStringLiteral("test")}});
+            } else if (method == QStringLiteral("notifications/initialized")) {
+                status = failure == QStringLiteral("ack") ? 503 : 202;
+            } else if (method == QStringLiteral("tools/list")) {
+                if (failure != QStringLiteral("listing")) {
+                    result.insert(QStringLiteral("tools"), QJsonArray{QJsonObject{
+                        {QStringLiteral("name"), toolName},
+                        {QStringLiteral("description"), QStringLiteral("List workspaces")},
+                        {QStringLiteral("inputSchema"), QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}}}}});
+                }
+            } else if (method == QStringLiteral("tools/call")) {
+                status = toolStatus;
+                result.insert(QStringLiteral("content"), QJsonArray{QJsonObject{
+                    {QStringLiteral("type"), QStringLiteral("text")},
+                    {QStringLiteral("text"), QStringLiteral("test workspace")}}});
+            } else {
+                check(false, "the client sends only expected Undermind methods");
+            }
+            if (failure == QStringLiteral("bad-handshake") && method == QStringLiteral("initialize")) {
+                result = QJsonObject{};
+            }
+            if (failure == QStringLiteral("bad-tool") && method == QStringLiteral("tools/list")) {
+                result.insert(QStringLiteral("tools"), QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("missing-schema")}}});
+            }
+            if ((failure == QStringLiteral("unauthorized") || failure == QStringLiteral("forbidden")
+                 || failure == QStringLiteral("server-http")) && method == QStringLiteral("initialize")) {
+                status = failure == QStringLiteral("unauthorized") ? 401
+                    : failure == QStringLiteral("forbidden") ? 403 : 503;
+            }
+            if (failure == QStringLiteral("listing-http") && method == QStringLiteral("tools/list")) {
+                status = 503;
+            }
+            if (status != 202 && method != QStringLiteral("notifications/initialized")) {
+                QJsonObject reply{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                                  {QStringLiteral("id"), rpc.value(QStringLiteral("id"))},
+                                  {QStringLiteral("result"), result}};
+                if (failure == QStringLiteral("rpc-error") && method == QStringLiteral("initialize")) {
+                    reply.insert(QStringLiteral("error"), QJsonObject{{QStringLiteral("message"), QStringLiteral("Access denied")}});
+                }
+                response = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+                if (eventStream) {
+                    type = "text/event-stream";
+                    response = "event: message\ndata: " + response + "\n\n";
+                }
+            }
+        }
+        return new UndermindReply(request, status, response, type, this);
+    }
+};
+
+bool waitForUndermind(const std::function<bool()>& ready) {
+    QElapsedTimer timer;
+    timer.start();
+    while (!ready() && timer.elapsed() < 5000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(1);
+    }
+    return ready();
+}
+
+void testUndermindConnection() {
+    std::cout << "Undermind browser handoff through OAuth callback and tool discovery\n";
+    for (const QString& scenario : {QStringLiteral("json"), QStringLiteral("sse"),
+                                   QStringLiteral("denied"), QStringLiteral("state"),
+                                   QStringLiteral("missing-code"), QStringLiteral("token"),
+                                   QStringLiteral("ack"), QStringLiteral("listing"),
+                                   QStringLiteral("token-http"), QStringLiteral("unauthorized"),
+                                   QStringLiteral("forbidden"), QStringLiteral("server-http"),
+                                   QStringLiteral("listing-http"), QStringLiteral("bad-handshake"),
+                                   QStringLiteral("bad-tool"), QStringLiteral("rpc-error")}) {
+        std::cout << "  scenario: " << scenario.toStdString() << '\n';
+        Collector browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "captureUrl");
+        UndermindNetwork network;
+        network.failure = scenario;
+        network.eventStream = scenario == QStringLiteral("sse");
+        auto store = std::make_unique<kestrel::storage::InMemorySecretStore>();
+        auto* observedStore = store.get();
+        kestrel::app::UndermindClient client(network, std::move(store));
+        int completions = 0;
+        bool succeeded = false;
+        QJsonArray tools;
+        client.connectAndList([&](bool ok, QJsonArray listed) {
+            ++completions;
+            succeeded = ok;
+            tools = listed;
+        });
+        check(!browser.openedUrl.isEmpty(), "Connect hands an authorization URL to the browser");
+        if (browser.openedUrl.isEmpty()) {
+            QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+            continue;
+        }
+        const QUrlQuery authorization(browser.openedUrl);
+        check(authorization.queryItemValue(QStringLiteral("resource"))
+                  == QStringLiteral("https://mcp.undermind.ai/mcp"),
+              "authorization binds tokens to the Undermind MCP resource");
+        check(browser.openedUrl.host() == QStringLiteral("api.undermind.ai")
+                  && browser.openedUrl.path() == QStringLiteral("/o/authorize/"),
+              "the browser opens the real Undermind authorization endpoint");
+        check(authorization.queryItemValue(QStringLiteral("client_id")) == kestrel::app::undermindClientId()
+                  && (kestrel::app::undermindClientId()
+                          == QStringLiteral("https://identity.josh-lynes.com/oauth/kestrel-linux.json")
+                      || kestrel::app::undermindClientId()
+                             == QStringLiteral("https://identity.josh-lynes.com/oauth/kestrel-windows.json")),
+              "the browser request uses Kestrel's platform CIMD URL");
+        check(authorization.queryItemValue(QStringLiteral("scope")) == QStringLiteral("mcp")
+                  && authorization.queryItemValue(QStringLiteral("response_type")) == QStringLiteral("code")
+                  && authorization.queryItemValue(QStringLiteral("code_challenge_method")) == QStringLiteral("S256")
+                  && !authorization.queryItemValue(QStringLiteral("state")).isEmpty(),
+              "authorization includes the MCP scope, code flow, PKCE and state");
+        QUrl callback(authorization.queryItemValue(QStringLiteral("redirect_uri")));
+        check(callback.toString() == QStringLiteral("http://127.0.0.1:8787/callback"),
+              "the loopback callback matches the published metadata");
+        QUrlQuery returned;
+        returned.addQueryItem(QStringLiteral("state"), scenario == QStringLiteral("state")
+            ? QStringLiteral("wrong-state") : authorization.queryItemValue(QStringLiteral("state")));
+        if (scenario == QStringLiteral("denied")) {
+            returned.addQueryItem(QStringLiteral("error"), QStringLiteral("access_denied"));
+            returned.addQueryItem(QStringLiteral("error_description"), QStringLiteral("Access was declined"));
+        } else if (scenario != QStringLiteral("missing-code")) {
+            returned.addQueryItem(QStringLiteral("code"), QStringLiteral("code+with/special=characters"));
+        }
+        callback.setQuery(returned);
+        QNetworkReply* callbackReply = network.get(QNetworkRequest(callback));
+        check(waitForUndermind([&] { return completions > 0 && callbackReply->isFinished(); }),
+              "the callback and tool-discovery attempt finish before the deadline");
+        const QByteArray page = callbackReply->readAll();
+        callbackReply->deleteLater();
+        check(completions == 1, "one connection attempt completes exactly once");
+        const bool expectedSuccess = scenario == QStringLiteral("json") || scenario == QStringLiteral("sse");
+        check(succeeded == expectedSuccess && client.connected() == expectedSuccess,
+              "only a valid OAuth flow and tool list report connected");
+        const bool authorized = scenario != QStringLiteral("denied") && scenario != QStringLiteral("state")
+            && scenario != QStringLiteral("missing-code") && scenario != QStringLiteral("token")
+            && scenario != QStringLiteral("token-http");
+        check(authorized ? page.contains("signed in") : !page.contains("signed in"),
+              "the browser claims sign-in only after a successful token exchange");
+        check(!page.isEmpty(), "the browser receives a callback result page");
+        if (expectedSuccess) {
+            check(tools.size() == 1 && tools.first().toObject().value(QStringLiteral("name"))
+                      == QStringLiteral("list_workspaces"), "tool discovery returns the remote tool definition");
+            check(client.status() == QStringLiteral("Connected to Undermind, 1 tools"),
+                  "the activity status reports the actual tool count");
+            check(network.requests.size() == 4, "the flow exchanges a code, initializes, acknowledges, and lists tools");
+        } else {
+            check(tools.isEmpty() && client.status().startsWith(QStringLiteral("Not connected:")),
+                  "a failed attempt returns no tools and an actionable status");
+        }
+        if (scenario == QStringLiteral("state") || scenario == QStringLiteral("denied")
+            || scenario == QStringLiteral("missing-code")) {
+            check(network.requests.empty(), "an invalid or denied callback sends no token request");
+        }
+        if (!network.requests.empty()) {
+            const QUrlQuery form(QString::fromUtf8(network.requests.front().body));
+            check(form.queryItemValue(QStringLiteral("client_id"), QUrl::FullyDecoded)
+                      == authorization.queryItemValue(QStringLiteral("client_id")),
+                  "the token request keeps the same CIMD client identity");
+            check(kestrel::app::pkceChallenge(form.queryItemValue(QStringLiteral("code_verifier")))
+                      == authorization.queryItemValue(QStringLiteral("code_challenge")),
+                  "the exchanged PKCE verifier matches the browser challenge");
+            const QByteArray decodedForm = QByteArray(network.requests.front().body).replace('+', ' ');
+            const QUrlQuery decoded(QString::fromUtf8(decodedForm));
+            check(decoded.queryItemValue(QStringLiteral("code"), QUrl::FullyDecoded)
+                      == QStringLiteral("code+with/special=characters"),
+                  "OAuth form encoding preserves a plus sign inside an authorization code");
+            for (std::size_t i = 1; i < network.requests.size(); ++i) {
+                check(network.requests[i].headers.rawHeader("Authorization") == "Bearer test-access",
+                      "every MCP request carries the acquired bearer token");
+                if (i > 1) {
+                    check(network.requests[i].headers.rawHeader("Mcp-Session-Id") == "test-session",
+                          "MCP discovery reuses the initialized session");
+                }
+            }
+        }
+        std::string error;
+        const auto saved = observedStore->sealed("undermind", "com.kestrel.mcp", error);
+        if (expectedSuccess) {
+            check(saved.has_value(), "tokens are persisted through the SecretStore interface");
+            if (saved.has_value()) {
+                const QByteArray bytes(reinterpret_cast<const char*>(saved->data()),
+                                       static_cast<qsizetype>(saved->size()));
+                const QJsonObject record = QJsonDocument::fromJson(bytes).object();
+                check(record.value(QStringLiteral("client_id")).toString() == kestrel::app::undermindClientId()
+                          && record.value(QStringLiteral("resource")).toString()
+                                 == QStringLiteral("https://mcp.undermind.ai/mcp"),
+                      "persisted token records bind to the platform CIMD client_id and MCP resource");
+            }
+        } else if (scenario == QStringLiteral("token") || scenario == QStringLiteral("token-http")
+                   || scenario == QStringLiteral("unauthorized") || network.requests.empty()) {
+            check(!saved.has_value(), "failed OAuth attempts do not persist tokens");
+        }
+        QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+
+    // A token saved without a matching client_id must be ignored so Kestrel
+    // never attempts a refresh across a changed OAuth client identity.
+    {
+        Collector browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "captureUrl");
+        UndermindNetwork network;
+        auto store = std::make_unique<kestrel::storage::InMemorySecretStore>();
+        const QByteArray legacy = QJsonDocument(QJsonObject{
+            {QStringLiteral("client_id"), QStringLiteral("https://raw.githubusercontent.com/CanadianCowboy/Kestrel/feature/cross-os-persona/docs/mcp/kestrel-oauth-client.json")},
+            {QStringLiteral("resource"), QStringLiteral("https://mcp.undermind.ai/mcp")},
+            {QStringLiteral("access_token"), QStringLiteral("stale-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("stale-refresh")},
+            {QStringLiteral("expires_at_ms"), static_cast<double>(QDateTime::currentMSecsSinceEpoch() + 3600000)},
+        }).toJson(QJsonDocument::Compact);
+        std::string sealError;
+        check(store->seal("undermind", "com.kestrel.mcp",
+                          std::vector<std::uint8_t>(legacy.cbegin(), legacy.cend()), sealError),
+              "legacy token record can be seeded in the test store");
+        kestrel::app::UndermindClient client(network, std::move(store));
+        client.connectAndList([](bool, QJsonArray) {});
+        check(!browser.openedUrl.isEmpty() && network.requests.empty(),
+              "tokens saved under a different client_id are ignored in favour of fresh sign-in");
+        QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+
+    // Silent startup auto-connect: does nothing without saved tokens, and with
+    // valid saved tokens connects without opening a browser and refreshes the
+    // controller's system-prompt capability block so the model sees Undermind's
+    // tools immediately.
+    {
+        Collector browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "captureUrl");
+        UndermindNetwork emptyNetwork;
+        auto emptyStore = std::make_unique<kestrel::storage::InMemorySecretStore>();
+        kestrel::app::UndermindClient emptyClient(emptyNetwork, std::move(emptyStore));
+        check(!emptyClient.hasSavedTokens(), "an empty keystore reports no saved Undermind tokens");
+
+        kestrel::core::McpDispatcher dispatcher;
+        AppController controller;
+        controller.setIdleLoopEnabled(false);
+        auto backend = std::make_unique<kestrel::runtime::MockBackend>();
+        kestrel::runtime::MockBackend* observedBackend = backend.get();
+        controller.setBackendForTesting(std::move(backend));
+        controller.setAgentTools(&dispatcher, false);
+        controller.refreshAgentCapabilitiesPrompt();
+        check(controller.systemPrompt().contains(QStringLiteral("No external tools are enabled right now.")),
+              "initial capability prompt states that no external tools are enabled");
+
+        controller.setUndermindClientForTesting(&emptyClient);
+        controller.autoConnectUndermind();
+        check(browser.openedUrl.isEmpty() && emptyNetwork.requests.empty()
+                  && controller.undermindStatus() == QStringLiteral("Not connected"),
+              "autoConnectUndermind is a silent no-op when no tokens are saved");
+
+        UndermindNetwork savedNetwork;
+        auto savedStore = std::make_unique<kestrel::storage::InMemorySecretStore>();
+        const QByteArray validRecord = QJsonDocument(QJsonObject{
+            {QStringLiteral("client_id"), kestrel::app::undermindClientId()},
+            {QStringLiteral("resource"), QStringLiteral("https://mcp.undermind.ai/mcp")},
+            {QStringLiteral("access_token"), QStringLiteral("test-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("test-refresh")},
+            {QStringLiteral("expires_at_ms"), static_cast<double>(QDateTime::currentMSecsSinceEpoch() + 3600000)},
+        }).toJson(QJsonDocument::Compact);
+        std::string sealError;
+        check(savedStore->seal("undermind", "com.kestrel.mcp",
+                               std::vector<std::uint8_t>(validRecord.cbegin(), validRecord.cend()), sealError),
+              "valid token record can be seeded in the test store");
+        kestrel::app::UndermindClient savedClient(savedNetwork, std::move(savedStore));
+        check(savedClient.hasSavedTokens(), "a matching token record is recognized as saved");
+
+        controller.setUndermindClientForTesting(&savedClient);
+        controller.autoConnectUndermind();
+        check(waitForUndermind([&] {
+                  return controller.undermindStatus() == QStringLiteral("Connected to Undermind, 1 tools");
+              }),
+              "autoConnectUndermind connects and lists tools from saved tokens");
+        check(browser.openedUrl.isEmpty(), "autoConnectUndermind never opens a browser window");
+        check(savedNetwork.requests.size() == 3,
+              "autoConnectUndermind runs initialize, initialized, and tools/list directly");
+        check(controller.systemPrompt().contains(QStringLiteral("undermind_list_workspaces"))
+                  && !controller.systemPrompt().contains(QStringLiteral("No external tools are enabled right now.")),
+              "connecting Undermind refreshes the system prompt with the discovered undermind_* tools");
+        check(QString::fromUtf8(observedBackend->systemPrompt().data(),
+                                static_cast<qsizetype>(observedBackend->systemPrompt().size()))
+                  == controller.systemPrompt(),
+              "the refreshed system prompt is propagated to the active ModelBackend");
+        check(controller.systemPrompt().count(QStringLiteral("Kestrel's own capabilities:")) == 1,
+              "refreshing capabilities replaces the previous capability block instead of duplicating it");
+
+        // Verify what the user sees, not just the protocol callback: the real
+        // Activity panel must stop advertising a session after it expires.
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+        std::unique_ptr<QObject> scene(component.create());
+        if (!scene) { std::cout << component.errorString().toStdString(); }
+        check(scene != nullptr, "the shipped Undermind activity scene loads");
+        QObject* statusText = scene ? scene->findChild<QObject*>(QStringLiteral("undermindStatusText")) : nullptr;
+        QObject* connectButton = scene ? scene->findChild<QObject*>(QStringLiteral("connectUndermindButton")) : nullptr;
+        check(statusText && connectButton, "the real Activity panel exposes Undermind status and Connect");
+        if (scene) { scene->setProperty("activityOpen", true); }
+        check(!statusText || statusText->property("text").toString() == savedClient.status(),
+              "the Activity panel displays the verified connection state");
+
+        savedNetwork.toolStatus = 404;
+        bool callFinished = false;
+        savedClient.callTool("list_workspaces", "{}", [&](kestrel::core::McpToolResult result) {
+            check(result.isError, "an expired MCP session is a failed tool call");
+            callFinished = true;
+        });
+        check(waitForUndermind([&] { return callFinished; }), "an expired-session call finishes");
+        check(!savedClient.connected() && controller.undermindStatus().startsWith(QStringLiteral("Not connected:"))
+                  && !dispatcher.permissions().enabled("undermind_list_workspaces")
+                  && !controller.systemPrompt().contains(QStringLiteral("undermind_list_workspaces")),
+              "an ended session disables stale tools and removes them from the model's capabilities");
+        QCoreApplication::processEvents();
+        check(!statusText || statusText->property("text").toString().startsWith(QStringLiteral("Not connected:")),
+              "the real Activity panel no longer claims an expired session is connected");
+        const auto requestsBefore = savedNetwork.requests.size();
+        savedClient.callTool("list_workspaces", "{}", [](kestrel::core::McpToolResult result) {
+            check(result.isError, "a disconnected client refuses calls");
+        });
+        check(savedNetwork.requests.size() == requestsBefore, "a disconnected tool never sends a network request");
+
+        savedNetwork.toolStatus = 200;
+        savedNetwork.toolName = QStringLiteral("new_tool");
+        void* mouseEvent = nullptr;
+        check(connectButton && QMetaObject::invokeMethod(connectButton, "clicked", Qt::DirectConnection,
+                  QGenericArgument("QQuickMouseEvent*", &mouseEvent)),
+              "the real Connect action starts session validation");
+        check(!browser.openedUrl.isEmpty() && !savedClient.connected(),
+              "explicit Connect starts fresh browser OAuth despite valid saved credentials");
+        const QUrlQuery freshAuthorization(browser.openedUrl);
+        QUrl freshCallback(freshAuthorization.queryItemValue(QStringLiteral("redirect_uri")));
+        QUrlQuery freshReturned;
+        freshReturned.addQueryItem(QStringLiteral("state"), freshAuthorization.queryItemValue(QStringLiteral("state")));
+        freshReturned.addQueryItem(QStringLiteral("code"), QStringLiteral("fresh-authorization-code"));
+        freshCallback.setQuery(freshReturned);
+        QNetworkReply* freshReply = savedNetwork.get(QNetworkRequest(freshCallback));
+        check(waitForUndermind([&] { return savedClient.connected() && freshReply->isFinished(); }),
+              "Connect rediscovers the remote tools only after fresh browser authorization");
+        freshReply->deleteLater();
+        browser.openedUrl.clear();
+        check(!dispatcher.permissions().enabled("undermind_list_workspaces")
+                  && dispatcher.permissions().enabled("undermind_new_tool")
+                  && !controller.systemPrompt().contains(QStringLiteral("undermind_list_workspaces")),
+              "reconnection cannot retain tools missing from the new discovery result");
+
+        savedNetwork.failure = QStringLiteral("forbidden");
+        controller.autoConnectUndermind();
+        check(waitForUndermind([&] { return savedClient.status().startsWith(QStringLiteral("Not connected:")); }),
+              "failed revalidation produces a disconnected status");
+        check(!savedClient.connected() && !dispatcher.permissions().enabled("undermind_new_tool")
+                  && !controller.systemPrompt().contains(QStringLiteral("undermind_new_tool"))
+                  && browser.openedUrl.isEmpty(),
+              "failed saved-token revalidation leaves no advertised tools and does not fake a browser sign-in");
+        controller.setUndermindClientForTesting(nullptr);
+        QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+    // Saved credentials are not proof of an active connection. Exercise silent
+    // resume with rejected tokens, refresh failure, and malformed discovery.
+    for (const QString& scenario : {QStringLiteral("refresh"), QStringLiteral("token"),
+                                   QStringLiteral("unauthorized"), QStringLiteral("forbidden"),
+                                   QStringLiteral("server-http"), QStringLiteral("listing-http"),
+                                   QStringLiteral("bad-handshake"), QStringLiteral("bad-tool"),
+                                   QStringLiteral("rpc-error")}) {
+        Collector browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "captureUrl");
+        UndermindNetwork network;
+        network.failure = scenario;
+        auto store = std::make_unique<kestrel::storage::InMemorySecretStore>();
+        const bool expired = scenario == QStringLiteral("refresh") || scenario == QStringLiteral("token");
+        const QByteArray record = QJsonDocument(QJsonObject{
+            {QStringLiteral("client_id"), kestrel::app::undermindClientId()},
+            {QStringLiteral("resource"), QStringLiteral("https://mcp.undermind.ai/mcp")},
+            {QStringLiteral("access_token"), QStringLiteral("test-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("test-refresh")},
+            {QStringLiteral("expires_at_ms"), static_cast<double>(QDateTime::currentMSecsSinceEpoch()
+                + (expired ? -1000 : 3600000))}}).toJson(QJsonDocument::Compact);
+        std::string error;
+        check(store->seal("undermind", "com.kestrel.mcp",
+                          std::vector<std::uint8_t>(record.cbegin(), record.cend()), error),
+              "saved-token regression credentials can be seeded");
+        kestrel::app::UndermindClient client(network, std::move(store));
+        int completions = 0;
+        bool success = false;
+        client.connectSavedAndList([&](bool ok, QJsonArray tools) {
+            ++completions;
+            success = ok;
+            check(ok || tools.isEmpty(), "failed silent authentication returns no tools");
+        });
+        check(!client.connected(), "starting silent authentication does not mean connected");
+        check(waitForUndermind([&] { return completions > 0; }), "silent authentication finishes");
+        const bool expected = scenario == QStringLiteral("refresh");
+        check(completions == 1 && success == expected && client.connected() == expected,
+              "only a successful refresh and complete discovery restore a saved session");
+        check(browser.openedUrl.isEmpty(), "silent connection never substitutes browser approval");
+        if (expired && !network.requests.empty()) {
+            const QUrlQuery form(QString::fromUtf8(network.requests.front().body));
+            check(form.queryItemValue(QStringLiteral("grant_type")) == QStringLiteral("refresh_token"),
+                  "expired saved access tokens must be refreshed before MCP use");
+        }
+        if (scenario == QStringLiteral("unauthorized")) {
+            check(!client.hasSavedTokens(), "rejected saved credentials are no longer reusable");
+            client.connectAndList([](bool, QJsonArray) {});
+            check(!browser.openedUrl.isEmpty(), "Connect starts real browser OAuth after saved credentials are rejected");
+        }
+        QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+}
+
+// The Groq adapter still uses real Qt request/reply objects on the generation
+// thread. Only the remote service is scripted, never the parser or worker.
+struct GroqScript {
+    int status = 200;
+    QByteArray type = "text/event-stream";
+    QByteArray body;
+    QByteArray retryAfter;
+    bool hang = false;
+    qint64 chunkSize = 17;
+    int requests = 0;
+    QNetworkRequest headers;
+    QJsonObject payload;
+};
+
+class GroqReply final : public QNetworkReply {
+public:
+    GroqReply(const QNetworkRequest& request, const GroqScript& script, QObject* parent)
+        : QNetworkReply(parent), m_body(script.body) {
+        setRequest(request);
+        setUrl(request.url());
+        setAttribute(QNetworkRequest::HttpStatusCodeAttribute, script.status);
+        setHeader(QNetworkRequest::ContentTypeHeader, script.type);
+        if (!script.retryAfter.isEmpty()) { setRawHeader("retry-after", script.retryAfter); }
+        open(QIODevice::ReadOnly);
+        if (!script.hang) {
+            auto* timer = new QTimer(this);
+            timer->setInterval(1);
+            connect(timer, &QTimer::timeout, this, [this, timer, chunkSize = script.chunkSize] {
+                if (isFinished()) { timer->stop(); return; }
+                // Split JSON, CRLF framing, and UTF-8 across reads.
+                m_available = std::min(m_available + chunkSize, static_cast<qint64>(m_body.size()));
+                emit readyRead();
+                if (!isFinished() && m_available == m_body.size()) {
+                    timer->stop();
+                    setFinished(true);
+                    emit finished();
+                }
+            });
+            timer->start();
+        }
+    }
+    void abort() override {
+        if (isFinished()) { return; }
+        setError(QNetworkReply::OperationCanceledError, QStringLiteral("aborted"));
+        setFinished(true);
+        emit finished();
+    }
+    qint64 bytesAvailable() const override { return m_available - m_offset + QNetworkReply::bytesAvailable(); }
+protected:
+    qint64 readData(char* data, qint64 maximum) override {
+        const qint64 size = std::min(maximum, m_available - m_offset);
+        if (size <= 0) { return 0; }
+        std::memcpy(data, m_body.constData() + m_offset, static_cast<std::size_t>(size));
+        m_offset += size;
+        return size;
+    }
+private:
+    QByteArray m_body;
+    qint64 m_offset = 0;
+    qint64 m_available = 0;
+};
+
+class GroqNetwork final : public QNetworkAccessManager {
+public:
+    explicit GroqNetwork(std::shared_ptr<GroqScript> script) : m_script(std::move(script)) {}
+protected:
+    QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
+                                 QIODevice* outgoing) override {
+        check(operation == PostOperation, "Groq chat uses POST");
+        ++m_script->requests;
+        m_script->headers = request;
+        m_script->payload = QJsonDocument::fromJson(outgoing->readAll()).object();
+        return new GroqReply(request, *m_script, this);
+    }
+private:
+    std::shared_ptr<GroqScript> m_script;
+};
+
+QByteArray groqStream() {
+    return QByteArray(": keepalive\r\n\r\ndata: {\"choices\":[{\"delta\":{\"reasoning\":\"private reasoning\"}}]}\r\n\r\n")
+        + "data: {\"choices\":[{\"delta\":{\"content\":\"Hello · \"}}]}\r\n\r\n"
+        + "data: {\"choices\":[{\"delta\":{\"content\":\"Kestrel\"}}]}\r\n\r\n"
+        + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"x_groq\":{\"usage\":{\"total_tokens\":37,\"completion_tokens\":5,\"completion_time\":0.5}}}\r\n\r\n"
+        + "data: [DONE]\r\n\r\n";
+}
+
+void testGroqStreamingAndFailures() {
+    using kestrel::app::GroqBackend;
+    for (const QString& scenario : {QStringLiteral("ok"), QStringLiteral("rate"),
+                                   QStringLiteral("key"), QStringLiteral("server"),
+                                   QStringLiteral("bad-json"), QStringLiteral("empty"),
+                                   QStringLiteral("truncated"), QStringLiteral("length"),
+                                   QStringLiteral("event-error"), QStringLiteral("wrong-type"),
+                                   QStringLiteral("oversized"), QStringLiteral("cancel")}) {
+        auto script = std::make_shared<GroqScript>();
+        script->body = groqStream();
+        if (scenario == QStringLiteral("rate")) { script->status = 429; script->retryAfter = "7"; }
+        if (scenario == QStringLiteral("key")) { script->status = 401; }
+        if (scenario == QStringLiteral("server")) { script->status = 503; }
+        if (script->status != 200) { script->body = "sensitive server error"; script->type = "application/json"; }
+        if (scenario == QStringLiteral("bad-json")) { script->body = "data: broken\n\n"; }
+        if (scenario == QStringLiteral("empty")) { script->body = "data: [DONE]\n\n"; }
+        if (scenario == QStringLiteral("truncated")) { script->body.replace("data: [DONE]\r\n\r\n", ""); }
+        if (scenario == QStringLiteral("length")) { script->body.replace("\"stop\"", "\"length\""); }
+        if (scenario == QStringLiteral("event-error")) { script->body = "data: {\"error\":{\"message\":\"sensitive\"}}\n\n"; }
+        if (scenario == QStringLiteral("wrong-type")) { script->type = "application/json"; }
+        if (scenario == QStringLiteral("oversized")) { script->body = QByteArray(1024 * 1024 + 1, 'x'); }
+        if (scenario == QStringLiteral("cancel")) { script->hang = true; }
+        if (scenario == QStringLiteral("oversized")) { script->chunkSize = script->body.size(); }
+        GroqBackend backend("gsk_testonly", [script] { return std::make_unique<GroqNetwork>(script); });
+        std::string error;
+        check(backend.loadModel("openai/gpt-oss-120b", error), "Groq accepts the selected GPT-OSS model");
+        backend.setSystemPrompt("Kestrel instructions\nundermind_list_workspaces");
+        bool completed = false;
+        bool success = false;
+        int completions = 0;
+        std::string output;
+        std::string failure;
+        QTimer cancelTimer;
+        cancelTimer.setSingleShot(true);
+        QObject::connect(&cancelTimer, &QTimer::timeout, [&] { backend.cancel(); });
+        if (script->hang) { cancelTimer.start(30); }
+        QElapsedTimer elapsed;
+        elapsed.start();
+        backend.generate(GenerationRequest{{
+                kestrel::runtime::ChatMessage{kestrel::runtime::Role::User, "Hi"},
+                kestrel::runtime::ChatMessage{kestrel::runtime::Role::Tool, "workspace result"}}, 0.7F, 512},
+            [&](std::string_view text) {
+                check(!completed, "Groq tokens stream before completion");
+                output += text;
+            },
+            [&](bool ok, std::string_view message) {
+                completed = true;
+                ++completions;
+                success = ok;
+                failure = message;
+            });
+        check(completed && completions == 1 && script->requests == 1,
+              "Groq completes once and never silently retries a paid request");
+        check(success == (scenario == QStringLiteral("ok")), "only complete Groq streams succeed");
+        check(failure.find("sensitive") == std::string::npos && failure.find("gsk_") == std::string::npos,
+              "Groq errors never expose raw server errors or credentials");
+        check(script->headers.url() == QUrl(QStringLiteral("https://api.groq.com/openai/v1/chat/completions"))
+                  && script->headers.rawHeader("Authorization") == "Bearer gsk_testonly",
+              "Groq uses its fixed HTTPS endpoint with bearer authentication");
+        check(script->headers.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt()
+                  == QNetworkRequest::ManualRedirectPolicy,
+              "Groq never forwards credentials through redirects");
+        const QJsonArray messages = script->payload.value(QStringLiteral("messages")).toArray();
+        check(messages.size() == 3 && messages.first().toObject().value(QStringLiteral("content")).toString()
+                  == QStringLiteral("Kestrel instructions\nundermind_list_workspaces")
+                  && messages.last().toObject().value(QStringLiteral("role")).toString() == QStringLiteral("user"),
+              "Groq sends the shared prefix once followed by conversation and textual tool context");
+        check(script->payload.value(QStringLiteral("stream")).toBool()
+                  && !script->payload.value(QStringLiteral("include_reasoning")).toBool(true)
+                  && script->payload.value(QStringLiteral("max_completion_tokens")).toInt() == 512,
+              "Groq streams with the requested cap and excludes private reasoning");
+        if (scenario == QStringLiteral("ok")) {
+            check(output == "Hello · Kestrel", "fragmented Groq SSE preserves Unicode and hides reasoning");
+            check(backend.status().contextUsed == 37 && backend.status().tokensPerSecond == 10.0
+                      && backend.cachedPrefixTokens() == 0,
+                  "Groq uses server usage without inventing a resident prefix cache");
+        }
+        if (scenario == QStringLiteral("oversized")) {
+            check(failure.find("oversized") != std::string::npos, "Groq rejects an overlong SSE line");
+        }
+        if (scenario == QStringLiteral("rate")) {
+            check(failure.find("7 seconds") != std::string::npos, "Groq rate-limit advice respects Retry-After");
+        }
+        if (scenario == QStringLiteral("cancel")) {
+            check(failure == "Generation stopped" && elapsed.elapsed() < 1000,
+                  "Groq cancellation interrupts a stalled response promptly");
+        }
+    }
+
+    auto script = std::make_shared<GroqScript>();
+    script->body = groqStream();
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    auto backend = std::make_unique<GroqBackend>("gsk_testonly", [script] { return std::make_unique<GroqNetwork>(script); });
+    auto* observed = backend.get();
+    std::string error;
+    check(backend->loadModel("openai/gpt-oss-120b", error), "test Groq backend loads");
+    controller.setBackendForTesting(std::move(backend));
+    controller.setSystemPrompt(QStringLiteral("Fresh Undermind capabilities"));
+    controller.sendMessage(QStringLiteral("Hello"));
+    check(waitForUndermind([&] { return !controller.generating(); }),
+          "Groq reply travels through AppController and its worker");
+    check(controller.messages()->rowCount() == 2
+              && controller.messages()->data(controller.messages()->index(1, 0),
+                  kestrel::app::MessageModel::ContentRole).toString() == QStringLiteral("Hello · Kestrel"),
+          "Groq streamed answer reaches the UI transcript model");
+    check(script->payload.value(QStringLiteral("messages")).toArray().first().toObject()
+              .value(QStringLiteral("content")).toString() == QStringLiteral("Fresh Undermind capabilities"),
+          "the worker sends the controller's current shared capabilities to Groq");
+    observed->resetContextUsage();
+    check(observed->status().contextUsed == 0, "new Groq sessions clear context accounting");
+    observed->setSystemPrompt("Updated tools after connection");
+    observed->generate(GenerationRequest{{kestrel::runtime::ChatMessage{
+            kestrel::runtime::Role::Assistant, "Partial answer"}}, 0.7F, 512, false},
+        [](std::string_view) {}, [](bool ok, std::string_view) { check(ok, "Groq continuation completes"); });
+    const QJsonArray continuation = script->payload.value(QStringLiteral("messages")).toArray();
+    check(continuation.size() == 3
+              && continuation.first().toObject().value(QStringLiteral("content")).toString()
+                    == QStringLiteral("Updated tools after connection")
+              && continuation.last().toObject().value(QStringLiteral("content")).toString()
+                    .startsWith(QStringLiteral("Continue your previous answer")),
+          "Groq continuation uses fresh instructions and explicitly requests only the unfinished suffix");
+}
+
+void testGroqConfigurationThroughQml() {
+    const QByteArray previousKey = qgetenv("GROQ_API_KEY");
+    const QByteArray previousFile = qgetenv("GROQ_API_KEY_FILE");
+    const bool hadKey = qEnvironmentVariableIsSet("GROQ_API_KEY");
+    const bool hadFile = qEnvironmentVariableIsSet("GROQ_API_KEY_FILE");
+    qputenv("GROQ_API_KEY", "gsk_testonly");
+    qunsetenv("GROQ_API_KEY_FILE");
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    check(!controller.groqEnabled(), "a configured Groq credential does not silently enable cloud inference");
+    QTemporaryFile keyFile;
+    check(keyFile.open(), "a temporary Groq credential file is available");
+    keyFile.write("not-a-key\n");
+    keyFile.flush();
+    qputenv("GROQ_API_KEY_FILE", keyFile.fileName().toUtf8());
+    check(!controller.configureGroq() && controller.modelError().contains(QStringLiteral("format")),
+          "a selected invalid credential file is rejected without falling through to another key");
+    keyFile.resize(0);
+    keyFile.write("gsk_testonly\n");
+    keyFile.flush();
+    check(controller.configureGroq() && controller.groqEnabled() && controller.runtimeAvailable()
+              && controller.modelPath().isEmpty(),
+          "the explicitly selected key file configures cloud inference without fabricating a local model path");
+    check(!controller.configureGroq(QString(), QStringLiteral("missing-model")) && controller.runtimeAvailable(),
+          "unsupported Groq models are rejected without destroying the current backend");
+    qunsetenv("GROQ_API_KEY_FILE");
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the shipped Groq settings scene loads");
+    if (scene) {
+        auto* window = qobject_cast<QQuickWindow*>(scene.get());
+        auto* button = scene->findChild<QObject*>(QStringLiteral("groqSettingsButton"));
+        auto* dialog = scene->findChild<QObject*>(QStringLiteral("groqSettingsDialog"));
+        auto* use = scene->findChild<QObject*>(QStringLiteral("groqUseConfiguredButton"));
+        check(window && button && dialog && use, "the real runtime panel exposes Groq configuration");
+        if (window && button && dialog && use) {
+            window->resize(980, 640);
+            check(QMetaObject::invokeMethod(button, "clicked"), "the Groq settings action opens");
+            QCoreApplication::processEvents();
+            check(dialog->property("visible").toBool(), "the Groq cloud consent dialog is visible");
+            auto* content = qobject_cast<QQuickItem*>(dialog->property("contentItem").value<QObject*>());
+            check(content && content->height() > 0 && content->height() < window->height(),
+                  "Groq cloud settings fit the minimum desktop height");
+            check(QMetaObject::invokeMethod(use, "clicked") && controller.groqEnabled()
+                      && controller.modelError().isEmpty(),
+                  "the real QML action configures Groq using the session credential");
+            QCoreApplication::processEvents();
+            check(!dialog->property("visible").toBool(), "successful Groq selection closes its dialog");
+            check(kestrel::ui::auditLayouts(window->contentItem()).isEmpty(),
+                  "Groq controls do not collapse or overlap the desktop layout");
+        }
+    }
+    if (hadKey) { qputenv("GROQ_API_KEY", previousKey); } else { qunsetenv("GROQ_API_KEY"); }
+    if (hadFile) { qputenv("GROQ_API_KEY_FILE", previousFile); } else { qunsetenv("GROQ_API_KEY_FILE"); }
 }
 
 // Runs a real command through the shell runner and waits for its one reply.
@@ -3239,6 +4237,9 @@ int main(int argc, char** argv) {
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testChatToolLoopRunsCallAndAnswers();
     testPkceAndJsonRpcFraming();
+    testUndermindConnection();
+    testGroqStreamingAndFailures();
+    testGroqConfigurationThroughQml();
     testShellCommandReportsOutputAndExitCode();
     testPaperLibrary();
     testPaperListSurvivesARestart();
@@ -3255,7 +4256,10 @@ int main(int argc, char** argv) {
 #endif
     testSpokenPhraseTakesTheTypedPath();
     testAbandonedPhraseIsNotSubmitted();
-    testRecallIsOffUntilTurnedOnAndPersists();
+    testRecallDefaultsOnWithSecureStorageAndPersists();
+    testAutomaticMemoryApprovalCorrectionAndCloudPrivacy();
+    testMemoryControlsThroughQml();
+    testReviewedLearningThroughQml();
     testRecallWithoutAKeystoreStaysOff();
     testAFailedSaveUndoesTheChange();
     testForgetAndClearAreSaved();

@@ -33,11 +33,23 @@ struct StoredConversation {
 // One thing Kestrel remembers across sessions, as it is kept.
 struct StoredMemory {
     std::int64_t id = 0;
-    // "fact" or "summary". A string for the same reason as StoredMessage::role:
+    // "fact", "summary", or "episode". A string like StoredMessage::role:
     // a document field has to be readable by something that is not this program.
     std::string kind;
     std::string text;
     // ISO-8601, UTC, supplied by the app when the memory is stored.
+    std::string createdAt;
+    std::string updatedAt;
+    std::string source = "manual";
+    bool sensitive = false;
+};
+
+// Explicitly reviewed behavior examples, never harvested from memory or chats.
+struct StoredTrainingExample {
+    std::int64_t id = 0;
+    std::string prompt;
+    std::string rejected;
+    std::string preferred;
     std::string createdAt;
 };
 
@@ -64,10 +76,12 @@ struct StoredMemory {
 // something they can see in the file.
 class Profile {
 public:
-    // Version 2 added recall. A version 1 document still loads, and reads as
-    // recall off with nothing remembered. Bumped only when the new fields need
-    // a reader that predates them to refuse the document rather than drop them.
-    static constexpr std::int64_t kCurrentVersion = 2;
+    // Version 4 adds separately reviewed training examples. Older readers must
+    // refuse it rather than silently dropping the learning dataset.
+    static constexpr std::int64_t kCurrentVersion = 4;
+    // Reader metadata, not a stored field. Distinguishes a fresh profile from
+    // an older profile whose explicit disabled state must remain disabled.
+    std::int64_t loadedVersion = 0; // Zero means no stored document was found.
 
     // The name the document is filed under inside the store. Distinct from
     // kProfileService so a future second secret cannot land on top of this one.
@@ -82,16 +96,19 @@ public:
 
     std::vector<StoredConversation> conversations;
 
-    // Whether Kestrel may store what it learns. Off unless the user turned it on.
+    // Saved recall choice. The desktop initializes fresh secure profiles to on;
+    // the parser defaults missing legacy choices to off to preserve opt-outs.
     bool recallEnabled = false;
 
     // What Kestrel has remembered, kept while recall is off too: turning recall
     // off stops new storage, and only an explicit clear deletes.
     std::vector<StoredMemory> memories;
+    // At most 1000 examples; each text field is limited to 4000 UTF-8 bytes.
+    std::vector<StoredTrainingExample> trainingExamples;
 
     [[nodiscard]] bool empty() const {
         return modelPath.empty() && systemPrompt.empty() && conversations.empty()
-            && !recallEnabled && memories.empty();
+            && !recallEnabled && memories.empty() && trainingExamples.empty();
     }
 
     // Adds a conversation, or replaces the one with the same id, and returns its
