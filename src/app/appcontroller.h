@@ -123,6 +123,9 @@ class AppController final : public QObject {
     Q_PROPERTY(double presenceIntensity READ presenceIntensity NOTIFY presenceChanged)
     Q_PROPERTY(bool presenceSpeaking READ presenceSpeaking NOTIFY presenceChanged)
     Q_PROPERTY(QString personaMood READ personaMood NOTIFY presenceChanged)
+    // The field Kestrel is tuned for, shown with the mood. Fixed for the
+    // session because it is part of the cached prompt prefix.
+    Q_PROPERTY(QString specialism READ specialism CONSTANT)
     // The single status line shown under the composer: an activity whisper, or
     // an anticipatory line while one is still fresh.
     Q_PROPERTY(QString statusWhisper READ statusWhisper NOTIFY presenceChanged)
@@ -299,6 +302,7 @@ public:
     [[nodiscard]] double presenceIntensity() const noexcept;
     [[nodiscard]] bool presenceSpeaking() const noexcept;
     [[nodiscard]] QString personaMood() const;
+    [[nodiscard]] QString specialism() const;
     [[nodiscard]] QString statusWhisper() const;
     [[nodiscard]] QString acknowledgement() const noexcept;
     [[nodiscard]] QString ambientThought() const;

@@ -400,6 +400,7 @@ ApplicationWindow {
                         ToolTip.visible: presenceHover.containsMouse
                         ToolTip.text: "Kestrel is " + appController.presenceState
                                       + " · " + appController.personaMood
+                                      + " · " + appController.specialism + " specialist"
                         ToolTip.delay: 400
                         MouseArea {
                             id: presenceHover

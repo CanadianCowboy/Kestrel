@@ -811,6 +811,10 @@ QString AppController::personaMood() const {
     return QString::fromLatin1(core::toString(m_presence.snapshot().mood));
 }
 
+QString AppController::specialism() const {
+    return QString::fromLatin1(core::toString(m_persona.specialism()));
+}
+
 QString AppController::statusWhisper() const {
     // An anticipatory line outranks the activity whisper while it is fresh, and
     // then lets it back: the status line must return to saying what Kestrel is

@@ -294,6 +294,9 @@ int printRuntime(const kestrel::app::AppController& controller) {
     out << "Kestrel runtime report\n";
     out << "  backend      : " << controller.backendName() << "\n";
     out << "  model        : " << controller.modelName() << "\n";
+    // The specialist field is part of the prompt and names the training target,
+    // so it belongs in the report beside the backend that will answer.
+    out << "  specialism   : " << controller.specialism() << "\n";
     out << "  detail       : " << controller.runtimeDetail() << "\n";
     out << "  gpu available: " << (controller.gpuAvailable() ? "yes" : "no") << "\n";
     out << "  gpu          : " << controller.gpuName() << "\n";
