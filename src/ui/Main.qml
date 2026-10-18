@@ -338,6 +338,7 @@ ApplicationWindow {
                                 objectName: "generationStageLabel"
                                 visible: appController.toolRouterEnabled && appController.generationStage.length > 0
                                 text: appController.generationStage
+                                textFormat: Text.PlainText
                                 color: window.accent
                                 width: parent.width
                                 wrapMode: Text.Wrap
