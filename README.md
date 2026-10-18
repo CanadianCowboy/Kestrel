@@ -12,6 +12,15 @@ The project prioritizes:
 
 > **Project status:** Kestrel has a working Qt/QML desktop app, persistent local conversations, streaming generation, a model picker, runtime diagnostics, and opt-in local tools. Native inference is available through optional llama.cpp (GGUF) and ONNX Runtime GenAI integrations; a mock preview backend keeps dependency-light builds usable. Speech input and synthesis work through separate adapters, with important real-time voice capabilities still on the roadmap.
 
+Kestrel is tuned for **astronomy and astrophysics**. The specialism is one
+persona field, one training target, and four local computation tools that agree
+with each other: the prompt asks for exact units, epochs, frames, and
+uncertainties, the LoRA pipeline keeps reviewed astronomy examples in every run,
+and the tools turn a coordinate, epoch, distance, or magnitude into a computed
+number instead of an estimate. It is steering and practice, not a claim that a
+small local model has read the literature. Details, dataset candidates, and
+limits are in [docs/ASTRONOMY.md](docs/ASTRONOMY.md).
+
 ## Vision
 
 Kestrel aims to become a personal local AI environment with three layers:
@@ -48,7 +57,8 @@ Kestrel does not treat CUDA as an inference engine by itself. CUDA supplies devi
 │   ├── core/
 │   │   ├── conversation.h
 │   │   ├── conversation.cpp    # Conversation and message domain model
-│   │   ├── persona.*           # Tone profile, presence line, anticipatory lines
+│   │   ├── persona.*           # Tone profile, specialism, presence line, anticipatory lines
+│   │   ├── astronomy.*         # Portable time/coordinate/unit/magnitude arithmetic
 │   │   ├── presence.*          # What Kestrel and the user last did, for the UI
 │   │   ├── idlepersona.*       # The sandboxed loop that runs between turns
 │   │   ├── voicesession.h

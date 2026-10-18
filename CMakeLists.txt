@@ -233,6 +233,8 @@ add_library(kestrel_core
     src/core/persona.cpp
     src/core/recall.cpp
     src/core/persona.h
+    src/core/astronomy.cpp
+    src/core/astronomy.h
     src/core/presence.cpp
     src/core/presence.h
     src/core/idletool.cpp

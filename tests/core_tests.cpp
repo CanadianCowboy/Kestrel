@@ -5,6 +5,7 @@
 #include "core/mcpdispatch.h"
 #include "core/mcphttp.h"
 #include "core/agenttools.h"
+#include "core/astronomy.h"
 #include "core/persona.h"
 #include "core/recall.h"
 #include "core/presence.h"
@@ -15,6 +16,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <iostream>
 #include <algorithm>
@@ -451,6 +453,37 @@ void testPersonaPromptHasKestrelCharacter() {
     assert(fragment.find("say when you are certain") != std::string::npos);
     assert(fragment.find("Ask before anything consequential or privileged") != std::string::npos);
     assert(fragment.find("Offer a next step only when it genuinely helps") != std::string::npos);
+}
+
+// The specialist field is steering, not knowledge, but it is the part of the
+// prompt that makes Kestrel an astronomy assistant rather than a generalist. It
+// is fixed with the rest of the prefix and absent when it is switched off.
+void testPersonaSpecialismSelectsDomainParagraph() {
+    core::Persona persona;
+    assert(persona.specialism() == core::PersonaSpecialism::Astronomy);
+    assert(core::toString(persona.specialism()) == std::string("astronomy"));
+
+    const std::string specialist = persona.specialismLine();
+    assert(specialist.find("astronomy and astrophysics") != std::string::npos);
+    assert(specialist.find("BJD_TDB") != std::string::npos);
+    assert(specialist.find("ICRS") != std::string::npos);
+    assert(persona.systemPromptFragment().find(specialist) != std::string::npos);
+    // The dials drift; the specialist paragraph does not, or the cached prefix
+    // would be rebuilt mid-conversation.
+    persona.drift(0.5F, -0.5F, 0.5F, -0.5F, 0.5F, 0.5F);
+    assert(persona.specialismLine() == specialist);
+
+    core::ToneProfile plain;
+    plain.wry = false;
+    persona.setTone(plain);
+    assert(persona.systemPromptFragment().find(specialist) != std::string::npos);
+
+    persona.setSpecialism(core::PersonaSpecialism::General);
+    assert(persona.specialismLine().empty());
+    assert(persona.systemPromptFragment().find("astronomy") == std::string::npos);
+    assert(persona.systemPromptFragment().find("You are Kestrel") != std::string::npos);
+    persona.setSpecialism(core::PersonaSpecialism::Astronomy);
+    assert(persona.specialismLine() == specialist);
 }
 
 void testPersonaAnticipation() {
@@ -1723,6 +1756,123 @@ void testHtmlToTextKeepsOnlyReadableText() {
     assert(clipped.find("[text cut short]") != std::string::npos);
 }
 
+// --- Astronomy arithmetic ----------------------------------------------------
+
+// The epochs are the ones every catalogue and paper quotes: J2000.0 noon,
+// MJD 0, and the Unix epoch. If any of these drift, every derived time is off.
+void testAstronomyTimeIsExact() {
+    std::string error;
+    double julianDay = 0.0;
+
+    assert(core::astronomy::parseIsoUtc("2000-01-01T12:00:00Z", julianDay, error));
+    assert(error.empty());
+    assert(std::abs(julianDay - 2451545.0) < 1e-9);
+
+    assert(core::astronomy::parseIsoUtc("1970-01-01", julianDay, error));
+    assert(std::abs(julianDay - 2440587.5) < 1e-9);
+
+    // MJD 0 by definition, so this checks the offset rather than a copied value.
+    assert(core::astronomy::parseIsoUtc("1858-11-17T00:00:00", julianDay, error));
+    assert(std::abs((julianDay - 2400000.5)) < 1e-9);
+
+    double midnight = 0.0;
+    double evening = 0.0;
+    assert(core::astronomy::parseIsoUtc("2026-10-17", midnight, error));
+    assert(core::astronomy::parseIsoUtc("2026-10-17T18:00:00", evening, error));
+    assert(std::abs((evening - midnight) - 0.75) < 1e-9);
+
+    assert(core::astronomy::parseIsoUtc("2024-02-29", julianDay, error));
+    // A date that does not exist must be refused, not rolled forward.
+    assert(!core::astronomy::parseIsoUtc("2023-02-29", julianDay, error) && !error.empty());
+    assert(!core::astronomy::parseIsoUtc("2026-04-31", julianDay, error));
+    assert(!core::astronomy::parseIsoUtc("not a date", julianDay, error));
+    assert(!core::astronomy::parseIsoUtc("2026-10-17T25:00:00", julianDay, error));
+    assert(!core::astronomy::parseIsoUtc("2026-10-17T12:00:00+02:00", julianDay, error));
+}
+
+void testAstronomySexagesimalParsing() {
+    std::string error;
+    double rightAscension = 0.0;
+    double declination = 0.0;
+
+    assert(core::astronomy::parseRightAscension("05:34:31.94", rightAscension, error));
+    assert(std::abs(rightAscension - (5.0 + 34.0 / 60.0 + 31.94 / 3600.0)) < 1e-12);
+    assert(core::astronomy::parseRightAscension("05h34m31.94s", rightAscension, error));
+    assert(std::abs(rightAscension - (5.0 + 34.0 / 60.0 + 31.94 / 3600.0)) < 1e-12);
+    // A bare number is hours, not degrees: 83.63 would be an angular measure
+    // and is out of range, which the parser has to refuse rather than wrap.
+    assert(core::astronomy::parseRightAscension("5.5755", rightAscension, error));
+    assert(std::abs(rightAscension - 5.5755) < 1e-9);
+
+    assert(core::astronomy::parseDeclination("+22:00:52.2", declination, error));
+    assert(std::abs(declination - (22.0 + 52.2 / 3600.0)) < 1e-12);
+    assert(core::astronomy::parseDeclination("-05 23 28", declination, error));
+    assert(std::abs(declination + (5.0 + 23.0 / 60.0 + 28.0 / 3600.0)) < 1e-12);
+    assert(core::astronomy::parseDeclination("22.5", declination, error));
+    assert(std::abs(declination - 22.5) < 1e-12);
+
+    // Formatting is a round trip within the hundredth of a second it prints.
+    const double hours = 5.5755;
+    assert(core::astronomy::parseRightAscension(
+        core::astronomy::formatRightAscension(hours), rightAscension, error));
+    assert(std::abs(rightAscension - hours) < 0.01 / 3600.0);
+    const double degrees = -5.391111;
+    assert(core::astronomy::parseDeclination(
+        core::astronomy::formatDeclination(degrees), declination, error));
+    assert(std::abs(declination - degrees) < 0.01 / 3600.0);
+
+    assert(!core::astronomy::parseRightAscension("-1:00:00", rightAscension, error));
+    assert(!core::astronomy::parseRightAscension("25:00:00", rightAscension, error));
+    assert(!core::astronomy::parseRightAscension("12:61:00", rightAscension, error));
+    assert(!core::astronomy::parseRightAscension("", rightAscension, error));
+    assert(!core::astronomy::parseDeclination("+91:00:00", declination, error));
+    assert(core::astronomy::parseDeclination("-5:00", declination, error));
+    assert(std::abs(declination + 5.0) < 1e-12);
+}
+
+void testAstronomySeparation() {
+    // Cardinal cases hold exactly, so they catch a swapped axis or a radians
+    // conversion that never happened.
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 0.0, 6.0, 0.0) - 90.0) < 1e-9);
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 0.0, 0.0, 90.0) - 90.0) < 1e-9);
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 0.0, 0.0, 0.0)) < 1e-12);
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 90.0, 12.0, 90.0)) < 1e-9);
+    // A one-arcsecond offset has to survive as one arcsecond, not as rounding
+    // noise; this is why the implementation is haversine.
+    const double arcsecond = 1.0 / 3600.0;
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 0.0, 0.0, arcsecond) - arcsecond) < 1e-12);
+    // Antipodal points are 180 degrees apart, not NaN.
+    assert(std::abs(core::astronomy::angularSeparationDeg(0.0, 0.0, 12.0, 0.0) - 180.0) < 1e-9);
+}
+
+void testAstronomyUnitsAndMagnitudes() {
+    std::string error;
+    double value = 0.0;
+
+    assert(core::astronomy::convertLength(1.0, "pc", "ly", value, error));
+    assert(std::abs(value - 3.26156) < 1e-4);
+    assert(core::astronomy::convertLength(1.0, "ly", "km", value, error));
+    assert(std::abs(value - 9.4607304725808e12) / 9.4607304725808e12 < 1e-12);
+    assert(core::astronomy::convertLength(1.0, "au", "km", value, error));
+    assert(std::abs(value - 1.495978707e8) < 1.0);
+    assert(core::astronomy::convertLength(1.0, "MPC", "kpc", value, error));
+    assert(std::abs(value - 1000.0) < 1e-9);
+    assert(!core::astronomy::convertLength(1.0, "furlong", "pc", value, error));
+    assert(!error.empty());
+    assert(!core::astronomy::convertLength(1.0, "pc", "parsecs", value, error));
+
+    // Five magnitudes is a factor of 100, and the sign follows the scale.
+    assert(std::abs(core::astronomy::fluxRatioFromMagnitudeDifference(5.0) - 0.01) < 1e-12);
+    assert(std::abs(core::astronomy::fluxRatioFromMagnitudeDifference(0.0) - 1.0) < 1e-12);
+    assert(std::abs(core::astronomy::fluxRatioFromMagnitudeDifference(-5.0) - 100.0) < 1e-9);
+
+    // Distance modulus: m - M = 0 is 10 pc, and five magnitudes is ten times
+    // further. A modulus of 25 is 1 Mpc, the value used for nearby galaxies.
+    assert(std::abs(core::astronomy::distanceParsecsFromDistanceModulus(0.0) - 10.0) < 1e-9);
+    assert(std::abs(core::astronomy::distanceParsecsFromDistanceModulus(5.0) - 100.0) < 1e-6);
+    assert(std::abs(core::astronomy::distanceParsecsFromDistanceModulus(25.0) - 1.0e6) < 1.0);
+}
+
 int main() {
     testModelToolCallParsing();
     testSearchResultParsing();
@@ -1756,9 +1906,14 @@ int main() {
     testPersonaDialsStayInRange();
     testPersonaAcknowledgementIsNotAStockCue();
     testPersonaPromptHasKestrelCharacter();
+    testPersonaSpecialismSelectsDomainParagraph();
     testPersonaAnticipation();
     testPersonaStatusWhispers();
     testPersonaSessionTopic();
+    testAstronomyTimeIsExact();
+    testAstronomySexagesimalParsing();
+    testAstronomySeparation();
+    testAstronomyUnitsAndMagnitudes();
     testRecallIsOffByDefault();
     testRecallOffKeepsWhatIsStored();
     testRecallRejectsEmptyAndLongText();
