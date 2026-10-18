@@ -2390,6 +2390,7 @@ ApplicationWindow {
                         color: window.ink
                         font.family: "monospace"
                         font.pixelSize: 12
+                        textFormat: Text.PlainText
                         wrapMode: Text.WrapAnywhere
                     }
                     Text { text: "REASON"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
@@ -2398,6 +2399,7 @@ ApplicationWindow {
                         width: parent.width
                         color: window.ink
                         font.pixelSize: 12
+                        textFormat: Text.PlainText
                         wrapMode: Text.Wrap
                     }
                 }
