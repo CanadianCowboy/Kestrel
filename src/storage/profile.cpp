@@ -27,6 +27,7 @@ Value bodyValue(const Profile& profile) {
     document.set("version", Value::makeInteger(Profile::kCurrentVersion));
     document.set("modelPath", Value::makeString(profile.modelPath));
     document.set("systemPrompt", Value::makeString(profile.systemPrompt));
+    document.set("activeConversationId", Value::makeInteger(profile.activeConversationId));
 
     Value conversations = Value::makeArray();
     for (const StoredConversation& conversation : profile.conversations) {
@@ -40,9 +41,21 @@ Value bodyValue(const Profile& profile) {
             Value entry = Value::makeObject();
             entry.set("role", Value::makeString(message.role));
             entry.set("content", Value::makeString(message.content));
+            entry.set("status", Value::makeString(message.status));
+            entry.set("note", Value::makeString(message.note));
             messages.push(std::move(entry));
         }
         one.set("messages", std::move(messages));
+        Value activity = Value::makeArray();
+        for (const StoredActivity& item : conversation.activity) {
+            Value entry = Value::makeObject();
+            entry.set("kind", Value::makeString(item.kind));
+            entry.set("name", Value::makeString(item.name));
+            entry.set("text", Value::makeString(item.text));
+            entry.set("isError", Value::makeBoolean(item.isError));
+            activity.push(std::move(entry));
+        }
+        one.set("activity", std::move(activity));
         conversations.push(std::move(one));
     }
     document.set("conversations", std::move(conversations));
@@ -58,6 +71,9 @@ Value bodyValue(const Profile& profile) {
         entry.set("updatedAt", Value::makeString(memory.updatedAt.empty() ? memory.createdAt : memory.updatedAt));
         entry.set("source", Value::makeString(memory.source));
         entry.set("sensitive", Value::makeBoolean(memory.sensitive));
+        entry.set("pinned", Value::makeBoolean(memory.pinned));
+        entry.set("confirmations", Value::makeInteger(memory.confirmations));
+        entry.set("supersededBy", Value::makeInteger(memory.supersededBy));
         memories.push(std::move(entry));
     }
     document.set("memories", std::move(memories));
@@ -69,9 +85,18 @@ Value bodyValue(const Profile& profile) {
         entry.set("rejected", Value::makeString(example.rejected));
         entry.set("preferred", Value::makeString(example.preferred));
         entry.set("createdAt", Value::makeString(example.createdAt));
+        entry.set("source", Value::makeString(example.source));
+        entry.set("adapterStage", Value::makeString(example.adapterStage));
+        entry.set("baseModel", Value::makeString(example.baseModel));
         examples.push(std::move(entry));
     }
     document.set("trainingExamples", std::move(examples));
+    document.set("automaticLearningEnabled", Value::makeBoolean(profile.automaticLearningEnabled));
+    Value instructions = Value::makeArray();
+    for (const auto& instruction : profile.behaviorInstructions) {
+        instructions.push(Value::makeString(instruction));
+    }
+    document.set("behaviorInstructions", std::move(instructions));
     return document;
 }
 
@@ -180,6 +205,22 @@ bool readRecall(const Value& body, Profile& profile, std::string& error) {
             if (!flag) { error = "a memory sensitivity flag is not true or false"; return false; }
             memory.sensitive = *flag;
         }
+        if (const Value* pinned = entry.find("pinned")) {
+            if (!pinned->isBoolean()) { error = "memory pinned must be boolean"; return false; }
+            memory.pinned = *pinned->asBoolean();
+        }
+        if (const Value* count = entry.find("confirmations")) {
+            if (!count->isInteger() || *count->asInteger() < 1 || *count->asInteger() > 1000000) {
+                error = "memory confirmations must be 1-1000000"; return false;
+            }
+            memory.confirmations = *count->asInteger();
+        }
+        if (const Value* target = entry.find("supersededBy")) {
+            if (!target->isInteger() || *target->asInteger() < 0 || *target->asInteger() == memory.id) {
+                error = "memory supersededBy must be a different nonnegative ID"; return false;
+            }
+            memory.supersededBy = *target->asInteger();
+        }
         if (memory.id <= 0 || memory.id == std::numeric_limits<std::int64_t>::max()
             || !ids.insert(memory.id).second || memory.text.empty() || memory.text.size() > 500
             || memory.source.size() > 200 || memory.createdAt.size() > 64 || memory.updatedAt.size() > 64
@@ -215,7 +256,20 @@ bool readTrainingExamples(const Value& body, Profile& profile, std::string& erro
         if (!readOptionalString(entry, "prompt", example.prompt, error)
             || !readOptionalString(entry, "rejected", example.rejected, error)
             || !readOptionalString(entry, "preferred", example.preferred, error)
-            || !readOptionalString(entry, "createdAt", example.createdAt, error)) { return false; }
+            || !readOptionalString(entry, "createdAt", example.createdAt, error)
+            || !readOptionalString(entry, "source", example.source, error)
+            || !readOptionalString(entry, "adapterStage", example.adapterStage, error)
+            || !readOptionalString(entry, "baseModel", example.baseModel, error)) { return false; }
+        if (example.adapterStage != "persona" && example.adapterStage != "tool") {
+            error = "unknown adapter training stage"; return false;
+        }
+        if (example.baseModel != "Qwen/Qwen3-4B-Base" && example.baseModel != "Qwen/Qwen3-4B-Instruct-2507") {
+            error = "unknown training parent model"; return false;
+        }
+        if (example.source != "reviewed" && example.source != "chat" && example.source != "teaching" && example.source != "tool_trace") {
+            error = "unknown learning example source";
+            return false;
+        }
         if (example.prompt.empty() || example.preferred.empty() || example.prompt.size() > 4000
             || example.rejected.size() > 4000 || example.preferred.size() > 4000
             || example.createdAt.size() > 64) {
@@ -340,6 +394,29 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         return false;
     }
 
+    if (const Value* enabled = body.find("automaticLearningEnabled")) {
+        if (!enabled->isBoolean()) { error = "automaticLearningEnabled must be boolean"; return false; }
+        assembled.automaticLearningEnabled = *enabled->asBoolean();
+    }
+    if (const Value* instructions = body.find("behaviorInstructions")) {
+        if (!instructions->isArray() || instructions->asArray()->size() > 32) {
+            error = "behaviorInstructions must contain at most 32 strings"; return false;
+        }
+        for (const Value& instruction : *instructions->asArray()) {
+            if (!instruction.isString() || instruction.asString()->empty() || instruction.asString()->size() > 500) {
+                error = "behavior instruction must be 1-500 UTF-8 bytes"; return false;
+            }
+            assembled.behaviorInstructions.emplace_back(*instruction.asString());
+        }
+    }
+    if (const Value* active = body.find("activeConversationId")) {
+        if (!active->isInteger() || *active->asInteger() < 0
+            || *active->asInteger() >= std::numeric_limits<int>::max()) {
+            error = "activeConversationId must be a nonnegative conversation ID";
+            return false;
+        }
+        assembled.activeConversationId = static_cast<int>(*active->asInteger());
+    }
     const Value* conversations = body.find("conversations");
     if (conversations == nullptr) {
         out = std::move(assembled);
@@ -350,6 +427,7 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
         error = "the profile's conversations are not a list";
         return false;
     }
+    std::unordered_set<int> conversationIds;
     for (const json::Value& entry : *list) {
         if (!entry.isObject()) {
             error = "a conversation in the profile is not a record";
@@ -374,6 +452,11 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
             }
             conversation.id = static_cast<int>(*number);
         }
+        if (*versionNumber >= 7 && (conversation.id <= 0 || conversation.id == std::numeric_limits<int>::max()
+            || !conversationIds.insert(conversation.id).second)) {
+            error = "a conversation has an invalid or duplicate ID";
+            return false;
+        }
         if (!readOptionalString(entry, "title", conversation.title, error) ||
             !readOptionalString(entry, "updatedAt", conversation.updatedAt, error)) {
             return false;
@@ -392,10 +475,37 @@ bool Profile::fromJson(std::string_view document, Profile& out, std::string& err
                 }
                 StoredMessage message;
                 if (!readOptionalString(stored, "role", message.role, error) ||
-                    !readOptionalString(stored, "content", message.content, error)) {
+                    !readOptionalString(stored, "content", message.content, error) ||
+                    !readOptionalString(stored, "status", message.status, error) ||
+                    !readOptionalString(stored, "note", message.note, error)) {
+                    return false;
+                }
+                if (message.status != "complete" && message.status != "streaming"
+                    && message.status != "stopped" && message.status != "failed") {
+                    error = "a message has an unknown delivery status";
                     return false;
                 }
                 conversation.messages.push_back(std::move(message));
+            }
+        }
+        if (const Value* activity = entry.find("activity")) {
+            if (!activity->isArray() || activity->asArray()->size() > 200) {
+                error = "conversation activity must be a list of at most 200 entries";
+                return false;
+            }
+            for (const Value& item : *activity->asArray()) {
+                StoredActivity row;
+                if (!item.isObject() || !readOptionalString(item, "kind", row.kind, error)
+                    || !readOptionalString(item, "name", row.name, error)
+                    || !readOptionalString(item, "text", row.text, error)) {
+                    error = "conversation activity contains an invalid record";
+                    return false;
+                }
+                if (const Value* flag = item.find("isError")) {
+                    if (!flag->isBoolean()) { error = "activity isError must be boolean"; return false; }
+                    row.isError = *flag->asBoolean();
+                }
+                conversation.activity.push_back(std::move(row));
             }
         }
         assembled.conversations.push_back(std::move(conversation));

@@ -685,6 +685,9 @@ if(KESTREL_BUILD_UI)
             src/app/main.cpp
             src/app/appcontroller.cpp
             src/app/appcontroller.h
+            src/app/appcontroller_learning.cpp
+            src/app/automaticlearning.cpp
+            src/app/automaticlearning.h
             src/app/privilegedcommand.cpp
             src/app/privilegedcommand.h
             src/app/privilegedapproval.cpp
@@ -731,7 +734,8 @@ if(KESTREL_BUILD_UI)
             Qt6::Quick
             Qt6::QuickControls2
         )
-        target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT=1)
+        target_compile_definitions(kestrel PRIVATE KESTREL_HAS_QT=1
+            KESTREL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
         # The embedded browser needs Qt WebEngine. Without it the browser tool
         # opens pages in the user's default browser instead.
@@ -856,8 +860,17 @@ if(KESTREL_BUILD_UI)
                 src/app/listensession.h
                 src/app/appcontroller.cpp
                 src/app/appcontroller.h
+                src/app/appcontroller_learning.cpp
+                src/app/automaticlearning.cpp
+                src/app/automaticlearning.h
                 src/app/undermindclient.cpp
                 src/app/undermindclient.h
+                src/app/mcpserver.cpp
+                src/app/mcpserver.h
+                src/app/browsertools.cpp
+                src/app/browsertools.h
+                src/app/privilegedapproval.cpp
+                src/app/privilegedapproval.h
                 src/app/groqbackend.cpp
                 src/app/groqbackend.h
                 src/app/shellcommand.cpp
@@ -878,7 +891,8 @@ if(KESTREL_BUILD_UI)
             find_package(Qt6Network REQUIRED)
             target_link_libraries(kestrel_app_tests PRIVATE kestrel_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Network)
             target_compile_definitions(kestrel_app_tests PRIVATE
-                KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
+                KESTREL_UI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/ui"
+                KESTREL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
             target_compile_options(kestrel_app_tests PRIVATE ${KESTREL_STRICT_FLAGS})
             if(TARGET Qt6::TextToSpeech)
                 target_link_libraries(kestrel_app_tests PRIVATE Qt6::TextToSpeech)

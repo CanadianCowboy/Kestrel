@@ -1,174 +1,197 @@
-# Local base-model behavior learning
+# Automatic local behavior learning
 
-## Model and limits
+Kestrel is local-only. Groq configuration and cloud-selection controls are no
+longer available; old cloud configuration calls are refused without reading keys.
+Remote MCP tools remain explicitly connected network integrations, not inference
+backends. Remote results are not training targets; successful calls may contribute
+the executed call itself to the separate Tool-stage dataset with learning consent.
 
-The selected inference artifact is `Qwen3-4B-Base.Q4_K_M.gguf`, from
-[mradermacher/Qwen3-4B-Base-GGUF](https://huggingface.co/mradermacher/Qwen3-4B-Base-GGUF),
-a quantization of [Qwen/Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base)
-(Apache 2.0). It is **not** Qwen3-4B chat or Instruct-2507.
+## User workflow
 
-Local installation for this checkout: `build/models/Qwen3-4B-Base.Q4_K_M.gguf`.
-The adjacent manifest records the pinned revision, byte count and SHA-256 verified
-against the repository's LFS metadata. Build/model artifacts are ignored by git.
+1. Launch Kestrel. It loads the last working local model, otherwise discovers
+   installed models beside the executable, in application-data `models/`, or in
+   the development checkout's `build/models/`. `--model` and `KESTREL_MODEL` remain
+   explicit overrides. Missing models produce an installation diagnostic, not a
+   cloud or mock fallback. No automatic download occurs.
+2. Open **Memory (Ctrl+M)** and enable **Learn automatically from my conversations
+   (local only)** once. This consent is saved in the encrypted OS-keystore
+   profile. Old profiles do not opt in during migration. Without a working
+   keystore, automatic learning cannot be enabled.
+3. Just chat. Completed, non-sensitive, non-tool-assisted turns become local
+   examples after consent. Stopped/failed replies, tool outputs, oversized turns,
+   and recognized sensitive text are excluded. Screening is best-effort, not a
+   guarantee that no personal information enters weights.
+4. Teach behavior naturally. For example, `From now on keep answers short` saves
+   a user-authored preference for immediate prompting, including across restarts.
+   `When I ask status, say Ready.` adds a concrete prompt/answer example. These
+   preferences do not grant tool capabilities or administrator permission. The
+   Memory panel lists taught preferences with individual **Forget preference**
+   actions. `When I ask status, say All clear.` replaces an earlier target for
+   `status`, ignoring case and repeated whitespace. `No, say …` teaches a target
+   for the preceding user request. Target/preference updates save atomically;
+   failed secure saves leave the previous behavior intact.
+5. With at least eight distinct usable prompts, after 60 seconds without chat
+   activity, the app automatically trains a candidate if inference, dictation,
+   speech playback and resumable output are idle. Inference VRAM is released;
+   the model reloads afterward. Status explains collection, training, conversion,
+   activation or rejection. Returning during training stops the local process;
+   retry the message once model restoration finishes.
+6. Disable learning to stop future collection/training. Existing learned behavior
+   remains available. **Reset learned behavior** confirms before clearing
+   examples/preferences, removing the active adapter and its startup selection,
+   and deleting managed learning artifacts. Previously exported files remain.
 
-Kestrel uses plain transcript prompting for GGUFs marked `general.finetune=Base`,
-even if their tokenizer metadata includes a chat template. That metadata does not
-mean base weights were chat-trained. The same `user: ...\nassistant:` format is
-used by the training CLI. Base output stops before a generated next-speaker label;
-this prevents invented transcript turns, not hallucinations within an answer.
+Ordinary assistant replies are self-distillation targets, not proof that those
+replies are correct or preferred. Chat corrections and teaching are important.
+Deleting a chat/example cannot reliably erase information already trained into
+an adapter. Reset to base weights is the reliable local rollback boundary.
 
-The default context is capped at 4096 tokens. Qwen3 KV accounting uses its explicit
-128-dimensional K/V heads rather than `hidden_size / query_heads` (80 for 4B).
-The latter underestimated memory and caused a 21K-context allocation to fail on
-the RTX 4050. A 4K Qwen3 4B FP16 cache is 576 MiB. This is not a guarantee that
-every model fits, or a quality claim about a base model's chat/tool behavior.
+Manual example review/export is optional under **Advanced review**, not required
+for ordinary teaching. Export preserves whether each example was reviewed or
+captured under chat-learning consent; auto-captured and chat-taught examples are
+never falsely marked reviewed. JSONL exports retain `source` (`chat`, `teaching`,
+`reviewed`) and explicit review/consent flags. Standalone training refuses
+non-reviewed exports unless `--allow-consented-chat` is given. Model and LoRA file
+management are not the normal user workflow.
 
-## Memory and reviewed corrections are separate
+## Automatic local lifecycle
 
-Memory remains the existing editable, encrypted local recall system. It does not
-modify model weights. Do not train private personal facts: deletion from memory
-or a dataset cannot reliably erase information already learned into an adapter.
+The app-owned `AutomaticLearning` coordinator runs only the installed Python
+trainer and compatible llama.cpp converter, directly through QProcess (no shell).
+It is **not IdlePersona work**: the sandboxed core idle loop has not gained file,
+network or command capability. One-time learning consent covers this separate
+local GPU/file workflow. No services, uploads or remote model code are used.
 
-Open **Memory (Ctrl+M) → Behavior learning**:
+- Automatic weight training currently targets `Qwen/Qwen3-4B-Base`; both Persona and Tool adapters are distinct and bound to that lineage. Instruct GGUF is an optional inference/routing model and must never receive a Base LoRA.
+- The optional Instruct artifact is installed only by `python3 scripts/setup_instruct.py`. It pins an immutable publisher revision and verifies exact file size and SHA-256 before writing the adjacent manifest. It has been verified locally; setup is not run during ordinary chat.
+- Inference artifact: `Qwen3-4B-Base.Q4_K_M.gguf`; its adjacent
+  `Qwen3-4B-Base.Q4_K_M.manifest.json` records base identity, filename, bytes and
+  SHA-256. The trainer verifies the inference file and installed training files
+  against manifests before starting GPU work.
+- The local NF4 training directory is `Qwen3-4B-Base-bnb-4bit` with its
+  `download-manifest.json`; conversion uses original non-quantized base
+  configuration in `Qwen3-4B-Base-config/`.
+- Batch size 1, rank 4, Q/V projections, eight steps, maximum 512 tokens per
+  example. Overlength examples are reported and skipped, never truncated.
+- Automatic Persona runs target `--domain astronomy` and merge the packaged,
+  reviewed `scripts/astronomy_seed.jsonl` corpus. Automatic Tool runs use only
+  successful executed-call targets and merge the stage-scoped reviewed
+  `scripts/tool_seed.jsonl` protocol examples; these are not mixed with Persona targets. A seed never overrides the
+  user's own answer for the same prompt, and the merge does not lower the
+  eight-example collection gate: the seeds keep the field in the adapter, they
+  do not trigger training on their own. Curation reserves at least half of the
+  replay budget for astronomy, so a run of generic corrections cannot train the
+  specialism out. See [ASTRONOMY.md](ASTRONOMY.md).
+- Automatic curation keeps at most 128 distinct normalized prompts, including
+  at most 32 self-generated chat replies. Explicit teaching/review overrides
+  chat and packaged seeds; the latest explicit correction wins. Recent
+  revisions are kept when the budget fills. Explicit targets receive two
+  training copies versus one for chat, only after splitting so weighting cannot
+  leak targets into validation.
+- The desktop never imports external datasets. `--allow-imported` on a manual
+  run accepts `source: "imported"` examples that carry a licence and origin,
+  and the activation gate then also requires the astronomy-held-out probe not to
+  regress. Imported examples are never marked reviewed.
+- Case/whitespace-normalized, prompt-disjoint 20% holdout. Activation requires
+  finite improved held-out loss,
+  nonempty/non-tool outputs, no regression on a small deterministic held-out
+  text-similarity probe, and, for a specialist run, no regression on the
+  astronomy-only probe. These are limited automated checks, **not proof of
+  general chat quality, factual reliability, privacy or tool safety**.
+- GPU memory admission requires at least 3.5 GiB free; training has a five-minute
+  process deadline. Inference is restored after cancellation, failure or rejection.
+  Failed datasets do not cause continuous automatic retries.
+- Candidate PEFT weights, tokenizer copies and temporary owner-only plaintext
+  JSONL are removed at completion. Accepted owner-only GGUF adapters live under
+  application-data `learning/`; the working adapter/model pairing reloads on the
+  next launch. Failed activation restores the preceding adapter. Roll back
+  learned weights returns to base weights without deleting editable memory.
+- Owner-only `learning/last-evaluation.json` keeps the latest completed candidate's
+  loss, behavior metrics, curation counts, seed and hashed held-out prompt IDs.
+  Accepted adapters also retain an adjacent `.evaluation.json`. Reports omit raw
+  prompts, preferred answers and generated outputs; fingerprints are identifiers,
+  not a guarantee of anonymity. The Memory panel shows the evaluation summary;
+  passing training checks and actual activation are reported separately.
+- Profile v6 stores opt-in, source-tagged examples and up to 32 user-taught
+  preferences. Secure-save failures roll back mutations. At most 1000 examples,
+  each field at most 4000 UTF-8 bytes; each preference at most 500 bytes.
 
-1. Review the latest chat answer or enter a prompt manually.
-2. Edit the original answer and write the preferred answer. Remove private facts,
-   credentials and tool output. The original answer is review context, **not** a
-   positive training target.
-3. Check the explicit review checkbox and save. Only this action adds an example;
-   normal chats, recall records, and idle work never become training data.
-4. Inspect/delete saved examples. They persist in the OS-keystore profile, format
-   v4 (reads v1–v3 without inventing examples or changing saved memory opt-outs).
-5. Explicitly export reviewed JSONL. Export is plaintext, owner-only on POSIX,
-   local, atomic, and does not upload, train, or activate anything. Keep exports
-   under ignored `data/`, not in source control.
+The normal installed build must package local training assets. Discovery checks
+app/development/user-data roots for `training-venv`, `scripts/train_persona.py`,
+`scripts/astronomy_seed.jsonl` (it is resolved beside the trainer),
+`models/Qwen3-4B-Base-bnb-4bit`, and `models/Qwen3-4B-Base-config`. The converter
+is discovered at `training/convert_lora_to_gguf.py` beside the app,
+`third_party/llama.cpp/convert_lora_to_gguf.py` in the checkout, or the existing
+local developer installation `~/.local/src/llama.cpp/`. Ship converter support
+modules from the compatible llama.cpp version as well. Missing assets keep chat
+capture/preferences working and produce an honest diagnostic; the app never
+silently downloads multi-gigabyte training dependencies.
 
-Sensitive-content screening is best-effort and not a guarantee. Recognized
-sensitive text is refused for training capture. At most 1000 reviewed examples
-are stored, each text field at most 4000 UTF-8 bytes. Invalid/oversized data is
-refused rather than silently truncated. Secure-save failure rolls back mutations.
-Deleting stored examples does not remove earlier exports or untrain adapters.
+The development checkout already has the local GGUF, NF4 weights, configuration,
+training environment and converter. Training packages are pinned in
+`scripts/training-requirements.txt`; no extra ML dependency is added to the C++
+portable core. Windows packaging must provide the equivalent local training
+runtime; CUDA/Python package availability is not inferred from GGUF inference.
 
-Export schema (one JSON object per UTF-8 line):
+## Verification
 
-```json
-{"schema_version":1,"reviewed":true,"id":1,"base_model":"Qwen/Qwen3-4B-Base","prompt":"Say hello","rejected":"Formal greeting","preferred":"Hey, good to see you."}
-```
-
-## Local QLoRA training
-
-Training requires more software and memory than GGUF inference. It is a separate,
-explicit CLI, **never an idle task**, and never uploads datasets. The GPU should
-not run inference while training. On a busy 16 GB / 6 GB laptop, loading may still
-fail; close other memory-heavy work instead of assuming quantization guarantees
-fit. A handful of examples tests the mechanics, not a useful personality.
-
-```bash
-python3 -m venv build/training-venv
-build/training-venv/bin/python -m pip install -r scripts/training-requirements.txt
-python3 scripts/train_persona.py --dataset data/reviewed.jsonl --validate-only
-```
-
-The CLI accepts only a **local Hugging Face model directory**, not a remote ID or
-GGUF. A local copy of
-[unsloth/Qwen3-4B-Base-bnb-4bit](https://huggingface.co/unsloth/Qwen3-4B-Base-bnb-4bit)
-contains the same base lineage in NF4 form, so it avoids downloading/loading full
-BF16 weights on a RAM-constrained machine. This is a weights source, not a hosted
-training service. Download it separately, verify provenance/checksums, and keep
-its manifest. No remote model code is trusted.
-
-```bash
-build/training-venv/bin/python scripts/train_persona.py \
-  --dataset data/reviewed.jsonl \
-  --model build/models/Qwen3-4B-Base-bnb-4bit \
-  --output data/adapters/persona-v1 \
-  --steps 8 --max-length 128 --rank 4 --approve-training
-```
-
-The output directory must be new; existing weights/adapters are not overwritten.
-The script sets Hugging Face offline/telemetry flags and disables experiment
-trackers. The frozen tied vocabulary/output matrix stays BF16 instead of PEFT's
-FP32 default, which otherwise exhausted this GPU during evaluation. Norms remain
-FP32. It uses NF4, batch size 1, gradient checkpointing, small Q/V-projection
-LoRA adapters, assistant-answer-only loss, and no silent truncation. Rejected
-answers are not trained. Prompt groups are disjoint between training and the
-seeded 20% holdout split. At least two distinct prompts are required.
-
-Output: standard PEFT `adapter_config.json`, `adapter_model.safetensors`, tokenizer
-files, and `evaluation.json` with dataset hash, before/after held-out loss, run
-time, peak GPU allocation and `activated=false`. Lower loss is not demonstrated
-chat quality. Review held-out answers, multi-turn behavior, factual reliability,
-privacy, and tools before using an adapter. Small corrections alone will not
-teach every chat/tool skill missing from a base model.
-
-## Convert, activate, and roll back
-
-Use the converter from the **same compatible llama.cpp source installation** as
-your runtime, with its documented dependencies. Keep conversion offline by
-passing a local directory containing the **original Qwen base `config.json`**
-(no `--trust-remote-code`). Do not pass the bitsandbytes training directory: this
-converter rejects its quantization metadata even when exporting adapter-only
-weights. The small original configuration is sufficient; full BF16 weights are
-not needed for adapter conversion. In this checkout the verified original
-configuration and revision are in `build/models/Qwen3-4B-Base-config/`:
-
-
-```bash
-build/training-venv/bin/python /path/to/llama.cpp/convert_lora_to_gguf.py \
-  --base build/models/Qwen3-4B-Base-config \
-  --outfile data/adapters/persona-v1.gguf --outtype f16 data/adapters/persona-v1
-```
-
-In Memory → Behavior learning, choose **Load GGUF LoRA…** only after evaluation.
-Use an adapter for this exact base lineage; matching tensor shapes alone do not
-prove provenance. Activation is session-only and refused during generation. A
-failed adapter load preserves the existing adapter. The runtime status names an
-active adapter. **Remove LoRA** clears its KV state and restores unchanged base
-weights. Start a fresh conversation for comparisons; old conversation text is
-not erased by changing adapters.
-
-## Tests
-
-```bash
+```sh
+cmake --build build-linux -j 2
+ctest --test-dir build-linux --output-on-failure
 python3 -m unittest discover -s tests -p train_persona_tests.py -v
-cmake --build build --parallel 2
-ctest --test-dir build --output-on-failure
-KESTREL_TEST_GGUF="$PWD/build/models/Qwen3-4B-Base.Q4_K_M.gguf" \
-  ctest --test-dir build -R kestrel_runtime_tests --output-on-failure
-QT_QPA_PLATFORM=offscreen build/kestrel \
-  --model "$PWD/build/models/Qwen3-4B-Base.Q4_K_M.gguf" --smoke-test
+./build-linux/kestrel --print-runtime
+QT_QPA_PLATFORM=offscreen ./build-linux/kestrel --smoke-test
 ```
 
-C++ coverage includes encrypted correction persistence, rollback, migration,
-real QML review controls, owner-only JSONL export, no network export, base-model
-cache accounting and token-boundary-aware next-speaker filtering. Python tests
-cover strict review/base identity, no duplicate or malformed examples, disjoint
-holdout, assistant-only labels and no silent token truncation.
+Opt-in real GPU lifecycle test (uses isolated temporary configuration, data and
+an in-memory keystore; never trains on the developer's conversations):
 
-## Measured local smoke test
+```sh
+QT_QPA_PLATFORM=offscreen \
+KESTREL_TEST_AUTO_LEARNING_MODEL="$PWD/build/models/Qwen3-4B-Base.Q4_K_M.gguf" \
+KESTREL_TEST_AUTO_LEARNING_DATASET="$PWD/build/learning-smoke.jsonl" \
+./build-linux/kestrel_app_tests
+```
 
-The final UI smoke generated a single assistant turn at 22.1 streamed chunks/sec
-(the app metric; not directly comparable to another tokenizer/runtime). All
-37 model layers offloaded, with 4096 context and a 576 MiB KV allocation. An
-earlier uncapped run failed context allocation; this was repaired, not counted
-as success.
+The synthetic eight-example dataset verifies mechanics, not useful personality.
+A local eight-step run measured held-out loss 2.29668 → 2.19364, text-similarity
+probe 0.22476 → 0.27255, ~3.92 GiB peak allocated GPU memory, and 13.55 seconds
+for model loading/training/evaluation (excluding package imports and checksum
+verification). A subsequent run with curation/report retention also passed actual
+activation, protected evaluation artifacts, an invalid-replacement check, a real
+completed chat reply with learned weights, and reset. It measured the same
+held-out losses, ~3.92 GiB peak allocation and 8.78 seconds within the trainer's
+loading/training/evaluation window. These separate timings are not a speedup
+comparison. An initial mixed-precision generation probe failed and was fixed
+with BF16 autocast; it is not counted as a pass.
 
-A deliberately synthetic eight-example mechanics dataset (six train, two held
-out) completed two QLoRA steps with rank 4 / 128-token limit. Peak PyTorch GPU
-allocation was 4,209,388,544 bytes (~3.92 GiB); held-out loss changed from 2.29668
-to 2.26585. Reported model load + train + evaluation time was 3.20 seconds in that
-warm run, excluding downloads/imports. This is not useful personality training
-or evidence of better conversations. The initial FP32-embedding run failed OOM;
-the BF16 frozen-matrix repair succeeded. The test adapter was converted to a
-2.9 MB GGUF but is **not enabled by default**. Its artifacts and evaluation
-remain under ignored `build/learning-smoke-adapter-bf16*`.
+## Hands-on memory and teaching check
 
-## Undermind authentication
+Launch `./build-linux/kestrel`, then open **Memory (Ctrl+M)**:
 
-Explicit **Connect Undermind** always starts a new PKCE browser authorization,
-even with saved credentials. Startup can still resume a saved OAuth grant, but
-must complete authenticated initialization and tool discovery before reporting
-connected. HTTP/authentication failures and expired sessions disable advertised
-tools. OAuth browser approval may be quick if the provider already has an active
-browser session; that is distinct from Kestrel skipping its authorization flow.
-Live account authorization still requires an interactive user check.
+1. Save the same ordinary note twice with different casing/spacing. It remains
+   one record and its reinforcement count increases. Pin it, then unpin it.
+2. Save an updated note, enter its ID on the old note and choose **Supersede**.
+   Both remain inspectable, but only the replacement is eligible for recall.
+3. Enable local learning and chat `From now on keep answers short`, then
+   `When I ask status, say Ready.` and `When I ask STATUS, say All clear.`
+   The listed specific preference and training target should contain only the
+   latest answer. Restart to verify persistence.
+4. Remove one preference through **Forget preference**. Its prompt instruction
+   disappears; existing adapter weights do not change. Eight usable distinct
+   examples plus an idle interval exercise automatic training. Inspect both
+   status and the last-evaluation summary; a rejection must leave chat usable.
+5. Use **Reset learned behavior** to return to base weights and clear managed
+   examples/preferences/artifacts. This does not clear editable memories or
+   previously exported datasets.
+
+The base model has limited chat/instruction-following ability. Persistent
+instructions and passing small automated probes do not establish reliable
+compliance with every preference, factual correctness, or general quality.
+
+MCP implementation scope and a hands-on endpoint test are in
+[`mcp/manual-test.md`](mcp/manual-test.md). Automated Undermind tests use a
+scripted server and in-memory keystore; they do not verify your account or current
+server schemas. Use the Activity panel's **Connect Undermind** action for that
+live check. If no saved keyring grant exists, Kestrel opens the OAuth browser
+flow; approve the requested Undermind access there.

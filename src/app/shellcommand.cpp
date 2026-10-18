@@ -4,6 +4,7 @@
 #include <QProcess>
 #include <QTimer>
 
+#include <algorithm>
 #include <memory>
 
 namespace kestrel::app {
@@ -34,6 +35,17 @@ void runShellCommand(const QString& commandLine, std::function<void(core::McpToo
     // Every path that can end the run (exit, failure to start, timeout) funnels
     // through here, and only the first one reports.
     auto reported = std::make_shared<bool>(false);
+    auto capturedOutput = std::make_shared<QByteArray>();
+    auto outputTruncated = std::make_shared<bool>(false);
+    auto captureOutput = [process, capturedOutput, outputTruncated] {
+        const QByteArray chunk = process->readAllStandardOutput();
+        const qsizetype remaining = kMaxOutputBytes - capturedOutput->size();
+        capturedOutput->append(chunk.constData(), std::min(chunk.size(), remaining));
+        if (chunk.size() > remaining) {
+            *outputTruncated = true;
+        }
+    };
+    QObject::connect(process, &QProcess::readyReadStandardOutput, process, captureOutput);
     auto complete = [process, done = std::move(done), reported](core::McpToolResult result) {
         if (*reported) {
             return;
@@ -51,18 +63,15 @@ void runShellCommand(const QString& commandLine, std::function<void(core::McpToo
                          }
                      });
     QObject::connect(process, &QProcess::finished, process,
-                     [complete, process](int exitCode, QProcess::ExitStatus status) {
-                         QByteArray output = process->readAllStandardOutput();
-                         const bool truncated = output.size() > kMaxOutputBytes;
-                         if (truncated) {
-                             output.truncate(kMaxOutputBytes);
-                         }
+                     [complete, captureOutput, capturedOutput, outputTruncated, process](
+                         int exitCode, QProcess::ExitStatus status) {
+                         captureOutput();
                          QString text = QStringLiteral("exit code %1").arg(exitCode);
                          if (status == QProcess::CrashExit) {
                              text = QStringLiteral("the command was stopped before it finished");
                          }
-                         text += QLatin1Char('\n') + QString::fromUtf8(output);
-                         if (truncated) {
+                         text += QLatin1Char('\n') + QString::fromUtf8(*capturedOutput);
+                         if (*outputTruncated) {
                              text += QStringLiteral("\n[output cut short]");
                          }
                          complete(core::McpToolResult{exitCode != 0 || status == QProcess::CrashExit,

@@ -39,6 +39,9 @@ std::string serialise(const core::McpHttpReply& reply) {
     if (!reply.contentType.empty()) {
         wire += "Content-Type: " + reply.contentType + "\r\n";
     }
+    if (!reply.sessionId.empty()) {
+        wire += "Mcp-Session-Id: " + reply.sessionId + "\r\n";
+    }
     wire += "Content-Length: " + std::to_string(reply.body.size()) + "\r\n";
     wire += "Connection: close\r\n\r\n";
     wire += reply.body;
@@ -58,6 +61,9 @@ McpServer::McpServer(core::McpDispatcher& dispatcher, QString token, QObject* pa
 McpServer::~McpServer() = default;
 
 bool McpServer::start(quint16 port, QString& error) {
+    if (m_server->isListening()) {
+        m_server->close();
+    }
     // Loopback only. Binding to Any would expose the endpoint to the network,
     // and the bearer token is not a reason to make that a safe default.
     if (!m_server->listen(QHostAddress::LocalHost, port)) {
@@ -68,6 +74,12 @@ bool McpServer::start(quint16 port, QString& error) {
     }
     error.clear();
     return true;
+}
+
+void McpServer::stop() {
+    if (m_server != nullptr && m_server->isListening()) {
+        m_server->close();
+    }
 }
 
 quint16 McpServer::port() const {

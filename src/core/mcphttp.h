@@ -24,6 +24,7 @@ struct McpHttpReply {
     int status = 500;
     std::string contentType;
     std::string body;
+    std::string sessionId;
 };
 
 // Answers one complete HTTP request aimed at the MCP endpoint.

@@ -16,6 +16,7 @@
 #include <QQuickWindow>
 #include <QRandomGenerator>
 #include <QStandardPaths>
+#include <QSettings>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrl>
@@ -130,8 +131,8 @@ QString valueAfter(const QStringList& arguments, const QString& flag) {
 // sources, in order.
 //
 //   1. KESTREL_MODEL, for a model kept anywhere on the machine. This is what a
-//      developer sets, because build trees and model stores are separate.
-//   2. A "models" directory beside the executable. This is what the packaged
+//      developer sets, because build trees and model stores are separate.    //   2. A saved local choice, then installed/user-data/development models directories.
+    //      A "models" directory beside the executable is what the packaged
 //      app uses, and it is why the packager ships that directory: dropping a
 //      model in it is the whole installation step.
 //
@@ -147,12 +148,21 @@ QStringList modelCandidatesFor(const QString& explicitPath) {
         return {QUrl::fromLocalFile(QFileInfo(fromEnvironment).absoluteFilePath()).toString()};
     }
 
-    const QString modelDirectory =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/models");
+    QStringList directories{
+        QCoreApplication::applicationDirPath() + QStringLiteral("/models"),
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/models"),
+        QCoreApplication::applicationDirPath() + QStringLiteral("/../models"),
+        QCoreApplication::applicationDirPath() + QStringLiteral("/../build/models")};
     QStringList urls;
-    for (const kestrel::runtime::ModelCandidate& candidate :
-         kestrel::runtime::discoverModels(kestrel::core::pathFromUtf8(modelDirectory.toStdString()))) {
-        urls.append(QUrl::fromLocalFile(QString::fromStdString(candidate.path)).toString());
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    const QString saved = settings.value(QStringLiteral("model/localPath")).toString();
+    if (QFileInfo::exists(saved)) { urls.append(QUrl::fromLocalFile(saved).toString()); }
+    for (const QString& directory : directories) {
+        for (const auto& candidate : kestrel::runtime::discoverModels(
+                 kestrel::core::pathFromUtf8(directory.toStdString()))) {
+            const QString url = QUrl::fromLocalFile(QString::fromStdString(candidate.path)).toString();
+            if (!urls.contains(url)) { urls.append(url); }
+        }
     }
     return urls;
 }
@@ -379,20 +389,11 @@ int main(int argc, char* argv[]) {
 
     const QStringList arguments = QGuiApplication::arguments();
 
-    const bool useGroq = arguments.contains(QStringLiteral("--groq"));
-    if (useGroq && arguments.contains(QStringLiteral("--model"))) {
-        QTextStream(stderr) << "Choose either --groq (cloud) or --model (local), not both.\n";
+    if (arguments.contains(QStringLiteral("--groq")) || arguments.contains(QStringLiteral("--groq-model"))) {
+        QTextStream(stderr) << "Kestrel is local-only. Cloud inference is no longer supported; the installed local model loads automatically.\n";
         return 2;
     }
-    if (useGroq && !controller.configureGroq(QString(),
-            valueAfter(arguments, QStringLiteral("--groq-model")).isEmpty()
-                ? QStringLiteral("openai/gpt-oss-120b")
-                : valueAfter(arguments, QStringLiteral("--groq-model")))) {
-        QTextStream(stderr) << "Groq: " << controller.modelError() << "\n";
-        return 2;
-    }
-    const QStringList modelCandidates = useGroq ? QStringList{}
-        : modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
+    const QStringList modelCandidates = modelCandidatesFor(valueAfter(arguments, QStringLiteral("--model")));
     const bool reportRuntime = arguments.contains(QStringLiteral("--print-runtime"));
     if (reportRuntime && modelCandidates.isEmpty()) {
         attachToLaunchConsole();
@@ -443,8 +444,10 @@ int main(int argc, char* argv[]) {
 
 #if KESTREL_HAS_MCP_SERVER
     // Background MCP endpoint for other local agents. Opt-in: nothing listens
-    // unless KESTREL_MCP_PORT is set. Tools start disabled in the dispatcher,
-    // so a running endpoint still offers nothing until the user enables it.
+    // unless KESTREL_MCP_PORT is set. Platform tools start disabled in the
+    // dispatcher, so a running endpoint still offers no outside capability until
+    // the user enables it; the only tools enabled from the start are Kestrel's
+    // own permission-free astronomy calculations.
     kestrel::core::McpDispatcher mcpDispatcher;
     mcpDispatcher.addTool({
         "kestrel_status",
@@ -452,7 +455,9 @@ int main(int argc, char* argv[]) {
         {kestrel::core::ToolPermission::ReadConversations},
         [&controller](const kestrel::storage::json::Value&) {
             return kestrel::core::McpToolResult{false, controller.backendName().toStdString()};
-        }});
+        },
+        nullptr,
+        R"({"type":"object","properties":{},"additionalProperties":false})"});
     // Administrator commands. Each run waits for the user's approval in the app,
     // then runs through pkexec, so the password is typed into the desktop's own
     // dialog. The tool is off unless the launcher opts in, and even then every
@@ -501,7 +506,8 @@ int main(int argc, char* argv[]) {
                         : result.error.toStdString();
                     done(kestrel::core::McpToolResult{true, text + (output.empty() ? "" : "\n" + output)});
                 });
-        }});
+        },
+        R"({"type":"object","properties":{"program":{"type":"string","description":"Executable to run"},"arguments":{"type":"array","items":{"type":"string"}},"reason":{"type":"string","description":"Why administrator rights are required"}},"required":["program"]})"});
     // Web search and screen capture. Both need the user's opt-in, so they are
     // registered disabled and only switched on by KESTREL_MCP_ALLOW_TOOLS=1.
     static QNetworkAccessManager networkAccess;
@@ -526,7 +532,8 @@ int main(int argc, char* argv[]) {
             kestrel::app::runWebSearch(networkAccess,
                                        QString::fromStdString(std::string(*query->asString())),
                                        limit, std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Maximum results, from 1 to 10"}},"required":["query"]})"});
     mcpDispatcher.addTool({
         "screen_capture",
         "Save a screenshot of the primary screen and report the file path.",
@@ -534,7 +541,8 @@ int main(int argc, char* argv[]) {
         [captureDirectory](const kestrel::storage::json::Value&) {
             return kestrel::app::captureScreen(captureDirectory);
         },
-        nullptr});
+        nullptr,
+        R"({"type":"object","properties":{},"additionalProperties":false})"});
     // Tavily's richer endpoints. Each is a network call, so each needs the
     // Network permission and the same opt-in as the search tool.
     mcpDispatcher.addTool({
@@ -557,7 +565,8 @@ int main(int argc, char* argv[]) {
                 query = QString::fromStdString(std::string(*q->asString()));
             }
             kestrel::app::tavilyExtract(networkAccess, urls, query, std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"}},"query":{"type":"string"}},"required":["urls"]})"});
     mcpDispatcher.addTool({
         "tavily_map",
         "List the URLs on a website, optionally filtered by instructions. Arguments: url (string), instructions (optional string).",
@@ -575,7 +584,8 @@ int main(int argc, char* argv[]) {
             }
             kestrel::app::tavilyMap(networkAccess, QString::fromStdString(std::string(*url->asString())),
                                     instructions, std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"url":{"type":"string"},"instructions":{"type":"string"}},"required":["url"]})"});
     mcpDispatcher.addTool({
         "tavily_crawl",
         "Crawl a website section and return the text of the pages it finds. Arguments: url (string), instructions (optional string).",
@@ -593,7 +603,8 @@ int main(int argc, char* argv[]) {
             }
             kestrel::app::tavilyCrawl(networkAccess, QString::fromStdString(std::string(*url->asString())),
                                       instructions, std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"url":{"type":"string"},"instructions":{"type":"string"}},"required":["url"]})"});
     mcpDispatcher.addTool({
         "tavily_research",
         "Run multi-source cited research on a question and return a report with sources. Takes minutes. Arguments: input (string question).",
@@ -607,7 +618,8 @@ int main(int argc, char* argv[]) {
             }
             kestrel::app::tavilyResearch(networkAccess, QString::fromStdString(std::string(*input->asString())),
                                          std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"input":{"type":"string","description":"Research question"}},"required":["input"]})"});
     // The shell and the browser. A command runs only after the user approves that
     // one command; browsing needs the Network permission like the search tools.
     mcpDispatcher.addTool({
@@ -641,7 +653,8 @@ int main(int argc, char* argv[]) {
                 }
                 kestrel::app::runShellCommand(commandLine, done);
             });
-        }});
+        },
+        R"({"type":"object","properties":{"command":{"type":"string","description":"Shell command line"},"reason":{"type":"string"}},"required":["command"]})"});
     mcpDispatcher.addTool({
         "browser_open",
         "Open a web address in the user's Firefox (or default browser) so they can see it. Arguments: url (string).",
@@ -664,7 +677,8 @@ int main(int argc, char* argv[]) {
             }
             return kestrel::core::McpToolResult{false, "Opened " + address.toStdString() + " in the browser."};
         },
-        nullptr});
+        nullptr,
+        R"({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL"}},"required":["url"]})"});
     mcpDispatcher.addTool({
         "browser_read",
         "Fetch a web page and return its readable text (no scripts run, so JavaScript-only pages come back empty). Arguments: url (string).",
@@ -678,7 +692,8 @@ int main(int argc, char* argv[]) {
             }
             kestrel::app::readWebPage(networkAccess, QString::fromUtf8(std::string(*url->asString()).c_str()),
                                       std::move(done));
-        }});
+        },
+        R"({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL"}},"required":["url"]})"});
     // Research papers. A web address is downloaded as a PDF; the agent cannot
     // name a file on this computer, only a paper the user already has open. It
     // needs the same Network permission as the other web tools.
@@ -706,7 +721,8 @@ int main(int argc, char* argv[]) {
             }
             paperLibrary.showPaper(index);
             done(kestrel::core::McpToolResult{false, "Showing \"" + text.toStdString() + "\" in the paper panel."});
-        }});
+        },
+        R"({"type":"object","properties":{"source":{"type":"string","description":"PDF URL or open paper title"}},"required":["source"]})"});
     // KESTREL_MCP_ALLOW_TOOLS is "1" to enable every chat tool, or a comma-separated
     // list of tool names to enable only those. Each enabled tool still needs its
     // permission, and the permissions below are granted only for the tools chosen.
@@ -787,6 +803,9 @@ int main(int argc, char* argv[]) {
         // The chat model may call the same tools the endpoint offers, through the
         // same dispatcher and permissions.
         controller.setAgentTools(&mcpDispatcher, endpointRunning);
+        if (mcpServer != nullptr) {
+            controller.attachLocalMcpServer(mcpServer.get());
+        }
 #else
         controller.setAgentTools(nullptr, false);
 #endif

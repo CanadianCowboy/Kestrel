@@ -1427,6 +1427,40 @@ void testRecallRelevancePrivacyAndCorrections() {
     assert(recall.retrieve("email", false).empty());
 }
 
+void testMemoryReinforcementPinningAndSupersession() {
+    core::Recall recall;
+    recall.setEnabled(true);
+    const auto first = recall.remember(core::MemoryKind::Episode, "Kestrel uses CMake", "2026-01-01");
+    const auto other = recall.remember(core::MemoryKind::Episode, "Kestrel uses Ninja", "2026-01-02");
+    assert(recall.remember(core::MemoryKind::Episode, " kestrel uses cmake ", "2026-01-03") == first);
+    assert(recall.memories().front().confirmations == 2 && recall.memories().front().updatedAt == "2026-01-03");
+    assert(recall.retrieve("Kestrel", false).front().id == first);
+    assert(recall.retrieve("astronomy", false).empty());
+    assert(recall.setPinned(first, true));
+    assert(recall.retrieve("astronomy", false).front().id == first);
+    assert(recall.supersede(first, other));
+    assert(!recall.setPinned(first, true));
+    for (const auto& memory : recall.retrieve("CMake Kestrel", false)) { assert(memory.id != first); }
+    assert(!recall.supersede(other, first) && !recall.supersede(other, other));
+    assert(recall.forget(other));
+    assert(recall.retrieve("CMake", false).empty()); // no resurrection when replacement is deleted
+    recall.restore(true, recall.memories());
+    const auto afterRestart = recall.remember(core::MemoryKind::Episode, "A different topic", "2026-01-04");
+    assert(afterRestart > other); // tombstone IDs may never be reassigned on restart
+    assert(recall.edit(first, "Kestrel uses Meson", "2026-01-04"));
+    assert(recall.memories().front().supersededBy == 0 && recall.memories().front().confirmations == 1);
+    assert(recall.retrieve("Meson", false).front().id == first);
+    const auto secret = recall.remember(core::MemoryKind::Fact, "private note", "t", "manual", true);
+    const auto replacement = recall.remember(core::MemoryKind::Fact, "replacement note", "t");
+    assert(recall.supersede(secret, replacement));
+    for (const auto& memory : recall.retrieve("replacement", true)) { assert(memory.id != replacement); }
+    assert(recall.search("note").size() == 2); // inspection retains both, retrieval does not
+    assert(recall.setPinned(replacement, true));
+    for (const auto& memory : recall.retrieve("astronomy", true)) { assert(memory.id != replacement); }
+    const auto block = recall.contextBlock("note", false, 2400);
+    assert(block.find("confirmations=") != std::string::npos && block.find("pinned=true") != std::string::npos);
+}
+
 void testRecallCaptureAndContextBounds() {
     std::string unicode;
     for (int i = 0; i < 350; ++i) { unicode += "é"; }
@@ -1514,6 +1548,108 @@ void testMcpInitializeAdvertisesTools() {
     assert(result->find("capabilities")->find("tools") != nullptr);
 }
 
+void testMcpRichCapabilities() {
+    core::McpDispatcher dispatcher;
+    dispatcher.addTool({"lookup", "Lookup an item", {},
+        [](const storage::json::Value&) { return core::McpToolResult{false, "ok"}; }, nullptr,
+        R"({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})"});
+    dispatcher.permissions().setEnabled("lookup", true);
+    const auto tools = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"));
+    const auto& tool = tools.find("result")->find("tools")->asArray()->front();
+    assert(tool.find("inputSchema")->find("required")->asArray()->front().asString() == "query");
+
+    dispatcher.addResource({"kestrel://test/status", "status", "Status", "text/plain",
+        {core::ToolPermission::ReadConversations},
+        [] { return core::McpResourceContent{false, {}, "text/plain", "ready"}; }});
+    dispatcher.addResourceTemplate({"kestrel://test/items/{id}", "item", "Item", "text/plain",
+        {core::ToolPermission::ReadConversations},
+        [](std::string_view uri) { return core::McpResourceContent{false, std::string(uri), "text/plain", "item"}; }});
+    dispatcher.addPrompt({"review", "Review an item", {{"focus", "Focus", true, {"decisions", "details", "overview"}}},
+        {core::ToolPermission::ReadConversations},
+        [](const storage::json::Value& args) {
+            return core::McpPromptResult{false, "Review", {{"user", std::string(*args.find("focus")->asString())}}};
+        }});
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":2,"method":"resources/list"})"))
+               .find("result")->find("resources")->asArray()->empty());
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":3,"method":"prompts/list"})"))
+               .find("result")->find("prompts")->asArray()->empty());
+    for (const char* name : {"kestrel://test/status", "kestrel://test/items/{id}", "review"}) {
+        dispatcher.permissions().setEnabled(name, true);
+    }
+    const std::string read = R"({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"kestrel://test/status"}})";
+    assert(parsedReply(dispatcher.handle(read)).find("error") != nullptr);
+    dispatcher.permissions().grant(core::ToolPermission::ReadConversations, true);
+    const auto resource = parsedReply(dispatcher.handle(read));
+    assert(resource.find("result")->find("contents")->asArray()->front().find("text")->asString() == "ready");
+    const auto templated = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"kestrel://test/items/42"}})"));
+    assert(templated.find("result")->find("contents")->asArray()->front().find("text")->asString() == "item");
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":6,"method":"resources/templates/list"})"))
+               .find("result")->find("resourceTemplates")->asArray()->size() == 1);
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"unknown://item"}})"))
+               .find("error")->find("code")->asInteger() == -32002);
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":8,"method":"prompts/get","params":{"name":"review"}})"))
+               .find("error")->find("code")->asInteger() == -32602);
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":9,"method":"prompts/get","params":{"name":"review","arguments":{"focus":4}}})"))
+               .find("error") != nullptr);
+    const auto prompt = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":10,"method":"prompts/get","params":{"name":"review","arguments":{"focus":"decisions"}}})"));
+    assert(prompt.find("result")->find("messages")->asArray()->front().find("content")->find("text")->asString() == "decisions");
+    const auto complete = parsedReply(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":11,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"review"},"argument":{"name":"focus","value":"de"}}})"));
+    assert(complete.find("result")->find("completion")->find("values")->asArray()->size() == 2);
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":12,"method":"logging/setLevel","params":{"level":"warning"}})"))
+               .find("result") != nullptr);
+    assert(dispatcher.logLevel() == "warning");
+    assert(parsedReply(dispatcher.handle(R"({"jsonrpc":"2.0","id":13,"method":"logging/setLevel","params":{"level":"invalid"}})"))
+               .find("error") != nullptr);
+    assert(dispatcher.logLevel() == "warning");
+}
+
+void testMcpAsyncValidationAndExactlyOnce() {
+    core::McpDispatcher dispatcher;
+    int runs = 0;
+    dispatcher.addTool({"async", "Async", {}, nullptr,
+        [&runs](const storage::json::Value&, core::McpCompletion done) {
+            ++runs;
+            done({false, "first"});
+            done({false, "second"});
+        }});
+    dispatcher.permissions().setEnabled("async", true);
+    for (const char* invalid : {
+        R"({"id":1,"method":"tools/call","params":{"name":"async"}})",
+        R"({"jsonrpc":"1.0","id":1,"method":"tools/call","params":{"name":"async"}})",
+        R"({"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"async"}})",
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"async","arguments":[]}})"}) {
+        assert(parsedReply(dispatcher.handle(invalid)).find("error") != nullptr);
+        assert(runs == 0);
+    }
+    int replies = 0;
+    dispatcher.handleAsync(R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"async"}})",
+        [&replies](std::string body) {
+            ++replies;
+            assert(toolText(parsedReply(body)) == "first");
+        });
+    assert(replies == 1 && runs == 1);
+}
+
+void testMcpHttpOriginAndProtocolVersion() {
+    core::McpDispatcher dispatcher;
+    const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+    const auto request = [&body](std::string headers) {
+        return "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\n"
+            + headers + "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    };
+    for (const char* origin : {"https://evil.example", "null", "http://localhost.evil.example", "http://localhost@evil.example"}) {
+        assert(core::answerMcpRequest(request(std::string("Origin: ") + origin + "\r\n"), "t", dispatcher).status == 403);
+    }
+    const auto ok = core::answerMcpRequest(request("Origin: http://127.0.0.1:1234\r\nMCP-Protocol-Version: 2025-06-18\r\n"), "t", dispatcher);
+    assert(ok.status == 200 && ok.sessionId.empty()); // stateless, no fabricated session ID
+    assert(core::answerMcpRequest(request("MCP-Protocol-Version: bogus\r\n"), "t", dispatcher).status == 400);
+    assert(core::answerMcpRequest("DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer t\r\n\r\n", "t", dispatcher).status == 405);
+}
+
 void testMcpNotificationsGetNoReply() {
     core::McpDispatcher dispatcher;
     assert(dispatcher.handle(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").empty());
@@ -1584,11 +1720,18 @@ void testAgentCapabilitiesDescribeStateHonestly() {
                         [](const storage::json::Value&) { return core::McpToolResult{false, "x"}; },
                         nullptr});
 
-    // Nothing enabled: the model is told so, and told how to call a tool.
+    // Nothing enabled: the model is told so, and told how to call a tool. The
+    // list is complete, so list_tools is not advertised: beside a complete list
+    // a small model calls it instead of answering a question about its tools.
     const std::string none = core::describeAgentCapabilities(dispatcher, true);
     assert(none.find("No external tools are enabled") != std::string::npos);
     assert(none.find("<tool_call>") != std::string::npos);
-    assert(none.find("list_tools") != std::string::npos);
+    assert(none.find("list_tools") == std::string::npos);
+    assert(none.find("This list is complete") != std::string::npos);
+    // And it is told to call a tool rather than explain how to use one, and to
+    // answer a question about them without reciting the argument signatures.
+    assert(none.find("use it rather than describing it") != std::string::npos);
+    assert(none.find("never its argument names or JSON") != std::string::npos);
     assert(none.find("Tool \"kestrel_status\"") == std::string::npos);
 
     // Enabled but ungranted: listed, with the refusal stated rather than hidden.
@@ -1605,6 +1748,45 @@ void testAgentCapabilitiesDescribeStateHonestly() {
 
     const auto summaries = dispatcher.toolSummaries();
     assert(summaries.size() == 1 && summaries[0].enabled && summaries[0].permitted);
+}
+
+// A remote MCP server can advertise dozens of tools whose descriptions carry
+// whole JSON schemas. This text goes into the cached system prompt, so it needs
+// a hard budget: unbounded, it grows past the model's context window and every
+// turn fails to decode.
+void testAgentCapabilitiesStayWithinAPromptBudget() {
+    core::McpDispatcher dispatcher;
+    for (int i = 0; i < 40; ++i) {
+        const std::string name = "remote_tool_" + std::to_string(i);
+        dispatcher.addTool({name, std::string(2000, 'x'), {core::ToolPermission::Network},
+                            [](const storage::json::Value&) {
+                                return core::McpToolResult{false, "ok"};
+                            },
+                            nullptr});
+        dispatcher.permissions().setEnabled(name, true);
+    }
+    dispatcher.permissions().grant(core::ToolPermission::Network, true);
+
+    const std::string bounded = core::describeAgentCapabilities(dispatcher, false, 4000);
+    assert(bounded.size() <= 4000 + 250);
+    assert(bounded.find("more enabled tool(s) do not fit") != std::string::npos);
+    assert(bounded.find("list_tools") != std::string::npos);
+    // The 2000-character description appears shortened, not in full.
+    assert(bounded.find(std::string(600, 'x')) == std::string::npos);
+    assert(bounded.find("remote_tool_0") != std::string::npos);
+
+    dispatcher.addTool({"undermind_get_current_workspace", "Read the current workspace.", {core::ToolPermission::Network},
+        [](const storage::json::Value&) { return core::McpToolResult{false, "current workspace evidence"}; }, nullptr});
+    dispatcher.permissions().setEnabled("undermind_get_current_workspace", true);
+    const std::string workspaceFirst = core::describeAgentCapabilities(dispatcher, false, 4000);
+    assert(workspaceFirst.find("undermind_get_current_workspace") < workspaceFirst.find("remote_tool_0"));
+    assert(workspaceFirst.size() <= 4250);
+    dispatcher.permissions().setEnabled("undermind_get_current_workspace", false);
+    assert(core::describeAgentCapabilities(dispatcher, false, 4000).find("undermind_get_current_workspace") == std::string::npos);
+
+    const std::string byDefault = core::describeAgentCapabilities(dispatcher, true);
+    assert(byDefault.size() <= core::kAgentCapabilityBudgetChars + 250);
+    assert(byDefault.find("Kestrel's own capabilities:") != std::string::npos);
 }
 
 void testMcpAsyncToolRepliesWhenItCompletes() {
@@ -1654,6 +1836,28 @@ void testMcpHttpRefusesWrongHostAndToken() {
     assert(core::answerMcpRequest(badAuth, "secret-token", dispatcher).status == 401);
     assert(core::answerMcpRequest(badAuth, "", dispatcher).status == 401); // no token configured
 
+    for (const char* hostileHost : {
+             "127.0.0.1.evil.example", "localhost.evil.example", "localhost@evil.example",
+             "127.0.0.1:", "localhost:0", "[::1]junk", "[::1]:65536", "127.0.0.1:abc"}) {
+        const std::string hostile =
+            std::string("POST /mcp HTTP/1.1\r\nHost: ") + hostileHost + "\r\nAuthorization: Bearer secret-token\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        assert(core::answerMcpRequest(hostile, "secret-token", dispatcher).status == 403);
+    }
+
+    const std::string duplicateHost =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: evil.example\r\nAuthorization: Bearer secret-token\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(core::answerMcpRequest(duplicateHost, "secret-token", dispatcher).status == 400);
+    const std::string duplicateLength =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-token\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\nContent-Length: 0\r\n\r\n" + body;
+    assert(core::answerMcpRequest(duplicateLength, "secret-token", dispatcher).status == 400);
+    const std::string ambiguousFraming =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-token\r\n"
+        "Transfer-Encoding: chunked\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(core::answerMcpRequest(ambiguousFraming, "secret-token", dispatcher).status == 400);
+
     const std::string good = goodHeaders + body;
     const auto ok = core::answerMcpRequest(good, "secret-token", dispatcher);
     assert(ok.status == 200);
@@ -1678,6 +1882,11 @@ void testMcpHttpPathMethodAndNotifications() {
     const std::string getRequest =
         "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\n\r\n";
     assert(core::answerMcpRequest(getRequest, "t", dispatcher).status == 405);
+
+    const std::string duplicateAuthorization =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\nAuthorization: Bearer attacker\r\n"
+        "Content-Length: " + std::to_string(note.size()) + "\r\n\r\n" + note;
+    assert(core::answerMcpRequest(duplicateAuthorization, "t", dispatcher).status == 400);
 }
 
 void testMcpHttpFramingWaitsForTheWholeBody() {
@@ -1697,12 +1906,46 @@ void testMcpHttpFramingWaitsForTheWholeBody() {
 } // namespace
 
 void testModelToolCallParsing() {
+    assert(core::shouldRouteTools("load my workspace from Undermind", true));
+    assert(core::shouldRouteTools("Search the web for JWST", true));
+    assert(!core::shouldRouteTools("What tools do you have?", true));
+    assert(!core::shouldRouteTools("Hello there", true));
+    assert(core::shouldRouteTools("Hello there", true, true));
+    assert(!core::shouldRouteTools("load workspace", false, true));
+    assert(core::needsInstructSynthesis("compare both workspaces", 1));
+    assert(core::needsInstructSynthesis("summarize", 2));
+    assert(!core::needsInstructSynthesis("what is the title", 1));
+    assert(core::modelReplyNeedsMoreJson(" \n"));
+    assert(core::modelReplyNeedsMoreJson(R"({"arguments":{"x":"}"})"));
+    assert(!core::modelReplyNeedsMoreJson(R"({"arguments":{"x":"}"}})"));
+    assert(!core::modelReplyNeedsMoreJson(R"({"answer":42})"));
+    assert(!core::modelReplyNeedsMoreJson("ordinary text"));
     const auto call = core::findModelToolCall(
         R"(Let me check. <tool_call>{"name":"web_search","arguments":{"query":"tavily"}}</tool_call>)");
     assert(call.has_value());
     assert(call->name == "web_search");
     assert(call->argumentsJson == R"({"query":"tavily"})");
 
+    // A base model shown the protocol once tends to write the call as bare
+    // JSON. It is the same request and has to be run, not shown to the user.
+    const auto bare = core::findModelToolCall(R"( {"name":"list_tools","arguments":{}})");
+    assert(bare.has_value());
+    assert(bare->name == "list_tools");
+    assert(bare->argumentsJson == "{}");
+    const auto bareNested = core::findModelToolCall(
+        R"({"name":"web_search","arguments":{"query":"a } b"}})");
+    assert(bareNested.has_value());
+    assert(bareNested->argumentsJson == R"({"query":"a } b"})");
+    // Still being written, or not a call at all.
+    assert(!core::findModelToolCall(R"({"name":"web_search","arguments":{"query":"x")").has_value());
+    assert(!core::findModelToolCall(R"({"answer":42})").has_value());
+    // JSON in the middle of an answer is text, not an action.
+    assert(!core::findModelToolCall(
+                R"(The answer is {"name":"web_search","arguments":{}}.)")
+                .has_value());
+
+    const auto specialClose = core::findModelToolCall(R"(<tool_call>{"name":"web_search","arguments":{}})");
+    assert(specialClose && specialClose->name == "web_search");
     // Still being written: not a call yet.
     assert(!core::findModelToolCall(R"(<tool_call>{"name":"web_search")").has_value());
     // Malformed JSON and a missing name are ordinary text, not guessed at.
@@ -1877,10 +2120,14 @@ int main() {
     testModelToolCallParsing();
     testSearchResultParsing();
     testAgentCapabilitiesDescribeStateHonestly();
+    testAgentCapabilitiesStayWithinAPromptBudget();
     testMcpAsyncToolRepliesWhenItCompletes();
     testMcpHttpRefusesWrongHostAndToken();
     testMcpHttpPathMethodAndNotifications();
     testMcpHttpFramingWaitsForTheWholeBody();
+    testMcpRichCapabilities();
+    testMcpAsyncValidationAndExactlyOnce();
+    testMcpHttpOriginAndProtocolVersion();
     testMcpInitializeAdvertisesTools();
     testMcpNotificationsGetNoReply();
     testMcpRejectsMalformedRequests();
@@ -1923,6 +2170,7 @@ int main() {
     testRecallContextIsEmptyUnlessOnAndStored();
     testRecallContextDropsTheOldestFirst();
     testRecallRelevancePrivacyAndCorrections();
+    testMemoryReinforcementPinningAndSupersession();
     testRecallCaptureAndContextBounds();
     testRecallRepresentativeCorpusEvaluation();
     testIdleStaysSilentWhileTheUserIsPresent();

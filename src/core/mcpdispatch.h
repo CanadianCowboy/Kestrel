@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -40,6 +41,60 @@ struct McpToolDefinition {
     std::vector<ToolPermission> permissions;
     std::function<McpToolResult(const storage::json::Value& arguments)> handler;
     std::function<void(const storage::json::Value& arguments, McpCompletion done)> asyncHandler;
+    // Optional JSON Schema object for tools/list. Defaults to {"type":"object"}
+    // when empty or invalid so callers with no parameters need not supply one.
+    std::string inputSchemaJson = {};
+};
+
+struct McpResourceContent {
+    bool isError = false;
+    std::string uri;
+    std::string mimeType = "text/plain";
+    std::string text;
+};
+
+struct McpResourceDefinition {
+    std::string uri;
+    std::string name;
+    std::string description;
+    std::string mimeType = "text/plain";
+    std::vector<ToolPermission> permissions;
+    std::function<McpResourceContent()> handler;
+};
+
+struct McpResourceTemplateDefinition {
+    std::string uriTemplate;
+    std::string name;
+    std::string description;
+    std::string mimeType = "text/plain";
+    std::vector<ToolPermission> permissions;
+    std::function<McpResourceContent(std::string_view uri)> handler;
+};
+
+struct McpPromptArgument {
+    std::string name;
+    std::string description;
+    bool required = false;
+    std::vector<std::string> completions;
+};
+
+struct McpPromptMessage {
+    std::string role = "user"; // "user" or "assistant"
+    std::string text;
+};
+
+struct McpPromptResult {
+    bool isError = false;
+    std::string description;
+    std::vector<McpPromptMessage> messages;
+};
+
+struct McpPromptDefinition {
+    std::string name;
+    std::string description;
+    std::vector<McpPromptArgument> arguments;
+    std::vector<ToolPermission> permissions;
+    std::function<McpPromptResult(const storage::json::Value& arguments)> handler;
 };
 
 // What a tool is and whether the user has switched it on, for describing the
@@ -66,6 +121,17 @@ public:
     // starts disabled and ungranted.
     void addTool(McpToolDefinition tool);
 
+    // Removes a declared tool (for example when a remote MCP server disconnects).
+    bool removeTool(std::string_view name);
+
+    // Declares an MCP resource, resource template, or prompt template. Like
+    // tools, each starts disabled and is gated through permissions().
+    void addResource(McpResourceDefinition resource);
+    void addResourceTemplate(McpResourceTemplateDefinition resourceTemplate);
+    void addPrompt(McpPromptDefinition prompt);
+
+    [[nodiscard]] std::string logLevel() const noexcept { return m_logLevel; }
+
     // The permission state the user controls. Enabling and granting go through
     // here so the same registry governs idle tools and external tools.
     [[nodiscard]] IdleToolRegistry& permissions() noexcept { return m_permissions; }
@@ -77,6 +143,9 @@ public:
 
     // Every registered tool with its current state, in registration order.
     [[nodiscard]] std::vector<McpToolSummary> toolSummaries() const;
+    [[nodiscard]] std::vector<McpResourceDefinition> resources() const { return m_resources; }
+    [[nodiscard]] std::vector<McpResourceTemplateDefinition> resourceTemplates() const { return m_resourceTemplates; }
+    [[nodiscard]] std::vector<McpPromptDefinition> prompts() const { return m_prompts; }
 
     // Synchronous convenience for callers that cannot wait. An asynchronous
     // tool that has not finished by the time this returns yields an error body.
@@ -86,16 +155,40 @@ private:
     [[nodiscard]] storage::json::Value dispatch(const storage::json::Value& request, bool& isNotification);
     [[nodiscard]] storage::json::Value callTool(const storage::json::Value& params);
     [[nodiscard]] storage::json::Value listTools() const;
+    [[nodiscard]] storage::json::Value listResources() const;
+    [[nodiscard]] storage::json::Value listResourceTemplates() const;
+    [[nodiscard]] storage::json::Value readResource(const storage::json::Value& id,
+                                                    const storage::json::Value& params) const;
+    [[nodiscard]] storage::json::Value listPrompts() const;
+    [[nodiscard]] storage::json::Value getPrompt(const storage::json::Value& id,
+                                                 const storage::json::Value& params) const;
+    [[nodiscard]] storage::json::Value completeArgument(const storage::json::Value& id,
+                                                        const storage::json::Value& params) const;
     [[nodiscard]] const McpToolDefinition* findTool(const std::string& name) const;
 
     std::vector<McpToolDefinition> m_tools;
+    std::vector<McpResourceDefinition> m_resources;
+    std::vector<McpResourceTemplateDefinition> m_resourceTemplates;
+    std::vector<McpPromptDefinition> m_prompts;
+    std::string m_logLevel = "info";
     IdleToolRegistry m_permissions;
 };
 
 // Plain-language description of what Kestrel can do for an agent, for the
 // model's own system prompt. It states what is enabled, and it is honest about
 // what the model itself cannot do from a chat turn.
+//
+// The text is bounded. A remote server can advertise dozens of tools whose
+// descriptions carry whole JSON schemas, and unbounded they grow the system
+// prompt past the model's context window -- which turns every turn into a
+// decode failure. Each description is shortened and the list stops at the
+// budget, naming how many tools were left out; `list_tools` still reports all
+// of them at call time, so nothing is hidden, only summarised.
+inline constexpr std::size_t kAgentCapabilityBudgetChars = 6000;
+inline constexpr std::size_t kAgentCapabilityToolChars = 500;
+
 [[nodiscard]] std::string describeAgentCapabilities(const McpDispatcher& dispatcher,
-                                                    bool endpointRunning);
+                                                    bool endpointRunning,
+                                                    std::size_t maxChars = kAgentCapabilityBudgetChars);
 
 } // namespace kestrel::core

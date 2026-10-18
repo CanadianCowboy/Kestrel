@@ -27,8 +27,11 @@ public:
     // Starts listening on 127.0.0.1. Returns false and sets `error` with what
     // to do next (usually: pick another port, or stop the other program).
     [[nodiscard]] bool start(quint16 port, QString& error);
+    void stop();
     [[nodiscard]] quint16 port() const;
     [[nodiscard]] bool isListening() const;
+    [[nodiscard]] QString token() const { return m_token; }
+    void setToken(QString token) { m_token = std::move(token); }
 
 private:
     void acceptConnections();

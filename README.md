@@ -76,6 +76,12 @@ Kestrel does not treat CUDA as an inference engine by itself. CUDA supplies devi
 │   │   └── chatformat.*        # Structured message and fallback template helpers
 │   └── ui/
 │       └── Main.qml            # Initial soft-glass desktop workspace
+├── scripts/
+│   ├── train_persona.py        # Local LoRA training, curation, held-out gates
+│   ├── astronomy_seed.jsonl    # Reviewed astronomy seed corpus
+│   └── import_astronomy_dataset.py  # Offline dataset converter
+├── docs/
+│   └── ASTRONOMY.md            # Specialism, tools, datasets, limitations
 └── tests/
     ├── core_tests.cpp          # Core behavior tests
     ├── app_tests.cpp           # Qt threading, send path, and presence tests
@@ -912,6 +918,13 @@ The contract has one rule callers must respect: **pass `generate()` the
 per-turn prompt only.** The prefix is the backend's business, and repeating it
 in the request undoes the caching as well as double-counting the context.
 
+The capability block inside the prefix is bounded on purpose. A connected MCP
+server can advertise dozens of tools whose descriptions carry whole JSON
+schemas, and the unbounded version grew the prompt past the context window, so
+every turn failed to decode. Tool descriptions are shortened, the list stops at
+a fixed budget, and the prompt names how many tools were left out; `list_tools`
+still reports all of them at call time.
+
 The reconciliation happens on the worker thread, not in the setter, because a
 model context is not safe to touch from the UI thread. When the prefix is
 unchanged only the tokens after it are dropped, so it survives; when it changes
@@ -1065,9 +1078,13 @@ carry that, and none of them is allowed to reach outside the process.
 line that goes into the shared system prompt, the short acknowledgement said the
 moment a request is accepted, the one-line status whisper, and the anticipatory
 lines ("Would you like me to continue?", "Task complete."). The presence line is
-built from the fixed tone profile rather than the drifting dials, so it is
-byte-identical on every turn and the backend's cached prefix survives; the dials
-move, the rules do not.
+built from the fixed tone profile and the specialism (`Astronomy` by default)
+rather than the drifting dials, so it is byte-identical on every turn and the
+backend's cached prefix survives; the dials move, the rules do not.
+
+`--print-runtime` reports the active specialism beside the backend, and the
+presence tooltip shows it, so the field Kestrel is tuned for is visible without
+reading the prompt.
 
 **`Presence`** records what the user did, what the assistant did, the voice and
 generation states, and the mood as plain booleans. The UI animates on that
@@ -1104,7 +1121,7 @@ in the idle loop.
 
 ## Safety and privacy principles
 
-Kestrel is intended to be local-first, but contributors must not assume that “local” automatically means safe. Future tools must:
+Kestrel is intended to be local-first, but contributors must not assume that “local” automatically means safe. The built-in astronomy tools are the one exception to "off until enabled": they declare no permission, read nothing, write nothing, and compute only, so enabling them cannot expose user data. Any tool that gains a permission goes back behind the normal gate. Future tools must:
 
 - Be disabled by default.
 - Declare their permissions and affected resources.
