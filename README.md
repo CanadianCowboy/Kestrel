@@ -1107,6 +1107,8 @@ Never add real secrets, API keys, private model files, user data, or system-spec
 
 ## Roadmap
 
+Deferred work kept separate from this release roadmap is tracked in [TODO.md](TODO.md).
+
 ### Foundation
 
 - [x] C++20/CMake project scaffold
