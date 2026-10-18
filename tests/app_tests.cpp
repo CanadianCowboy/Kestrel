@@ -32,6 +32,7 @@
 #include <QStringList>
 #include <QThread>
 #include <QTemporaryFile>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QUrl>
 
@@ -50,6 +51,10 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include "app/undermindclient.h"
+#include "app/mcpserver.h"
+#include "app/browsertools.h"
+#include "app/privilegedapproval.h"
+#include "app/automaticlearning.h"
 #include "storage/profile.h"
 #include "storage/secretstore.h"
 
@@ -524,6 +529,108 @@ void testTokensStreamBeforeCompletionAndPreserveUtf8() {
     check(collector.success, "streamed generation succeeds");
     thread.quit();
     thread.wait();
+}
+
+// A base model writes a call as bare JSON rather than in the tagged form. The
+// worker has to recognise it as a call, keep the call text out of the stream,
+// and still deliver an ordinary JSON answer unchanged.
+void testWorkerHidesBareJsonCallButNotJsonAnswers() {
+    std::cout << "a bare JSON call is hidden, a JSON answer is shown\n";
+    {
+        SlowBackend backend(4, 0);
+        backend.setTokenPieces({" {\"name\":", " \"kestrel_status\",", " \"arguments\":{}}",
+                                " I invented this result."});
+        QThread thread;
+        GenerationWorker worker(&backend);
+        worker.moveToThread(&thread);
+        thread.start();
+        Collector collector;
+        QObject::connect(&worker, &GenerationWorker::tokenReady, &collector,
+                         [&collector](quint64, const QString& token) { collector.tokens.append(token); });
+        QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                         [&collector](quint64, bool success, const QString& error) {
+                             collector.success = success;
+                             collector.error = error;
+                             collector.finished = true;
+                             emit collector.finishedSignal();
+                         });
+        worker.start(10, QStringLiteral("status?"), 0.7F, 16);
+        check(pumpUntilFinished(collector, 5000), "bare call generation completes");
+        check(collector.tokens.join(QString()).trimmed().isEmpty(),
+              "the bare call and the text after it are not shown");
+        const auto call = worker.takeToolCall();
+        check(call.has_value() && call->name == "kestrel_status",
+              "the bare call is recognised so the tool can run");
+        check(!call.has_value() || call->argumentsJson == "{}",
+              "the bare call carries its arguments");
+        thread.quit();
+        thread.wait();
+    }
+    {
+        SlowBackend backend(3, 0);
+        backend.setTokenPieces({"{\"answer\":", " 42", "}"});
+        QThread thread;
+        GenerationWorker worker(&backend);
+        worker.moveToThread(&thread);
+        thread.start();
+        Collector collector;
+        QObject::connect(&worker, &GenerationWorker::tokenReady, &collector,
+                         [&collector](quint64, const QString& token) { collector.tokens.append(token); });
+        QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                         [&collector](quint64, bool, const QString&) {
+                             collector.finished = true;
+                             emit collector.finishedSignal();
+                         });
+        worker.start(11, QStringLiteral("give me json"), 0.7F, 16);
+        check(pumpUntilFinished(collector, 5000), "json answer generation completes");
+        check(collector.tokens.join(QString()) == QStringLiteral("{\"answer\": 42}"),
+              "a JSON answer that names no tool is shown in full");
+        check(!worker.takeToolCall().has_value(), "a JSON answer is not treated as a tool call");
+        thread.quit();
+        thread.wait();
+    }
+}
+
+void testWorkerCutsStreamAtCompleteToolCall() {
+    std::cout << "complete tool calls cut generation before trailing tokens\n";
+    const std::vector<std::vector<std::string>> cases{
+        {"\n", " {\"name\":\"kestrel_status\",\"arguments\":{\"query\":\"a }",
+         " b\",\"nested\":{}}", "}", " invented result"},
+        {"Checking. <tool", "_call>{\"name\":\"kestrel_status\",\"arguments\":{}", "}",
+         "</tool_call> invented result"},
+        {"{\"name\":\"kestrel_status\",\"arguments\":{}", "}", " invented result"}
+    };
+    for (const auto& pieces : cases) {
+        SlowBackend backend(1000, 0);
+        backend.setTokenPieces(pieces);
+        QThread thread;
+        GenerationWorker worker(&backend);
+        worker.moveToThread(&thread);
+        thread.start();
+        Collector collector;
+        QObject::connect(&worker, &GenerationWorker::tokenReady, &collector,
+                         [&](quint64, const QString& text) { collector.tokens.append(text); });
+        QObject::connect(&worker, &GenerationWorker::finished, &collector,
+                         [&](quint64, bool success, const QString& error) {
+                             collector.success = success;
+                             collector.error = error;
+                             collector.finished = true;
+                             emit collector.finishedSignal();
+                         });
+        worker.start(12, QStringLiteral("status"), 0.7F, 1024);
+        check(pumpUntilFinished(collector, 5000), "early tool cancellation finishes");
+        check(collector.success && collector.error.isEmpty(),
+              "internal tool cancellation is a successful handoff, not a failure");
+        check(backend.tokensEmitted() == static_cast<int>(pieces.size()) - 1,
+              "backend stops at the closing call token without generating a trailing result");
+        const auto call = worker.takeToolCall();
+        check(call && call->name == "kestrel_status", "split nested call survives the handoff");
+        const QString visible = collector.tokens.join(QString());
+        check(visible == QString() || visible == QStringLiteral("Checking. "),
+              "only genuine prose before a tagged call reaches the chat");
+        thread.quit();
+        thread.wait();
+    }
 }
 
 void testCancelBeforeWorkerStarts() {
@@ -1043,6 +1150,116 @@ std::unique_ptr<kestrel::storage::SecretStore> storeOn(kestrel::storage::InMemor
     return std::make_unique<SharedMemoryStore>(keystore, failSeals);
 }
 
+void testConversationsSurviveRestartAndDeletion() {
+    std::cout << "controller history saves, restores, renames and deletes\n";
+    QTemporaryDir directory;
+    const QByteArray before = qgetenv("KESTREL_CONVERSATIONS_PATH");
+    const QString path = directory.filePath(QStringLiteral("conversations.json"));
+    qputenv("KESTREL_CONVERSATIONS_PATH", path.toUtf8());
+    kestrel::storage::InMemorySecretStore store;
+    bool fail = false;
+    int id = 0;
+    {
+        AppController controller;
+        controller.setIdleLoopEnabled(false);
+        controller.setProfileStore(storeOn(store, &fail));
+        controller.setBackendForTesting(std::make_unique<SlowBackend>(3, 0));
+        controller.sendMessage(QStringLiteral("Inspect this reply after restart"));
+        QElapsedTimer timer;
+        timer.start();
+        while (controller.generating() && timer.elapsed() < 5000) {
+            QCoreApplication::processEvents(); QThread::msleep(1);
+        }
+        check(!controller.generating(), "the persisted reply finishes");
+        id = controller.activeConversationId();
+        controller.renameConversation(id, QStringLiteral("Saved custom title"));
+        controller.messages()->setLastMessageStatus(kestrel::app::MessageStatus::Failed, QStringLiteral("GPU test failure"));
+        controller.newConversation();
+        controller.selectConversation(id);
+        QFile file(path);
+        check(file.open(QIODevice::ReadOnly), "controller creates the inspectable JSON file");
+        const QByteArray bytes = file.readAll();
+        check(bytes.contains("Inspect this reply after restart") && bytes.contains("GPU test failure"),
+              "the actual file contains user text, assistant text and failure details");
+#if defined(__unix__)
+        check((file.permissions() & (QFileDevice::ReadGroup | QFileDevice::WriteGroup
+            | QFileDevice::ReadOther | QFileDevice::WriteOther)) == 0, "JSON mirror grants no group or other read/write access");
+#endif
+    }
+    {
+        AppController reopened;
+        reopened.setProfileStore(storeOn(store, &fail));
+        check(reopened.activeConversationId() == id && reopened.conversationTitle() == QStringLiteral("Saved custom title"),
+              "secure profile restores the active conversation and renamed title");
+        check(reopened.messages()->rowCount() == 2, "both messages survive a fresh controller");
+        const auto last = reopened.messages()->index(1, 0);
+        check(reopened.messages()->data(last, kestrel::app::MessageModel::ContentRole).toString() == QStringLiteral("toktoktok")
+            && reopened.messages()->data(last, kestrel::app::MessageModel::StatusRole).toString() == QStringLiteral("failed")
+            && reopened.messages()->data(last, kestrel::app::MessageModel::NoteRole).toString() == QStringLiteral("GPU test failure"),
+              "assistant content, terminal state and actionable note survive restart");
+    }
+    {
+        AppController mirrorOnly;
+        mirrorOnly.setProfileStore(nullptr);
+        check(mirrorOnly.messages()->rowCount() == 2, "JSON history recovers without a system keystore");
+        mirrorOnly.deleteConversation(id);
+    }
+    {
+        AppController deleted;
+        deleted.setProfileStore(nullptr);
+        check(deleted.messages()->rowCount() == 0, "a deleted conversation is not resurrected from disk");
+    }
+    // Simulate a process ending while a partial answer was still streaming.
+    kestrel::storage::Profile interrupted;
+    interrupted.activeConversationId = 9;
+    kestrel::storage::StoredConversation conversation;
+    conversation.id = 9;
+    conversation.title = "Interrupted";
+    conversation.messages = {{"user", "status?"}, {"assistant", "partial", "streaming", ""}};
+    conversation.activity = {{"call", "undermind_workspace", "{}", false}, {"result", "undermind_workspace", "real evidence", false}};
+    interrupted.conversations = {conversation};
+    {
+        QFile file(path);
+        check(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "interrupted fixture opens");
+        file.write(QByteArray::fromStdString(interrupted.toJson()));
+    }
+    {
+        AppController resumed;
+        resumed.setProfileStore(nullptr);
+        const auto last = resumed.messages()->index(1, 0);
+        check(resumed.messages()->data(last, kestrel::app::MessageModel::StatusRole).toString() == QStringLiteral("stopped")
+            && !resumed.messages()->data(last, kestrel::app::MessageModel::NoteRole).toString().isEmpty(),
+              "an interrupted generation restores as stopped with an explanation, never complete");
+        check(resumed.activityEntries().size() == 2, "tool calls and evidence are restored to the activity panel");
+    }
+    const QByteArray broken = "{truncated history";
+    {
+        QFile file(path);
+        check(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "corrupt fixture opens");
+        check(file.write(broken) == broken.size(), "corrupt fixture is written");
+    }
+    {
+        AppController refused;
+        refused.setProfileStore(nullptr);
+        check(!refused.conversationStorageError().isEmpty(), "corrupt history reports a repairable error");
+        refused.renameConversation(refused.activeConversationId(), QStringLiteral("must not overwrite"));
+    }
+    {
+        QFile file(path);
+        check(file.open(QIODevice::ReadOnly), "corrupt history remains accessible");
+        check(file.readAll() == broken, "corrupt history is preserved even on shutdown");
+    }
+    qputenv("KESTREL_CONVERSATIONS_PATH", directory.path().toUtf8());
+    {
+        AppController blocked;
+        blocked.setProfileStore(std::make_unique<kestrel::storage::InMemorySecretStore>());
+        blocked.renameConversation(blocked.activeConversationId(), QStringLiteral("cannot save to a directory"));
+        check(!blocked.conversationStorageError().isEmpty(), "a failed disk write is reported, not claimed saved");
+    }
+    if (before.isNull()) { qunsetenv("KESTREL_CONVERSATIONS_PATH"); }
+    else { qputenv("KESTREL_CONVERSATIONS_PATH", before); }
+}
+
 void testRecallDefaultsOnWithSecureStorageAndPersists() {
     std::cout << "recall defaults on with secure storage, preserves opt-out, and survives restart\n";
     kestrel::storage::InMemorySecretStore keystore;
@@ -1333,6 +1550,25 @@ void testMemoryControlsThroughQml() {
               && controller.approveMemory(controller.pendingMemories().first().toMap().value(QStringLiteral("id")).toLongLong())
               && controller.recallMemories().first().toMap().value(QStringLiteral("sensitive")).toBool(),
           "manually marked privacy survives approval even without a screening match");
+    QCoreApplication::processEvents();
+    auto* pin = memoryControl(window->contentItem(), QStringLiteral("pinMemoryButton"));
+    check(pin && QMetaObject::invokeMethod(pin, "clicked")
+              && controller.recallMemories().first().toMap().value(QStringLiteral("pinned")).toBool(),
+          "the actual QML pin control protects a background memory");
+    QCoreApplication::processEvents();
+    const auto oldId = controller.recallMemories().first().toMap().value(QStringLiteral("id")).toLongLong();
+    const auto replacementId = controller.recallMemories()[1].toMap().value(QStringLiteral("id")).toLongLong();
+    auto* replacement = memoryControl(window->contentItem(), QStringLiteral("replacementMemoryIdField"));
+    auto* supersede = memoryControl(window->contentItem(), QStringLiteral("supersedeMemoryButton"));
+    check(replacement && supersede, "QML exposes explicit replacement rather than guessing conflicts");
+    if (replacement && supersede) {
+        replacement->setProperty("text", QString::number(replacementId));
+        check(supersede->property("enabled").toBool() && QMetaObject::invokeMethod(supersede, "clicked")
+                  && controller.recallMemories().first().toMap().value(QStringLiteral("supersededBy")).toLongLong() == replacementId,
+              "the actual QML supersession action records the correction link");
+        check(controller.recallMemories().first().toMap().value(QStringLiteral("id")).toLongLong() == oldId,
+              "superseded evidence remains inspectable with its stable ID");
+    }
     QEventLoop settled;
     QTimer::singleShot(150, &settled, &QEventLoop::quit);
     settled.exec();
@@ -1363,6 +1599,8 @@ void testReviewedLearningThroughQml() {
     check(scene != nullptr, "the real behavior-learning panel loads");
     if (!scene) { return; }
     scene->setProperty("memoryOpen", true);
+    auto* advanced = scene->findChild<QObject*>(QStringLiteral("advancedLearningToggle"));
+    check(advanced && QMetaObject::invokeMethod(advanced, "clicked"), "advanced manual review remains optional");
     auto* window = qobject_cast<QQuickWindow*>(scene.get());
     if (!window) { check(false, "learning belongs to a real window"); return; }
     auto* prompt = memoryControl(window->contentItem(), QStringLiteral("learningPromptField"));
@@ -1429,6 +1667,281 @@ void testReviewedLearningThroughQml() {
         check(remove && QMetaObject::invokeMethod(remove, "clicked") && observed->adapterPath().empty(),
               "the real Remove LoRA control restores unchanged base weights");
     }
+}
+
+void testRealAutomaticLearningLifecycle() {
+    const QString model = qEnvironmentVariable("KESTREL_TEST_AUTO_LEARNING_MODEL");
+    const QString dataset = qEnvironmentVariable("KESTREL_TEST_AUTO_LEARNING_DATASET");
+    QFile data(dataset);
+    check(data.open(QIODevice::ReadOnly), "the synthetic local teaching fixture is readable");
+    if (!data.isOpen()) { return; }
+    kestrel::storage::InMemorySecretStore keystore;
+    kestrel::storage::Profile profile;
+    profile.automaticLearningEnabled = true;
+    std::int64_t id = 1;
+    for (const QByteArray& line : data.readAll().split('\n')) {
+        if (line.trimmed().isEmpty()) { continue; }
+        const auto row = QJsonDocument::fromJson(line).object();
+        profile.trainingExamples.push_back({id++, row.value(QStringLiteral("prompt")).toString().toStdString(),
+            row.value(QStringLiteral("rejected")).toString().toStdString(),
+            row.value(QStringLiteral("preferred")).toString().toStdString(), "2026-10-17", "chat"});
+    }
+    std::string error;
+    check(profile.save(keystore, kestrel::storage::Profile::kProfileAccount, kestrel::storage::kProfileService, error),
+          "the isolated opted-in synthetic learning profile is saved");
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    bool failSeals = false;
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    bool loaded = false;
+    QObject::connect(&controller, &AppController::modelLoadFinished, &controller, [&] { loaded = true; });
+    controller.loadModelFromUrls({QUrl::fromLocalFile(model).toString()});
+    QElapsedTimer timer;
+    timer.start();
+    while (!loaded && timer.elapsed() < 30000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(10);
+    }
+    check(loaded && controller.runtimeAvailable() && controller.modelError().isEmpty(),
+          "the real inference model loads before automatic learning");
+    if (!loaded || !controller.modelError().isEmpty()) { return; }
+    bool started = false;
+    timer.restart();
+    while (timer.elapsed() < 180000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        started = started || controller.learningBusy();
+        if (started && !controller.learningBusy()) { break; }
+        QThread::msleep(20);
+    }
+    std::cout << "Automatic lifecycle: " << controller.automaticLearningStatus().toStdString() << '\n';
+    check(started && !controller.learningBusy(), "idle timer automatically runs training, evaluation, conversion, and model restoration");
+    check(controller.runtimeAvailable() && controller.modelError().isEmpty(), "real inference is restored after automatic learning");
+    QSettings settings(QStringLiteral("Kestrel"), QStringLiteral("Kestrel"));
+    const QString adapter = settings.value(QStringLiteral("learning/adapter")).toString();
+    check(!adapter.isEmpty() && QFileInfo(adapter).size() > 32
+              && controller.runtimeDetail().contains(QStringLiteral("LoRA"), Qt::CaseInsensitive),
+          "an evaluated converted candidate is actually activated and recorded for automatic restart");
+    const QString learningRoot = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/learning");
+    QFile evaluationFile(learningRoot + QStringLiteral("/last-evaluation.json"));
+    check(evaluationFile.open(QIODevice::ReadOnly), "the last candidate keeps an inspectable evaluation record");
+    const auto evaluation = QJsonDocument::fromJson(evaluationFile.readAll()).object();
+    std::cout << "Evaluation: loss " << evaluation.value(QStringLiteral("validation_loss_before")).toDouble()
+              << " -> " << evaluation.value(QStringLiteral("validation_loss_after")).toDouble()
+              << "; peak GPU bytes " << evaluation.value(QStringLiteral("peak_gpu_bytes")).toDouble()
+              << "; training/evaluation seconds " << evaluation.value(QStringLiteral("seconds")).toDouble() << '\n';
+    check(evaluation.value(QStringLiteral("automatic_activation_eligible")).toBool()
+              && evaluation.value(QStringLiteral("curation")).toObject().value(QStringLiteral("chat_selected")).toInt() == 8
+              && evaluation.value(QStringLiteral("held_out_prompt_sha256")).toArray().size()
+                  == evaluation.value(QStringLiteral("validation")).toInt()
+              && !controller.lastLearningEvaluation().isEmpty()
+              && QFileInfo::exists(QFileInfo(adapter).absolutePath() + QLatin1Char('/')
+                                      + QFileInfo(adapter).completeBaseName() + QStringLiteral(".evaluation.json")),
+          "retained evaluation records include curation, disjoint holdout fingerprints, and UI summary");
+#if !defined(_WIN32)
+    check(!(evaluationFile.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther
+                                           | QFileDevice::WriteGroup | QFileDevice::WriteOther)),
+          "evaluation artifacts are owner-only");
+#endif
+    evaluationFile.close();
+    check(QDir(learningRoot).entryList({QStringLiteral("dataset-*")}, QDir::Dirs | QDir::NoDotAndDotDot).isEmpty(),
+          "temporary plaintext training data is removed after completion");
+    check(!controller.applyLoraAdapter(QStringLiteral("missing-candidate.gguf"))
+              && controller.runtimeDetail().contains(QStringLiteral("LoRA"), Qt::CaseInsensitive),
+          "an invalid replacement cannot remove the working learned adapter");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("Say hello briefly."));
+    timer.restart();
+    while (controller.generating() && timer.elapsed() < 45000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(10);
+    }
+    const QString reply = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::ContentRole).toString();
+    const QString status = controller.messages()->data(controller.messages()->index(1, 0),
+        kestrel::app::MessageModel::StatusRole).toString();
+    check(!controller.generating() && !reply.trimmed().isEmpty() && status == QStringLiteral("complete"),
+          "the trained model produces an actual completed chat reply through the desktop interface");
+    controller.resetLearnedBehavior();
+    check(!controller.automaticLearningEnabled() && controller.trainingExamples().isEmpty()
+              && !controller.runtimeDetail().contains(QStringLiteral("LoRA"), Qt::CaseInsensitive)
+              && !settings.contains(QStringLiteral("learning/adapter")),
+          "reset removes real learned weights and their startup selection");
+}
+
+void testAutomaticLearningFromChat() {
+    kestrel::storage::InMemorySecretStore keystore;
+    bool failSeals = false;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setProfileStore(storeOn(keystore, &failSeals));
+    controller.setBackendForTesting(std::make_unique<kestrel::runtime::MockBackend>());
+    auto wait = [&] {
+        QElapsedTimer timer;
+        timer.start();
+        while (controller.generating() && timer.elapsed() < 5000) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            QThread::msleep(1);
+        }
+        check(!controller.generating(), "chat generation completes during learning tests");
+    };
+    check(!controller.automaticLearningEnabled(), "fresh profiles never opt into weight training silently");
+    controller.sendMessage(QStringLiteral("Hello before consent"));
+    wait();
+    check(controller.trainingExamples().isEmpty(), "ordinary chat is not captured before consent");
+    failSeals = true;
+    check(!controller.setAutomaticLearningEnabled(true) && !controller.automaticLearningEnabled(),
+          "failed secure permission writes cannot enable automatic learning");
+    failSeals = false;
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    check(scene != nullptr, "the shipped automatic-learning consent panel loads");
+    auto* consent = scene ? scene->findChild<QObject*>(QStringLiteral("automaticLearningCheckBox")) : nullptr;
+    check(consent != nullptr, "one-time consent is exposed in the real QML");
+    if (!consent) { return; }
+    consent->setProperty("checked", true);
+    check(QMetaObject::invokeMethod(consent, "toggled") && controller.automaticLearningEnabled(),
+          "the actual one-time consent handler securely enables chat learning");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("From now on keep answers short"));
+    wait();
+    check(controller.systemPrompt().contains(QStringLiteral("From now on keep answers short")),
+          "user-taught behavior applies immediately through the shared prefix");
+    check(!controller.trainingExamples().isEmpty(), "opted-in ordinary completed chat becomes a local example");
+    const auto count = controller.trainingExamples().size();
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("My password is secret123"));
+    wait();
+    check(controller.trainingExamples().size() == count, "sensitive chats are excluded from training capture");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("When I ask status, say Ready."));
+    wait();
+    bool teachingFound = false;
+    for (const auto& example : controller.trainingExamples()) {
+        const auto row = example.toMap();
+        teachingFound = teachingFound || (row.value(QStringLiteral("prompt")).toString() == QStringLiteral("status")
+            && row.value(QStringLiteral("preferred")).toString() == QStringLiteral("Ready."));
+    }
+    check(teachingFound, "natural chat teaching creates the requested prompt/answer pair without a LoRA form");
+    check(controller.systemPrompt().contains(QStringLiteral("When I ask status, reply with Ready.")),
+          "specific chat teaching is applied immediately, before weight training");
+    controller.sendMessage(QStringLiteral("No, say Standing by."));
+    wait();
+    check(controller.systemPrompt().contains(QStringLiteral("Standing by.")),
+          "natural corrections teach the preceding user request without opening a training form");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("When I ask status, say All clear."));
+    wait();
+    check(controller.systemPrompt().contains(QStringLiteral("When I ask status, reply with All clear."))
+              && !controller.systemPrompt().contains(QStringLiteral("When I ask status, reply with Ready.")),
+          "new teaching supersedes conflicting instructions for the same request");
+    int explicitTargets = 0;
+    for (const auto& example : controller.trainingExamples()) {
+        const auto row = example.toMap();
+        if (row.value(QStringLiteral("prompt")).toString() == QStringLiteral("status")) {
+            ++explicitTargets;
+            check(row.value(QStringLiteral("source")).toString() == QStringLiteral("teaching")
+                      && row.value(QStringLiteral("preferred")).toString() == QStringLiteral("All clear."),
+                  "training retains the user's latest explicit target, not a conflicting self-generated answer");
+        }
+    }
+    check(explicitTargets == 1, "explicit teaching has one authoritative target per prompt");
+    const auto targetsBeforeFailure = controller.trainingExamples();
+    const auto preferencesBeforeFailure = controller.learnedBehaviorInstructions();
+    failSeals = true;
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("When I ask STATUS, say Not saved."));
+    wait();
+    check(controller.trainingExamples() == targetsBeforeFailure
+              && controller.learnedBehaviorInstructions() == preferencesBeforeFailure
+              && !controller.systemPrompt().contains(QStringLiteral("Not saved.")),
+          "a failed teaching transaction rolls back both the target and immediate instruction");
+    failSeals = false;
+    QTemporaryDir exported;
+    const QString exportPath = exported.filePath(QStringLiteral("consented.jsonl"));
+    check(controller.exportTrainingExamples(exportPath), "consented teaching exports through the public interface");
+    QFile exportFile(exportPath);
+    check(exportFile.open(QIODevice::ReadOnly), "the consented export is readable");
+    bool consentedTeaching = false;
+    for (const auto& line : exportFile.readAll().split('\n')) {
+        if (line.trimmed().isEmpty()) { continue; }
+        const auto row = QJsonDocument::fromJson(line).object();
+        if (row.value(QStringLiteral("source")).toString() == QStringLiteral("teaching")) {
+            consentedTeaching = true;
+            check(row.value(QStringLiteral("chat_learning_consent")).toBool()
+                      && !row.value(QStringLiteral("reviewed")).toBool(),
+                  "teaching export preserves consent without falsely claiming manual review");
+        }
+    }
+    check(consentedTeaching, "teaching provenance survives JSONL export");
+    check(controller.saveTrainingExample(QStringLiteral(" STATUS "), {}, QStringLiteral("Reviewed clear.")),
+          "manual review can replace a chat-taught target for a normalized prompt");
+    int reviewedTargets = 0;
+    for (const auto& value : controller.trainingExamples()) {
+        const auto row = value.toMap();
+        if (row.value(QStringLiteral("prompt")).toString().simplified().compare(QStringLiteral("status"), Qt::CaseInsensitive) == 0) {
+            ++reviewedTargets;
+            check(row.value(QStringLiteral("source")).toString() == QStringLiteral("reviewed")
+                      && row.value(QStringLiteral("preferred")).toString() == QStringLiteral("Reviewed clear."),
+                  "the latest explicit review is authoritative for training");
+        }
+    }
+    check(reviewedTargets == 1, "reviewed corrections replace rather than multiply conflicting targets");
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("status"));
+    wait();
+    check(controller.trainingExamples().size() > 0, "chat continues after explicit review");
+    for (const auto& value : controller.trainingExamples()) {
+        const auto row = value.toMap();
+        if (row.value(QStringLiteral("prompt")).toString().simplified().compare(QStringLiteral("status"), Qt::CaseInsensitive) == 0) {
+            check(row.value(QStringLiteral("source")).toString() == QStringLiteral("reviewed"),
+                  "self-generated replies cannot override reviewed corrections");
+        }
+    }
+    check(!controller.learnedBehaviorInstructions().isEmpty(), "taught preferences are inspectable");
+    check(controller.rememberFact(QStringLiteral("Old build note"))
+              && controller.rememberFact(QStringLiteral("New build note")), "memory correction fixtures are saved");
+    const auto memories = controller.recallMemories();
+    const auto latestId = memories.front().toMap().value(QStringLiteral("id")).toLongLong();
+    const auto oldId = memories[1].toMap().value(QStringLiteral("id")).toLongLong();
+    failSeals = true;
+    const auto memoriesBeforeFailure = controller.recallMemories();
+    check(!controller.pinMemory(oldId, true) && controller.recallMemories() == memoriesBeforeFailure,
+          "failed secure saves roll back pinning");
+    check(!controller.supersedeMemory(oldId, latestId) && controller.recallMemories() == memoriesBeforeFailure,
+          "failed secure saves roll back supersession");
+    const auto preferencesBeforeDelete = controller.learnedBehaviorInstructions();
+    check(!controller.forgetBehaviorInstruction(0)
+              && controller.learnedBehaviorInstructions() == preferencesBeforeDelete,
+          "failed preference deletion keeps the prior behavior authoritative");
+    failSeals = false;
+    check(controller.pinMemory(oldId, true) && controller.supersedeMemory(oldId, latestId),
+          "app memory controls persist pinning and explicit supersession");
+    AppController reopened;
+    reopened.setIdleLoopEnabled(false);
+    reopened.setProfileStore(storeOn(keystore, &failSeals));
+    check(reopened.automaticLearningEnabled() && !reopened.trainingExamples().isEmpty()
+              && reopened.systemPrompt().contains(QStringLiteral("From now on keep answers short")),
+          "permission, examples, and immediate behavior survive restart together");
+    const QStringList preferences = controller.learnedBehaviorInstructions();
+    scene->setProperty("memoryOpen", true);
+    QCoreApplication::processEvents();
+    auto* window = qobject_cast<QQuickWindow*>(scene.get());
+    auto* forgetPreference = window ? memoryControl(window->contentItem(), QStringLiteral("forgetBehaviorInstructionButton")) : nullptr;
+    check(forgetPreference && QMetaObject::invokeMethod(forgetPreference, "clicked")
+              && controller.learnedBehaviorInstructions().size() == preferences.size() - 1,
+          "the real QML action removes one preference without resetting all learning");
+    check(controller.setAutomaticLearningEnabled(false), "learning can be stopped without deleting data");
+    const auto stoppedCount = controller.trainingExamples().size();
+    controller.newConversation();
+    controller.sendMessage(QStringLiteral("A message after opting out"));
+    wait();
+    check(controller.trainingExamples().size() == stoppedCount, "opting out stops future capture");
+    controller.resetLearnedBehavior();
+    check(!controller.automaticLearningEnabled() && controller.trainingExamples().isEmpty()
+              && !controller.systemPrompt().contains(QStringLiteral("From now on keep answers short")),
+          "reset clears learned preferences and examples without a manual adapter workflow");
 }
 
 void testIdleToolNeedsPermissionBeforeItRuns() {
@@ -2581,8 +3094,9 @@ void testSendingWithoutModelReportsActionableError() {
     controller.sendMessage(QStringLiteral("do not pretend to answer"));
     check(controller.messages()->rowCount() == 0,
           "a missing local model does not create a fake conversation turn");
-    check(controller.modelError().contains(QStringLiteral("Load a GGUF")),
-          "a missing local model produces a clear load-model instruction");
+    check(controller.modelError().contains(QStringLiteral("loading automatically"))
+              && controller.modelError().contains(QStringLiteral("models folder")),
+          "a missing model explains automatic loading and the installation fallback");
 }
 
 void testDiagnosticsPreferencePersists() {
@@ -3228,7 +3742,249 @@ void testChatToolLoopRunsCallAndAnswers() {
     controller.stopGeneration();
 }
 
+// The same loop, but with the call written as bare JSON instead of the tagged
+// form. A base model does this often; refusing it showed the user the call text
+// followed by a result the model had made up. The call has to run, and neither
+// the call nor a repeated answer may appear in the transcript.
+void testRealTwoStageRouterWhenRequested() {
+    const QString base = qEnvironmentVariable("KESTREL_TEST_ROUTER_BASE");
+    const QString instruct = qEnvironmentVariable("KESTREL_TEST_ROUTER_INSTRUCT");
+    if (base.isEmpty() || instruct.isEmpty()) { return; }
+    std::cout << "real Base/Instruct two-stage controller handoff\n";
+    kestrel::core::McpDispatcher dispatcher;
+    int calls = 0;
+    dispatcher.addTool({"undermind_current_workspace", "Read Undermind's current workspace. Arguments: {}. Returns the current workspace name.", {},
+        [&](const kestrel::storage::json::Value&) { ++calls; return kestrel::core::McpToolResult{false, "The server reports current workspace name: Orion-Test-42."}; }, nullptr,
+        R"({"type":"object","properties":{}})"});
+    dispatcher.permissions().setEnabled("undermind_current_workspace", true);
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    useSilentVoice(controller);
+    controller.setSystemPrompt(QStringLiteral("You are Kestrel, a concise local assistant. Never invent tool results."));
+    controller.setAgentTools(&dispatcher);
+    controller.refreshAgentCapabilitiesPrompt();
+    controller.loadModelFromUrls({QUrl::fromLocalFile(base).toString()});
+    QElapsedTimer timer;
+    timer.start();
+    while (controller.modelPath() != base && controller.modelError().isEmpty() && timer.elapsed() < 30000) {
+        QCoreApplication::processEvents(); QThread::msleep(2);
+    }
+    check(controller.modelPath() == base, "real Base model loads through the desktop controller");
+    check(controller.configureInstructModel(QUrl::fromLocalFile(instruct).toString()), "real Instruct GGUF is configured");
+    controller.setToolRouterEnabled(true);
+    controller.sendMessage(QStringLiteral("Load my current workspace from Undermind and tell me its exact name."));
+    timer.restart();
+    while (controller.generationStage() != QStringLiteral("Complete") && timer.elapsed() < 90000) {
+        QCoreApplication::processEvents(); QThread::msleep(2);
+    }
+    std::cout << "  real route elapsed_ms=" << timer.elapsed() << " calls=" << calls
+              << " stage=" << controller.generationStage().toStdString() << '\n';
+    bool sawEvidence = false;
+    for (int row = 0; row < controller.messages()->rowCount(); ++row) {
+        const auto index = controller.messages()->index(row, 0);
+        const QString text = controller.messages()->data(index, kestrel::app::MessageModel::ContentRole).toString();
+        std::cout << "  " << controller.messages()->data(index, kestrel::app::MessageModel::AuthorRole).toString().toStdString()
+                  << ": " << text.toStdString() << '\n';
+        if (controller.messages()->data(index, kestrel::app::MessageModel::AuthorRole).toString() == QStringLiteral("assistant")) {
+            sawEvidence = sawEvidence || text.contains(QStringLiteral("Orion-Test-42"));
+            check(!text.contains(QStringLiteral("<tool_call>")), "real model tool syntax stays hidden");
+        }
+    }
+    check(calls == 1 && sawEvidence && controller.generationStage() == QStringLiteral("Complete"),
+          "real Instruct calls once and Base answers from the actual test-server evidence");
+    check(controller.modelPath() == base, "simple tool answer swaps back to Base with one resident model");
+    controller.stopGeneration();
+    controller.setToolRouterEnabled(false);
+}
+
+void testSmartRouterHandsOffToPersona() {
+    std::cout << "smart tool router keeps planning private and hands evidence to persona\n";
+    kestrel::core::McpDispatcher dispatcher;
+    dispatcher.addTool({"undermind_current_workspace", "Read server-reported current workspace", {},
+        [](const kestrel::storage::json::Value&) { return kestrel::core::McpToolResult{false, "Current workspace: Orion"}; }, nullptr});
+    dispatcher.permissions().setEnabled("undermind_current_workspace", true);
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setAgentTools(&dispatcher);
+    controller.setToolRouterEnabled(true);
+    controller.setProfileStore(std::make_unique<kestrel::storage::InMemorySecretStore>());
+    check(controller.setAutomaticLearningEnabled(true), "tool learning uses saved one-time consent");
+    auto model = std::make_unique<ScriptedToolBackend>(std::vector<std::string>{
+        R"(<tool_call>{"name":"undermind_current_workspace","arguments":{}}</tool_call>)",
+        "NO_TOOL private planner text", "Your current workspace is Orion.", "Hello from Kestrel."});
+    auto* observed = model.get();
+    controller.setBackendForTesting(std::move(model));
+    controller.sendMessage(QStringLiteral("Load my workspace from Undermind"));
+    QElapsedTimer timer;
+    timer.start();
+    while ((observed->requests().size() < 3 || controller.generating()) && timer.elapsed() < 5000) {
+        QCoreApplication::processEvents(); QThread::msleep(1);
+    }
+    check(observed->requests().size() == 3 && !controller.generating(), "router calls tool, finishes planning, then generates the persona answer");
+    bool answer = false, leaked = false;
+    for (int row = 0; row < controller.messages()->rowCount(); ++row) {
+        const QString text = controller.messages()->data(controller.messages()->index(row, 0), kestrel::app::MessageModel::ContentRole).toString();
+        answer = answer || text.contains(QStringLiteral("Your current workspace is Orion."));
+        leaked = leaked || text.contains(QStringLiteral("private planner")) || text.contains(QStringLiteral("<tool_call>"));
+    }
+    check(answer && !leaked, "only evidence and persona answer are visible, not private router output");
+    check(controller.generationStage() == QStringLiteral("Complete"), "live stage reaches completion");
+    bool sawStage = false;
+    for (const auto& item : controller.activityEntries()) { sawStage = sawStage || item.toMap().value(QStringLiteral("kind")).toString() == QStringLiteral("stage"); }
+    check(sawStage, "routing and answer stages are recorded with tool activity");
+    bool captured = false;
+    for (const auto& item : controller.trainingExamples()) {
+        const auto example = item.toMap();
+        captured = captured || (example.value(QStringLiteral("source")).toString() == QStringLiteral("tool_trace")
+            && example.value(QStringLiteral("adapterStage")).toString() == QStringLiteral("tool")
+            && example.value(QStringLiteral("preferred")).toString().contains(QStringLiteral("undermind_current_workspace")));
+    }
+    check(captured, "a successful executed tool call is automatically distilled into a dedicated tool example");
+    controller.setAutomaticLearningEnabled(false);
+    controller.sendMessage(QStringLiteral("Hello"));
+    timer.restart();
+    while (controller.generating() && timer.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(1); }
+    check(observed->requests().size() == 4, "casual chat bypasses the router and uses one generation");
+    controller.setToolRouterEnabled(false);
+}
+
+void testStoppedToolResultCannotEnterAnotherConversation() {
+    kestrel::core::McpDispatcher dispatcher;
+    kestrel::core::McpCompletion finish;
+    dispatcher.addTool({"workspace", "Read workspace", {}, nullptr,
+        [&](const kestrel::storage::json::Value&, kestrel::core::McpCompletion done) { finish = std::move(done); }});
+    dispatcher.permissions().setEnabled("workspace", true);
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setAgentTools(&dispatcher);
+    auto model = std::make_unique<ScriptedToolBackend>(std::vector<std::string>{
+        R"({"name":"workspace","arguments":{}})", "This must not run."});
+    auto* observed = model.get();
+    controller.setBackendForTesting(std::move(model));
+    controller.sendMessage(QStringLiteral("load workspace"));
+    QElapsedTimer timer;
+    timer.start();
+    while (!finish && timer.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(1); }
+    check(static_cast<bool>(finish), "asynchronous workspace call starts");
+    controller.newConversation();
+    if (finish) { finish({false, "old workspace evidence"}); }
+    QCoreApplication::processEvents();
+    check(controller.messages()->rowCount() == 0 && observed->requests().size() == 1,
+          "late tool results cannot mutate or generate into a replacement conversation");
+}
+
+void testChatBareJsonToolCallIsExecuted() {
+    kestrel::core::McpDispatcher dispatcher;
+    dispatcher.addTool({
+        "kestrel_status",
+        "Report status.",
+        {kestrel::core::ToolPermission::ReadConversations},
+        [](const kestrel::storage::json::Value&) {
+            return kestrel::core::McpToolResult{false, "runtime is idle"};
+        },
+        nullptr});
+    dispatcher.permissions().setEnabled("kestrel_status", true);
+
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setAgentTools(&dispatcher);
+    auto model = std::make_unique<ScriptedToolBackend>(std::vector<std::string>{
+        "{\"name\":\"kestrel_status\",\"arguments\":{}}",
+        "The runtime is idle."});
+    ScriptedToolBackend* observed = model.get();
+    controller.setBackendForTesting(std::move(model));
+    controller.sendMessage(QStringLiteral("How is the runtime doing?"));
+
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(5);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        if (observed->requests().size() == 2 && !controller.generating()) {
+            loop.quit();
+        }
+    });
+    QTimer::singleShot(20000, &loop, &QEventLoop::quit);
+    poll.start();
+    loop.exec();
+
+    check(observed->requests().size() == 2, "a bare JSON call starts a follow-up generation");
+    const QVariantList activity = controller.activityEntries();
+    check(activity.size() == 2,
+          "the bare call ran through the dispatcher and left a call and a result");
+    if (activity.size() == 2) {
+        check(activity[0].toMap().value(QStringLiteral("name")).toString()
+                  == QStringLiteral("kestrel_status"),
+              "the activity log names the tool from the bare call");
+    }
+
+    bool leakedCall = false;
+    bool sawAnswer = false;
+    const kestrel::app::MessageModel* messages = controller.messages();
+    for (int row = 0; row < messages->rowCount(); ++row) {
+        const QModelIndex index = messages->index(row, 0);
+        const QString content = messages->data(index, kestrel::app::MessageModel::ContentRole).toString();
+        leakedCall = leakedCall || content.contains(QStringLiteral("\"arguments\""));
+        sawAnswer = sawAnswer || content.contains(QStringLiteral("The runtime is idle."));
+    }
+    check(!leakedCall, "the bare call is hidden from the transcript");
+    check(sawAnswer, "the answer after the tool result is shown");
+    controller.stopGeneration();
+}
+
 // PKCE and the MCP reply framing that the Undermind connection depends on.
+// The astronomy tools are local arithmetic. They declare no permission, so they
+// are enabled immediately, and the check that matters is that they answer
+// correctly through the same dispatcher the model and the MCP endpoint use.
+void testBuiltInAstronomyToolsAnswerThroughDispatcher() {
+    kestrel::core::McpDispatcher dispatcher;
+    AppController controller;
+    controller.setIdleLoopEnabled(false);
+    controller.setAgentTools(&dispatcher, false);
+    controller.refreshAgentCapabilitiesPrompt();
+
+    const auto call = [&dispatcher](const char* name, const char* arguments) {
+        std::string request = R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":")";
+        request += name;
+        request += R"(","arguments":)";
+        request += arguments;
+        request += "}}";
+        return dispatcher.handle(request);
+    };
+
+    const std::string time = call("astronomy_time", R"({"date":"2000-01-01T12:00:00Z"})");
+    check(time.find("2451545") != std::string::npos && time.find("isError\":true") == std::string::npos,
+          "the J2000 epoch is computed exactly through the astronomy tool");
+
+    const std::string fractional = call("astronomy_time", R"({"date":"2026-10-17T21:04:00Z"})");
+    check(fractional.find("2461331.3777778") != std::string::npos,
+          "the time tool keeps sub-second Julian Day precision");
+
+    const std::string coordinates = call(
+        "astronomy_coordinates",
+        R"({"ra":"0:00:00","dec":"0:00:00","other_ra":"6:00:00","other_dec":"0:00:00"})");
+    check(coordinates.find("90 deg") != std::string::npos,
+          "a quarter turn of right ascension is ninety degrees of separation");
+
+    const std::string length = call("astronomy_length", R"({"value":1,"from":"pc","to":"ly"})");
+    check(length.find("3.261") != std::string::npos, "the parsec converts to light-years");
+
+    const std::string magnitudes = call("astronomy_magnitudes", R"({"magnitude_difference":5})");
+    check(magnitudes.find("0.01") != std::string::npos, "five magnitudes is a flux ratio of one hundred");
+
+    const std::string refusal = call("astronomy_time", R"({"date":"2026-02-30"})");
+    check(refusal.find("isError") != std::string::npos && refusal.find("calendar") != std::string::npos,
+          "a date that does not exist is refused with advice rather than guessed");
+
+    check(controller.systemPrompt().contains(QStringLiteral("astronomy_time"))
+              && controller.systemPrompt().contains(QStringLiteral("astronomy_magnitudes")),
+          "the model is told the astronomy tools are available");
+    check(controller.systemPrompt().contains(QStringLiteral("astronomy and astrophysics"))
+              && controller.systemPrompt().contains(QStringLiteral("BJD_TDB")),
+          "the shared prompt steers the model to the astronomy specialism");
+    check(controller.specialism() == QStringLiteral("astronomy"),
+          "the controller reports the specialism without parsing the prompt");
+}
+
 void testPkceAndJsonRpcFraming() {
     // RFC 7636, appendix B: the published verifier and its S256 challenge.
     check(kestrel::app::pkceChallenge(QStringLiteral("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
@@ -3242,6 +3998,9 @@ void testPkceAndJsonRpcFraming() {
     check(fromStream.has_value()
               && fromStream->value(QStringLiteral("result")).toObject().value(QStringLiteral("ok")).toBool(),
           "a reply inside an event stream is found by its id");
+    const auto multiline = kestrel::app::jsonRpcResponse(
+        "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":3,\"result\":{\"ok\":true}}\r\n\r\n", "text/event-stream", 3);
+    check(multiline.has_value(), "SSE data lines are joined before parsing the response");
     check(!kestrel::app::jsonRpcResponse(stream, "text/event-stream", 4).has_value(),
           "a reply with a different id is not returned");
     check(kestrel::app::jsonRpcResponse(QByteArray(R"({"jsonrpc":"2.0","id":5,"result":{}})"),
@@ -3301,7 +4060,13 @@ public:
     QString failure;
     bool eventStream = false;
     QString toolName = QStringLiteral("list_workspaces");
+    QJsonObject toolSchema{{QStringLiteral("type"), QStringLiteral("object")}};
     int toolStatus = 200;
+    bool richCapabilities = false;
+    bool discovery = false;
+    bool pkceSupported = true;
+    bool cimdSupported = true;
+    bool issuerMatches = true;
 
 protected:
     QNetworkReply* createRequest(Operation operation, const QNetworkRequest& request,
@@ -3314,7 +4079,25 @@ protected:
         int status = 200;
         QByteArray type = "application/json";
         QByteArray response;
-        if (request.url().path() == QStringLiteral("/o/token/")) {
+        if (operation == GetOperation && discovery) {
+            if (request.url().path() == QStringLiteral("/.well-known/oauth-protected-resource/custom/mcp")) {
+                status = 404; // exercise the root fallback
+            } else if (request.url().path() == QStringLiteral("/.well-known/oauth-protected-resource")) {
+                response = R"({"resource":"https://custom.example/custom/mcp","authorization_servers":["https://auth.example/tenant"],"scopes_supported":["read"]})";
+            } else if (request.url().path() == QStringLiteral("/.well-known/oauth-authorization-server/tenant")) {
+                status = 404; // exercise OIDC path insertion
+            } else if (request.url().path() == QStringLiteral("/.well-known/openid-configuration/tenant")) {
+                QJsonObject metadata{
+                    {QStringLiteral("issuer"), issuerMatches ? QStringLiteral("https://auth.example/tenant") : QStringLiteral("https://attacker.example")},
+                    {QStringLiteral("authorization_endpoint"), QStringLiteral("https://auth.example/authorize")},
+                    {QStringLiteral("token_endpoint"), QStringLiteral("https://auth.example/o/token/")},
+                    {QStringLiteral("client_id_metadata_document_supported"), cimdSupported},
+                    {QStringLiteral("code_challenge_methods_supported"), pkceSupported ? QJsonArray{QStringLiteral("S256")} : QJsonArray{}}};
+                response = QJsonDocument(metadata).toJson(QJsonDocument::Compact);
+            } else {
+                check(false, "OAuth discovery uses the official well-known endpoint order");
+            }
+        } else if (request.url().path() == QStringLiteral("/o/token/")) {
             response = R"({"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600,"token_type":"Bearer"})";
             if (failure == QStringLiteral("token-http")) {
                 status = 503;
@@ -3329,7 +4112,13 @@ protected:
             QJsonObject result;
             if (method == QStringLiteral("initialize")) {
                 result.insert(QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18"));
-                result.insert(QStringLiteral("capabilities"), QJsonObject{});
+                QJsonObject capabilities{{QStringLiteral("tools"), QJsonObject{}}};
+                if (richCapabilities) {
+                    capabilities.insert(QStringLiteral("resources"), QJsonObject{});
+                    capabilities.insert(QStringLiteral("prompts"), QJsonObject{});
+                }
+                result.insert(QStringLiteral("capabilities"), capabilities);
+                if (discovery && !request.hasRawHeader("Authorization")) { status = 401; }
                 result.insert(QStringLiteral("serverInfo"), QJsonObject{{QStringLiteral("name"), QStringLiteral("test")}});
             } else if (method == QStringLiteral("notifications/initialized")) {
                 status = failure == QStringLiteral("ack") ? 503 : 202;
@@ -3338,8 +4127,24 @@ protected:
                     result.insert(QStringLiteral("tools"), QJsonArray{QJsonObject{
                         {QStringLiteral("name"), toolName},
                         {QStringLiteral("description"), QStringLiteral("List workspaces")},
-                        {QStringLiteral("inputSchema"), QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}}}}});
+                        {QStringLiteral("inputSchema"), toolSchema}}});
                 }
+            } else if (method == QStringLiteral("resources/list")) {
+                result.insert(QStringLiteral("resources"), QJsonArray{QJsonObject{
+                    {QStringLiteral("uri"), QStringLiteral("test://status")},
+                    {QStringLiteral("name"), QStringLiteral("Status")}}});
+            } else if (method == QStringLiteral("prompts/list")) {
+                result.insert(QStringLiteral("prompts"), QJsonArray{QJsonObject{
+                    {QStringLiteral("name"), QStringLiteral("review")}}});
+            } else if (method == QStringLiteral("resources/read")) {
+                result.insert(QStringLiteral("contents"), QJsonArray{QJsonObject{
+                    {QStringLiteral("uri"), QStringLiteral("test://status")},
+                    {QStringLiteral("text"), QStringLiteral("resource ready")}}});
+            } else if (method == QStringLiteral("prompts/get")) {
+                result.insert(QStringLiteral("messages"), QJsonArray{QJsonObject{
+                    {QStringLiteral("role"), QStringLiteral("user")},
+                    {QStringLiteral("content"), QJsonObject{{QStringLiteral("type"), QStringLiteral("text")},
+                                                          {QStringLiteral("text"), QStringLiteral("Review this")}}}}});
             } else if (method == QStringLiteral("tools/call")) {
                 status = toolStatus;
                 result.insert(QStringLiteral("content"), QJsonArray{QJsonObject{
@@ -3388,6 +4193,225 @@ bool waitForUndermind(const std::function<bool()>& ready) {
         QThread::msleep(1);
     }
     return ready();
+}
+
+void testCustomMcpOAuthDiscovery() {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        Collector browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "captureUrl");
+        UndermindNetwork network;
+        network.discovery = true;
+        network.pkceSupported = scenario != 1;
+        network.cimdSupported = scenario != 2;
+        network.issuerMatches = scenario != 3;
+        kestrel::app::McpServerConfig config;
+        config.id = QStringLiteral("custom");
+        config.displayName = QStringLiteral("Custom");
+        config.mcpUrl = QStringLiteral("https://custom.example/custom/mcp");
+        kestrel::app::UndermindClient client(config, network,
+            std::make_unique<kestrel::storage::InMemorySecretStore>());
+        bool completed = false;
+        bool success = false;
+        client.connectAndList([&](bool ok, QJsonArray) { success = ok; completed = true; });
+        check(waitForUndermind([&] { return completed || !browser.openedUrl.isEmpty(); }),
+              "custom MCP discovery reaches a sign-in or an actionable refusal");
+        check(network.requests.size() == 5, "MCP resource and authorization metadata use path then root/OIDC fallbacks");
+        for (const auto& request : network.requests) {
+            check(request.headers.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt()
+                      == QNetworkRequest::ManualRedirectPolicy,
+                  "OAuth metadata discovery never follows redirects to an unvalidated endpoint");
+        }
+        if (scenario == 0) {
+            const QUrlQuery query(browser.openedUrl);
+            check(browser.openedUrl.host() == QStringLiteral("auth.example")
+                      && query.queryItemValue(QStringLiteral("resource")) == config.mcpUrl
+                      && query.queryItemValue(QStringLiteral("scope")) == QStringLiteral("read")
+                      && query.queryItemValue(QStringLiteral("code_challenge_method")) == QStringLiteral("S256"),
+                  "discovered authorization binds PKCE, scope, and resource to the custom server");
+            QNetworkAccessManager callback;
+            QUrl url(query.queryItemValue(QStringLiteral("redirect_uri")));
+            QUrlQuery returned;
+            returned.addQueryItem(QStringLiteral("state"), query.queryItemValue(QStringLiteral("state")));
+            returned.addQueryItem(QStringLiteral("code"), QStringLiteral("test-code"));
+            url.setQuery(returned);
+            auto* reply = callback.get(QNetworkRequest(url));
+            check(waitForUndermind([&] { return completed && reply->isFinished(); }), "custom OAuth callback finishes");
+            check(success && client.connected(), "custom CIMD OAuth reaches authenticated MCP tool discovery");
+            reply->deleteLater();
+        } else {
+            check(completed && !success && browser.openedUrl.isEmpty(),
+                  "insecure OAuth metadata is refused before opening a browser");
+            const QString expected = scenario == 1 ? QStringLiteral("PKCE")
+                : scenario == 2 ? QStringLiteral("CIMD") : QStringLiteral("issuer");
+            check(client.status().contains(expected), "OAuth discovery refusal identifies the missing security requirement");
+        }
+        QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+    }
+}
+
+void testCustomMcpBearerResourcesAndPrompts() {
+    UndermindNetwork network;
+    network.richCapabilities = true;
+    network.toolSchema = QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+        {QStringLiteral("description"), QString(800, QLatin1Char('x'))},
+        {QStringLiteral("properties"), QJsonObject{{QStringLiteral("workspace_id"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}}},
+        {QStringLiteral("required"), QJsonArray{QStringLiteral("workspace_id")}}};
+    kestrel::app::McpServerConfig config;
+    config.id = QStringLiteral("custom");
+    config.displayName = QStringLiteral("Custom");
+    config.mcpUrl = QStringLiteral("https://custom.example/mcp");
+    config.bearerToken = QStringLiteral("test-bearer");
+    kestrel::app::UndermindClient client(config, network,
+        std::make_unique<kestrel::storage::InMemorySecretStore>());
+    bool connected = false;
+    client.connectAndList([&](bool ok, QJsonArray) { connected = ok; });
+    check(waitForUndermind([&] { return connected; }), "custom Bearer MCP server connects without OAuth");
+    check(client.discoveredResources().size() == 1 && client.discoveredPrompts().size() == 1,
+          "custom MCP resources and prompts are discovered");
+    for (const auto& request : network.requests) {
+        check(request.headers.rawHeader("Authorization") == "Bearer test-bearer"
+                  && request.headers.url() == QUrl(config.mcpUrl),
+              "the static token is sent only to the configured MCP endpoint");
+    }
+    bool resourceDone = false;
+    client.readResource(QStringLiteral("test://status"), [&](kestrel::core::McpToolResult result) {
+        check(!result.isError && result.text == "resource ready", "remote resource text reaches the caller");
+        resourceDone = true;
+    });
+    check(waitForUndermind([&] { return resourceDone; }), "remote resource completes");
+    bool promptDone = false;
+    client.getPrompt(QStringLiteral("review"), {}, [&](kestrel::core::McpToolResult result) {
+        check(!result.isError && result.text == "user: Review this", "remote prompt content reaches the caller");
+        promptDone = true;
+    });
+    check(waitForUndermind([&] { return promptDone; }), "remote prompt completes");
+    kestrel::core::McpDispatcher dispatcher;
+    AppController controller;
+    controller.setAgentTools(&dispatcher);
+    controller.setUndermindClientForTesting(&client);
+    controller.connectUndermind();
+    check(waitForUndermind([&] {
+        const auto tools = dispatcher.toolSummaries();
+        return std::any_of(tools.begin(), tools.end(), [](const auto& tool) { return tool.name == "custom_list_workspaces"; });
+    }), "remote capabilities register with the controller");
+    const auto listing = QJsonDocument::fromJson(QByteArray::fromStdString(dispatcher.handle(
+        R"({"jsonrpc":"2.0","id":90,"method":"tools/list"})"))).object();
+    bool preserved = false;
+    for (const auto& value : listing.value(QStringLiteral("result")).toObject().value(QStringLiteral("tools")).toArray()) {
+        const auto tool = value.toObject();
+        if (tool.value(QStringLiteral("name")).toString() == QStringLiteral("custom_list_workspaces")) {
+            preserved = tool.value(QStringLiteral("inputSchema")).toObject() == network.toolSchema;
+        }
+    }
+    check(preserved, "long remote schemas remain intact in tools/list while prompt hints stay bounded");
+}
+
+void testMcpControlsThroughQml() {
+    kestrel::core::McpDispatcher dispatcher;
+    AppController controller;
+    controller.setAgentTools(&dispatcher, false);
+    check(!controller.mcpConversationAccess(), "MCP cannot read conversations without explicit consent");
+    kestrel::app::BrowserPanel browserPanel;
+    kestrel::app::PaperLibrary paperLibrary;
+    kestrel::app::PrivilegedApprovalBroker privilegedBroker;
+    kestrel::app::PrivilegedApprovalBroker shellBroker;
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
+    engine.rootContext()->setContextProperty(QStringLiteral("browserPanel"), &browserPanel);
+    engine.rootContext()->setContextProperty(QStringLiteral("paperLibrary"), &paperLibrary);
+    engine.rootContext()->setContextProperty(QStringLiteral("privilegedBroker"), &privilegedBroker);
+    engine.rootContext()->setContextProperty(QStringLiteral("shellBroker"), &shellBroker);
+    QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
+    std::unique_ptr<QObject> scene(component.create());
+    if (!scene) { std::cout << component.errorString().toStdString(); }
+    check(scene != nullptr, "the shipped MCP control panel loads");
+    if (!scene) { return; }
+    auto* router = scene->findChild<QObject*>(QStringLiteral("toolRouterToggle"));
+    auto* force = scene->findChild<QObject*>(QStringLiteral("forceToolRouterToggle"));
+    auto* stage = scene->findChild<QObject*>(QStringLiteral("generationStageLabel"));
+    check(router && force && stage, "shipped QML exposes routing, manual override and a live stage label");
+    if (router && force) {
+        router->setProperty("checked", true);
+        check(QMetaObject::invokeMethod(router, "toggled"), "the real QML routing toggle runs");
+        force->setProperty("checked", true);
+        check(QMetaObject::invokeMethod(force, "toggled") && controller.toolRouterEnabled() && controller.forceToolRouter(),
+              "QML can enable routing and force the next turn");
+        router->setProperty("checked", false);
+        check(QMetaObject::invokeMethod(router, "toggled") && !controller.toolRouterEnabled() && !controller.forceToolRouter(),
+              "QML disabling the router clears its override");
+    }
+    scene->setProperty("activityOpen", true);
+    void* mouseEvent = nullptr;
+    auto* toggle = scene->findChild<QObject*>(QStringLiteral("toggleLocalMcpButton"));
+    auto* status = scene->findChild<QObject*>(QStringLiteral("localMcpStatusText"));
+    auto* consent = scene->findChild<QObject*>(QStringLiteral("mcpConversationAccessCheckBox"));
+    check(toggle && status && consent, "Activity exposes local server start/stop, status, and data consent");
+    if (!toggle || !status || !consent) { return; }
+    check(QMetaObject::invokeMethod(toggle, "clicked", Qt::DirectConnection, QGenericArgument("QQuickMouseEvent*", &mouseEvent)),
+          "the actual Start server click handler runs");
+    check(controller.localMcpRunning() && controller.localMcpToken().size() == 64
+              && status->property("text").toString().contains(controller.localMcpEndpoint()),
+          "the app starts a token-protected loopback server and shows its address");
+    if (!controller.localMcpRunning()) { return; }
+    QNetworkAccessManager network;
+    const auto rpc = [&](const QByteArray& body, bool authorized) {
+        QNetworkRequest request{QUrl(controller.localMcpEndpoint())};
+        request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        request.setRawHeader("Accept", "application/json, text/event-stream");
+        if (authorized) { request.setRawHeader("Authorization", ("Bearer " + controller.localMcpToken()).toUtf8()); }
+        auto* reply = network.post(request, body);
+        check(waitForUndermind([&] { return reply->isFinished(); }), "real loopback MCP request completes");
+        const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
+        reply->deleteLater();
+        return std::make_pair(code, response);
+    };
+    check(rpc(R"({"jsonrpc":"2.0","id":1,"method":"ping"})", false).first == 401,
+          "the live endpoint refuses requests without its token");
+    const auto initialized = rpc(R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}})", true);
+    check(initialized.first == 200 && initialized.second.value(QStringLiteral("result")).toObject()
+              .value(QStringLiteral("capabilities")).toObject().contains(QStringLiteral("resources")),
+          "the live endpoint advertises MCP resources");
+    const QByteArray read = R"({"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"kestrel://conversations/active"}})";
+    check(rpc(read, true).second.contains(QStringLiteral("error")), "conversation data is denied before consent");
+    consent->setProperty("checked", true);
+    check(QMetaObject::invokeMethod(consent, "toggled"), "the actual data-consent handler runs");
+    check(controller.mcpConversationAccess() && rpc(read, true).second.contains(QStringLiteral("result")),
+          "conversation reads work only after the app's consent control is enabled");
+    auto* name = scene->findChild<QObject*>(QStringLiteral("mcpServerNameInput"));
+    auto* url = scene->findChild<QObject*>(QStringLiteral("mcpServerUrlInput"));
+    auto* token = scene->findChild<QObject*>(QStringLiteral("mcpBearerTokenInput"));
+    auto* add = scene->findChild<QObject*>(QStringLiteral("addMcpServerButton"));
+    check(name && url && token && add, "custom MCP form exposes name, URL, and masked token");
+    if (name && url && token && add) {
+        name->setProperty("text", QStringLiteral("Local test"));
+        url->setProperty("text", controller.localMcpEndpoint());
+        token->setProperty("text", controller.localMcpToken());
+        check(QMetaObject::invokeMethod(add, "clicked", Qt::DirectConnection, QGenericArgument("QQuickMouseEvent*", &mouseEvent)),
+              "the actual Add server handler runs");
+        check(controller.mcpServers().size() == 2 && token->property("text").toString().isEmpty(),
+              "adding a custom server creates a row and clears the secret input");
+        controller.connectMcpServer(QStringLiteral("local_test"));
+        check(waitForUndermind([&] { return controller.mcpServers().last().toMap().value(QStringLiteral("connected")).toBool(); }),
+              "the app connects to its live endpoint as a custom Bearer MCP server");
+        check(controller.removeMcpServer(QStringLiteral("local_test")) && controller.mcpServers().size() == 1,
+              "removing a custom server removes its UI row and forwarded capabilities");
+    }
+    consent->setProperty("checked", false);
+    check(QMetaObject::invokeMethod(consent, "toggled"), "the actual data-revocation handler runs");
+    check(!controller.mcpConversationAccess() && rpc(read, true).second.contains(QStringLiteral("error")),
+          "revoking consent blocks subsequent reads on the live endpoint");
+    check(!controller.addMcpServer(QStringLiteral("Bad"), QStringLiteral("http://remote.example/mcp")),
+          "remote unencrypted URLs are refused");
+    check(QMetaObject::invokeMethod(toggle, "clicked", Qt::DirectConnection, QGenericArgument("QQuickMouseEvent*", &mouseEvent)),
+          "the actual Stop server click handler runs");
+    check(!controller.localMcpRunning() && status->property("text").toString().contains(QStringLiteral("Stopped")),
+          "the app stops the endpoint and updates its status");
+    scene->setProperty("height", 640);
+    check(waitForUndermind([&] {
+        auto* item = qobject_cast<QQuickItem*>(toggle);
+        return item != nullptr && item->width() > 0 && item->height() > 0;
+    }), "MCP controls retain clickable geometry at the minimum window height");
 }
 
 void testUndermindConnection() {
@@ -3481,6 +4505,11 @@ void testUndermindConnection() {
         if (scenario == QStringLiteral("state") || scenario == QStringLiteral("denied")
             || scenario == QStringLiteral("missing-code")) {
             check(network.requests.empty(), "an invalid or denied callback sends no token request");
+        }
+        for (const auto& request : network.requests) {
+            check(request.headers.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt()
+                      == QNetworkRequest::ManualRedirectPolicy,
+                  "OAuth token and MCP requests never forward authorization across redirects");
         }
         if (!network.requests.empty()) {
             const QUrlQuery form(QString::fromUtf8(network.requests.front().body));
@@ -3656,6 +4685,10 @@ void testUndermindConnection() {
         check(connectButton && QMetaObject::invokeMethod(connectButton, "clicked", Qt::DirectConnection,
                   QGenericArgument("QQuickMouseEvent*", &mouseEvent)),
               "the real Connect action starts session validation");
+        if (browser.openedUrl.isEmpty() || savedClient.connected()) {
+            std::cout << "Reconnect diagnostic: " << savedClient.status().toStdString()
+                      << "; browser=" << browser.openedUrl.toString().toStdString() << '\n';
+        }
         check(!browser.openedUrl.isEmpty() && !savedClient.connected(),
               "explicit Connect starts fresh browser OAuth despite valid saved credentials");
         const QUrlQuery freshAuthorization(browser.openedUrl);
@@ -3950,62 +4983,23 @@ void testGroqStreamingAndFailures() {
 }
 
 void testGroqConfigurationThroughQml() {
-    const QByteArray previousKey = qgetenv("GROQ_API_KEY");
-    const QByteArray previousFile = qgetenv("GROQ_API_KEY_FILE");
-    const bool hadKey = qEnvironmentVariableIsSet("GROQ_API_KEY");
-    const bool hadFile = qEnvironmentVariableIsSet("GROQ_API_KEY_FILE");
-    qputenv("GROQ_API_KEY", "gsk_testonly");
-    qunsetenv("GROQ_API_KEY_FILE");
     AppController controller;
     controller.setIdleLoopEnabled(false);
-    check(!controller.groqEnabled(), "a configured Groq credential does not silently enable cloud inference");
-    QTemporaryFile keyFile;
-    check(keyFile.open(), "a temporary Groq credential file is available");
-    keyFile.write("not-a-key\n");
-    keyFile.flush();
-    qputenv("GROQ_API_KEY_FILE", keyFile.fileName().toUtf8());
-    check(!controller.configureGroq() && controller.modelError().contains(QStringLiteral("format")),
-          "a selected invalid credential file is rejected without falling through to another key");
-    keyFile.resize(0);
-    keyFile.write("gsk_testonly\n");
-    keyFile.flush();
-    check(controller.configureGroq() && controller.groqEnabled() && controller.runtimeAvailable()
-              && controller.modelPath().isEmpty(),
-          "the explicitly selected key file configures cloud inference without fabricating a local model path");
-    check(!controller.configureGroq(QString(), QStringLiteral("missing-model")) && controller.runtimeAvailable(),
-          "unsupported Groq models are rejected without destroying the current backend");
-    qunsetenv("GROQ_API_KEY_FILE");
+    check(!controller.configureGroq() && !controller.groqEnabled()
+              && controller.modelError().contains(QStringLiteral("local-only")),
+          "legacy cloud configuration is explicitly refused without reading credentials");
     QQmlEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("appController"), &controller);
     QQmlComponent component(&engine, QUrl::fromLocalFile(QStringLiteral(KESTREL_UI_DIR "/Main.qml")));
     std::unique_ptr<QObject> scene(component.create());
-    if (!scene) { std::cout << component.errorString().toStdString(); }
-    check(scene != nullptr, "the shipped Groq settings scene loads");
+    check(scene != nullptr, "the local-only desktop scene loads");
     if (scene) {
-        auto* window = qobject_cast<QQuickWindow*>(scene.get());
-        auto* button = scene->findChild<QObject*>(QStringLiteral("groqSettingsButton"));
-        auto* dialog = scene->findChild<QObject*>(QStringLiteral("groqSettingsDialog"));
-        auto* use = scene->findChild<QObject*>(QStringLiteral("groqUseConfiguredButton"));
-        check(window && button && dialog && use, "the real runtime panel exposes Groq configuration");
-        if (window && button && dialog && use) {
-            window->resize(980, 640);
-            check(QMetaObject::invokeMethod(button, "clicked"), "the Groq settings action opens");
-            QCoreApplication::processEvents();
-            check(dialog->property("visible").toBool(), "the Groq cloud consent dialog is visible");
-            auto* content = qobject_cast<QQuickItem*>(dialog->property("contentItem").value<QObject*>());
-            check(content && content->height() > 0 && content->height() < window->height(),
-                  "Groq cloud settings fit the minimum desktop height");
-            check(QMetaObject::invokeMethod(use, "clicked") && controller.groqEnabled()
-                      && controller.modelError().isEmpty(),
-                  "the real QML action configures Groq using the session credential");
-            QCoreApplication::processEvents();
-            check(!dialog->property("visible").toBool(), "successful Groq selection closes its dialog");
-            check(kestrel::ui::auditLayouts(window->contentItem()).isEmpty(),
-                  "Groq controls do not collapse or overlap the desktop layout");
-        }
+        check(!scene->findChild<QObject*>(QStringLiteral("groqSettingsButton"))
+                  && !scene->findChild<QObject*>(QStringLiteral("groqSettingsDialog")),
+              "the shipped UI has no cloud inference controls");
+        check(scene->findChild<QObject*>(QStringLiteral("automaticLearningCheckBox")) != nullptr,
+              "the desktop offers one-time local chat learning consent instead");
     }
-    if (hadKey) { qputenv("GROQ_API_KEY", previousKey); } else { qunsetenv("GROQ_API_KEY"); }
-    if (hadFile) { qputenv("GROQ_API_KEY_FILE", previousFile); } else { qunsetenv("GROQ_API_KEY_FILE"); }
 }
 
 // Runs a real command through the shell runner and waits for its one reply.
@@ -4030,6 +5024,17 @@ void testShellCommandReportsOutputAndExitCode() {
     const kestrel::core::McpToolResult failed = runShellAndWait(QStringLiteral("echo nope; exit 3"));
     check(failed.isError && failed.text.find("exit code 3") != std::string::npos,
           "a failing command is an error with its exit code");
+
+#ifdef Q_OS_WIN
+    const QString largeOutputCommand = QStringLiteral("for /L %i in (1,1,20000) do @echo x");
+#else
+    const QString largeOutputCommand = QStringLiteral("yes x | head -c 200000");
+#endif
+    const kestrel::core::McpToolResult large = runShellAndWait(largeOutputCommand);
+    check(!large.isError && large.text.find("[output cut short]") != std::string::npos,
+          "shell output is explicitly marked when its bounded capture truncates");
+    check(large.text.size() < 17000,
+          "shell output is capped while the process runs, not only after it exits");
 }
 
 void testPaperLibrary() {
@@ -4206,6 +5211,16 @@ int main(int argc, char** argv) {
     // a microphone would change what the suite means.
     qputenv("KESTREL_SPEECH_INPUT", "mock");
 
+    if (qEnvironmentVariableIsSet("KESTREL_TEST_ROUTER_BASE")) {
+        testRealTwoStageRouterWhenRequested();
+        return failures == 0 ? 0 : 1;
+    }
+
+    if (qEnvironmentVariableIsSet("KESTREL_TEST_AUTO_LEARNING_MODEL")) {
+        testRealAutomaticLearningLifecycle();
+        return failures == 0 ? 0 : 1;
+    }
+
     if (qEnvironmentVariableIsSet("KESTREL_TEST_SPEECH_GGUF")) {
         testRealModelSpokenSummaryWhenRequested();
         return failures == 0 ? 0 : 1;
@@ -4215,6 +5230,8 @@ int main(int argc, char** argv) {
     testPrivilegedCommandRefusesWithoutApproval();
     testGenerationRunsOffCallingThread();
     testTokensStreamBeforeCompletionAndPreserveUtf8();
+    testWorkerHidesBareJsonCallButNotJsonAnswers();
+    testWorkerCutsStreamAtCompleteToolCall();
     testCancelBeforeWorkerStarts();
     testCancelStopsInFlightGeneration();
     testFileDialogUrlBecomesALocalPath();
@@ -4249,7 +5266,14 @@ int main(int argc, char** argv) {
     testLoadingVoiceReportsTextOnlyWithoutWaiting();
     testNewTurnReleasesOwedAudioAndOmitsToolHistory();
     testChatToolLoopRunsCallAndAnswers();
+    testChatBareJsonToolCallIsExecuted();
+    testStoppedToolResultCannotEnterAnotherConversation();
+    testSmartRouterHandsOffToPersona();
+    testBuiltInAstronomyToolsAnswerThroughDispatcher();
     testPkceAndJsonRpcFraming();
+    testCustomMcpOAuthDiscovery();
+    testCustomMcpBearerResourcesAndPrompts();
+    testMcpControlsThroughQml();
     testUndermindConnection();
     testGroqStreamingAndFailures();
     testGroqConfigurationThroughQml();
@@ -4269,10 +5293,12 @@ int main(int argc, char** argv) {
 #endif
     testSpokenPhraseTakesTheTypedPath();
     testAbandonedPhraseIsNotSubmitted();
+    testConversationsSurviveRestartAndDeletion();
     testRecallDefaultsOnWithSecureStorageAndPersists();
     testAutomaticMemoryApprovalCorrectionAndCloudPrivacy();
     testMemoryControlsThroughQml();
     testReviewedLearningThroughQml();
+    testAutomaticLearningFromChat();
     testRecallWithoutAKeystoreStaysOff();
     testAFailedSaveUndoesTheChange();
     testForgetAndClearAreSaved();

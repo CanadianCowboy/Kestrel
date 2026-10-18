@@ -496,6 +496,49 @@ std::size_t LlamaCppBackend::cachedPrefixTokens() const {
     return m_impl->prefixDirty ? 0 : m_impl->prefixTokens.size();
 }
 
+/// Decodes `count` tokens at consecutive positions in chunks no larger than the
+/// context's batch limit.
+///
+/// llama_decode asserts `n_tokens <= n_batch` and the assert calls abort(), so
+/// passing a whole system prompt in one batch kills the process once the prompt
+/// grows past the batch size -- which a persona plus a tool capability block
+/// does. Chunking is the documented way to feed a long prompt; positions stay
+/// explicit so the KV entries line up with the turn that follows.
+///
+/// When `logitsOnLast` is set, only the final token of the final chunk keeps its
+/// logits, which is what the sampler reads with -1 afterwards.
+static bool decodeInBatches(llama_context* context, const std::vector<llama_token>& tokens,
+                            std::size_t begin, std::size_t count, llama_pos startPosition,
+                            bool logitsOnLast) {
+    if (context == nullptr || count == 0) {
+        return count == 0;
+    }
+    const auto batchLimit = static_cast<std::size_t>(std::max<uint32_t>(1U, llama_n_batch(context)));
+    for (std::size_t offset = 0; offset < count; offset += batchLimit) {
+        const auto chunk = static_cast<int32_t>(std::min(batchLimit, count - offset));
+        llama_batch batch = llama_batch_init(chunk, 0, 1);
+        batch.n_tokens = chunk;
+        for (int32_t i = 0; i < chunk; ++i) {
+            const std::size_t index = offset + static_cast<std::size_t>(i);
+            batch.token[i] = tokens[begin + index];
+            batch.pos[i] = startPosition + static_cast<llama_pos>(index);
+            // n_seq_id is a per-token count, not a batch-wide flag, and
+            // llama_batch_init leaves it uninitialised. Setting only the first
+            // entry makes the library read a garbage count for every later
+            // token and reject the batch.
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = (logitsOnLast && index + 1 == count) ? 1 : 0;
+        }
+        const int rc = llama_decode(context, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Returns the retained prefix length, or zero if unavailable; the caller must hold m_mutex.
 std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
     prefixFailed = false;
@@ -522,25 +565,24 @@ std::size_t LlamaCppBackend::applySystemPrefix(bool& prefixFailed) {
                 ChatMessage{Role::System, m_systemPrompt}};
             const std::string rendered = renderChat(systemOnly, /* addAssistantCue */ false);
             tokenizeInto(llama_model_get_vocab(m_impl->model), rendered, m_impl->prefixTokens);
-            const auto prefixSize = static_cast<int32_t>(m_impl->prefixTokens.size());
-            if (prefixSize > 0) {
-                llama_batch batch = llama_batch_init(prefixSize, 0, 1);
-                batch.n_tokens = prefixSize;
-                for (int32_t i = 0; i < prefixSize; ++i) {
-                    batch.token[i] = m_impl->prefixTokens[static_cast<std::size_t>(i)];
-                    batch.pos[i] = static_cast<llama_pos>(i);
-                    // n_seq_id is a per-token count, not a batch-wide flag, and
-                    // llama_batch_init leaves it uninitialised. Setting only the
-                    // first entry makes the library read a garbage count for
-                    // every later token and reject the batch.
-                    batch.n_seq_id[i] = 1;
-                    batch.seq_id[i][0] = 0;
-                    // No logits wanted: the turn's own last token supplies them.
-                    batch.logits[i] = 0;
-                }
-                const int rc = llama_decode(m_impl->context, batch);
-                llama_batch_free(batch);
-                if (rc != 0) {
+            const auto contextSize = static_cast<std::size_t>(
+                std::max<std::uint32_t>(1U, llama_n_ctx(m_impl->context)));
+            if (m_impl->prefixTokens.size() >= contextSize) {
+                // The prompt alone fills the window. Decoding it would fill the
+                // cache and leave no position for a reply, so refuse before the
+                // attempt and let the caller report a prompt that is too long.
+                m_impl->prefixTokens.clear();
+                llama_memory_clear(memory, /* data */ true);
+                m_impl->prefixDirty = false;
+                prefixFailed = true;
+            } else if (!m_impl->prefixTokens.empty()) {
+                // No logits wanted from the prefix: the turn's own last token
+                // supplies them.
+                const bool decoded = decodeInBatches(m_impl->context, m_impl->prefixTokens,
+                                                     /* begin */ 0, m_impl->prefixTokens.size(),
+                                                     /* startPosition */ 0,
+                                                     /* logitsOnLast */ false);
+                if (!decoded) {
                     // A partially written prefix would leave the model reading
                     // a cache that does not match the text, so drop the partial
                     // entries and report the failure rather than continuing.
@@ -647,7 +689,9 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     bool prefixFailed = false;
     std::size_t prefixLength = applySystemPrefix(prefixFailed);
     if (prefixFailed) {
-        onComplete(false, "llama.cpp could not decode the system prompt into the context");
+        onComplete(false, "llama.cpp could not decode the system prompt into the context. It may "
+                          "be longer than the context window; shorten the prompt or raise the "
+                          "context size.");
         return;
     }
 
@@ -712,22 +756,13 @@ void LlamaCppBackend::generate(const GenerationRequest& request,
     // Decode this turn's tokens at the positions that follow the prefix.
     // Positions are explicit rather than delegated to llama_batch_get_one,
     // which always numbers a batch from 0 and would collide with the prefix.
-    const auto turnSize = static_cast<int32_t>(promptSize);
-    llama_batch promptBatch = llama_batch_init(turnSize, 0, 1);
-    promptBatch.n_tokens = turnSize;
-    for (int32_t i = 0; i < turnSize; ++i) {
-        promptBatch.token[i] = tokens[static_cast<std::size_t>(i)];
-        promptBatch.pos[i] = static_cast<llama_pos>(prefixLength + static_cast<std::size_t>(i));
-        // Per-token count, not a batch-wide flag: llama_batch_init leaves the
-        // array uninitialised and the library reads one entry per token.
-        promptBatch.n_seq_id[i] = 1;
-        promptBatch.seq_id[i][0] = 0;
-        // Only the final token's logits are needed, to sample the reply from.
-        promptBatch.logits[i] = (i == turnSize - 1) ? 1 : 0;
-    }
-    const int promptRc = llama_decode(context, promptBatch);
-    llama_batch_free(promptBatch);
-    if (promptRc != 0) {
+    // Only the final token's logits are needed, to sample the reply from. A
+    // long conversation is decoded in batch-sized chunks for the same reason
+    // the prefix is.
+    const bool promptDecoded = decodeInBatches(context, tokens, /* begin */ 0, promptSize,
+                                                static_cast<llama_pos>(prefixLength),
+                                                /* logitsOnLast */ true);
+    if (!promptDecoded) {
         llama_sampler_free(chain);
         onComplete(false, "llama.cpp failed to decode the prompt");
         return;

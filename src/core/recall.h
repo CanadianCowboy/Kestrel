@@ -20,6 +20,9 @@ struct Memory {
     std::string updatedAt;
     std::string source = "manual";
     bool sensitive = false;
+    bool pinned = false;
+    std::uint32_t confirmations = 1; // repeated user statements, not inferred truth
+    std::uint64_t supersededBy = 0; // retained audit record, excluded from retrieval
 };
 
 // Conservative heuristics, not a guarantee that all private information is
@@ -49,6 +52,10 @@ public:
     bool edit(std::uint64_t id, std::string_view text, std::string_view updatedAt,
               bool approvedSensitive = false);
     bool forget(std::uint64_t id);
+    bool setPinned(std::uint64_t id, bool pinned);
+    // Both records must be active; self-links/cycles are refused. The old record stays
+    // inspectable but can no longer compete with its explicit correction.
+    bool supersede(std::uint64_t oldId, std::uint64_t replacementId);
     void clear();
     void restore(bool enabled, std::vector<Memory> memories);
     [[nodiscard]] const std::vector<Memory>& memories() const noexcept;

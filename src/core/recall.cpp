@@ -110,10 +110,12 @@ std::uint64_t Recall::remember(MemoryKind kind, std::string_view text, std::stri
         || createdAt.size() > 64 || (sensitive && !approvedSensitive)) { return 0; }
     const std::string key = normalized(value);
     for (Memory& memory : m_memories) {
-        if (normalized(memory.text) == key && memory.kind == kind) {
+        if (memory.supersededBy == 0 && normalized(memory.text) == key && memory.kind == kind) {
             // A duplicate originating in an approved private message may never
             // downgrade that message's local-only boundary.
             memory.sensitive = memory.sensitive || sensitive || approvedSensitive;
+            if (memory.confirmations < 1000000) { ++memory.confirmations; }
+            memory.updatedAt = createdAt;
             return memory.id;
         }
     }
@@ -141,6 +143,8 @@ bool Recall::edit(std::uint64_t id, std::string_view text, std::string_view upda
         memory.updatedAt = updatedAt;
         memory.sensitive = memory.sensitive || approvedSensitive || memoryNeedsApproval(text);
         memory.source = "manual edit";
+        memory.confirmations = 1;
+        memory.supersededBy = 0;
         return true;
     }
     return false;
@@ -149,6 +153,28 @@ bool Recall::forget(std::uint64_t id) {
     const auto found = std::find_if(m_memories.begin(), m_memories.end(), [id](const Memory& memory) { return memory.id == id; });
     if (found == m_memories.end()) { return false; }
     m_memories.erase(found);
+    // Removing a correction must not silently resurrect obsolete evidence.
+    // The target remains a tombstone ID until the old record is deleted/edited.
+    return true;
+}
+bool Recall::setPinned(std::uint64_t id, bool pinned) {
+    for (auto& memory : m_memories) {
+        if (memory.id == id && memory.supersededBy == 0) { memory.pinned = pinned; return true; }
+    }
+    return false;
+}
+bool Recall::supersede(std::uint64_t oldId, std::uint64_t replacementId) {
+    if (oldId == replacementId || oldId == 0 || replacementId == 0) { return false; }
+    Memory* old = nullptr;
+    Memory* replacement = nullptr;
+    for (auto& memory : m_memories) {
+        if (memory.id == oldId) { old = &memory; }
+        if (memory.id == replacementId) { replacement = &memory; }
+    }
+    if (!old || !replacement || old->supersededBy != 0 || replacement->supersededBy != 0) { return false; }
+    old->supersededBy = replacementId;
+    old->pinned = false;
+    replacement->sensitive = replacement->sensitive || old->sensitive;
     return true;
 }
 void Recall::clear() { m_memories.clear(); }
@@ -157,7 +183,7 @@ void Recall::restore(bool enabled, std::vector<Memory> memories) {
     m_memories = std::move(memories);
     std::uint64_t largest = 0;
     for (Memory& memory : m_memories) {
-        largest = std::max(largest, memory.id);
+        largest = std::max({largest, memory.id, memory.supersededBy});
         if (memory.updatedAt.empty()) { memory.updatedAt = memory.createdAt; }
         memory.sensitive = memory.sensitive || memoryNeedsApproval(memory.text);
     }
@@ -180,7 +206,7 @@ std::vector<Memory> Recall::retrieve(std::string_view query, bool cloud, std::si
     std::vector<Candidate> candidates;
     std::vector<std::size_t> counts(words.size(), 0);
     for (const Memory& memory : m_memories) {
-        if (cloud && memory.sensitive) { continue; }
+        if (memory.supersededBy != 0 || (cloud && memory.sensitive)) { continue; }
         auto terms = tokens(memory.text);
         for (std::size_t i = 0; i < words.size(); ++i) {
             if (std::find(terms.begin(), terms.end(), words[i]) != terms.end()) { ++counts[i]; }
@@ -196,7 +222,14 @@ std::vector<Memory> Recall::retrieve(std::string_view query, bool cloud, std::si
         }
         // User-confirmed facts are a small stable profile. Episodes require a
         // real match; no random recent history for an unrelated question.
+        const bool relevant = candidate.score > 0;
         if (candidate.memory->kind == MemoryKind::Fact) { candidate.score += 0.1; }
+        if (candidate.memory->pinned) { candidate.score += 0.2; }
+        if (relevant) {
+            // Bounded reinforcement cannot let repeated irrelevant chatter
+            // displace evidence with an actual lexical match.
+            candidate.score += 0.1 * std::log(1.0 + candidate.memory->confirmations);
+        }
     }
     std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) { return a.score > b.score; }
@@ -224,6 +257,8 @@ std::string Recall::contextBlock(std::string_view query, bool cloud, std::size_t
     for (const Memory& memory : retrieve(query, cloud, kMaxMemories)) {
         const std::string line = "- id=" + std::to_string(memory.id) + " kind=" + toString(memory.kind)
             + " time=" + quoted(memory.updatedAt) + " source=" + quoted(memory.source)
+            + " confirmations=" + std::to_string(memory.confirmations)
+            + (memory.pinned ? " pinned=true" : "")
             + " text=" + quoted(memory.text) + "\n";
         if (heading.size() + lines.size() + line.size() > maxBytes) { continue; }
         lines += line;

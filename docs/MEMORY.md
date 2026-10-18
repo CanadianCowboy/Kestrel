@@ -18,22 +18,31 @@ explainable baseline, not a claim to beat external benchmarks.
   Recognized sensitive user messages require approval before persistence. Pending
   proposals exist only in process memory, are bounded, and disappear on opt-out,
   clear, or restart. Approved sensitive memories are local-only and are never
-  automatically retrieved into a cloud request. Text already typed into a cloud
-  chat is still sent to its selected provider; local-only memory does not redact
-  that chat message or earlier chat history. The manual note field also has a
+  retrieved into a remote inference request. Current inference is local-only;
+  the portable retrieval interface still enforces the local-only boundary if a
+  remote consumer is ever introduced. The manual note field also has a
   **Private / local only** checkbox to request protection regardless of screening.
 - Each record has stable ID, kind, created/updated timestamps, source label,
   sensitivity, and an approved/pending boundary (pending items never persist).
   Exact normalized duplicates reuse a record;
-  explicit edits replace it in place, with the newest text authoritative. No
-  guessed semantic conflict resolution and no silent eviction.
+  explicit edits replace it in place, with the newest text authoritative.
+  Repeated user statements increment a bounded confirmation count and update the
+  supplied timestamp; repetition is not verification of truth. Pin important
+  notes for background context. Explicit **Supersede** links an old memory to
+  its replacement: the old record remains inspectable but is excluded from
+  retrieval. Deleting a replacement does not resurrect obsolete evidence, and
+  its tombstone ID is not reassigned after restart. Supersession carries forward
+  private/local-only protection. No guessed semantic conflict resolution and no
+  silent eviction.
 - Query-aware local lexical ranking selects relevant records instead of merely
-  the newest ones. Explicitly saved facts can supply a small background profile.
-  Retrieval may return no matches. It must not infer that absent evidence is a
-  remembered fact. Lexical retrieval is not embedding-based semantic search.
+  the newest ones. Explicitly saved facts and user-pinned notes can supply a
+  small background profile. Bounded reinforcement favors repeated matching
+  evidence, not unrelated chatter. Retrieval may return no matches. It must not
+  infer that absent evidence is a remembered fact. Lexical retrieval is not embedding-based semantic search.
 - Bound prompt memory to 2,400 UTF-8 bytes and eight records. Skip items that do
   not fit instead of stopping at the first oversized item. Mark retrieved content
-  as quoted data with IDs, timestamps, and source, not system instructions. Keep
+  as quoted data with IDs, timestamps, source, confirmation counts and pin
+  status, not system instructions. Superseded records never enter this block. Keep
   the shared system prefix stable. Show the last retrieval in the Memory panel.
 - Bound stored memories to 2,000 records; each record is at most 500 UTF-8 bytes.
   Automatic capture accepts messages up to 2,000 UTF-8 bytes, split at character
@@ -44,7 +53,7 @@ explainable baseline, not a claim to beat external benchmarks.
   failure, except stopping recall (a privacy stop must take effect immediately).
   Delete/clear remove the persistent records and pending approvals. The current
   conversation may still contain the original text; forgetting a memory does not
-  delete a transcript or a provider's already-received data.
+  delete a transcript or erase already-trained adapter weights.
 
 ## Interfaces and migration
 
@@ -52,10 +61,12 @@ Extend the existing `src/core/recall.*`, `src/storage/profile.*`,
 `src/app/appcontroller.*`, and Memory panel in `src/ui/Main.qml`. Preserve the
 existing `rememberFact`, `forgetMemory`, `clearMemories`, and search interfaces;
 add approval, edit, source/updated metadata, capture notice, and last-retrieval
-properties/actions. Profile format v4 adds separately reviewed training examples
-(see [LEARNING.md](LEARNING.md)) and accepts v1/v2/v3 while preserving IDs,
-other profile fields, and explicit opt-outs. A newer or malformed profile must
-never be overwritten. Core time remains supplied by its owner.
+properties/actions, pinning and explicit supersession. Profile format v6 stores
+reinforcement counts, pins, supersession links and source-tagged training examples
+(see [LEARNING.md](LEARNING.md)). It accepts v1–v5 while preserving IDs, other
+profile fields, and explicit opt-outs; missing metadata gets conservative defaults.
+A newer or malformed profile must never be overwritten. Core time remains
+supplied by its owner.
 
 ## Evaluation
 
@@ -86,6 +97,11 @@ distinct-topic queries (median 8.67 ms, maximum 8.90 ms in that run). The unrela
 returned no records. These exact-token synthetic queries do not establish
 paraphrase recall, end-to-end model accuracy, or a speedup over another system.
 
+The reinforced/pinned/supersession implementation was rechecked on the same
+2,000-record corpus: 30/30 exact-topic top hits, median 9.23 ms and maximum
+9.80 ms in the UI-enabled Debug build. This is a correctness/latency observation,
+not a speedup claim; build conditions and machine load affect timing.
+
 Later extensions should be justified by evaluation: local embeddings for paraphrase
-recall, user-reviewed fact extraction and topic summaries, project scopes, temporal
-validity/supersession history, and independently measured end-to-end answer quality.
+recall, user-reviewed fact extraction and topic summaries, project scopes, richer
+temporal validity, and independently measured end-to-end answer quality.

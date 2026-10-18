@@ -75,6 +75,18 @@ struct ToneProfile {
     bool wry = true;
 };
 
+// The field Kestrel is tuned for. This is not a claim about what the model
+// knows: it selects the domain paragraph in the shared prompt and names the
+// material the local adapter is trained on, so the assistant and its weights
+// agree about what the specialist subject is. Astronomy covers astrophysics,
+// the instruments, and the data-reduction practice around both.
+enum class PersonaSpecialism {
+    General,
+    Astronomy,
+};
+
+[[nodiscard]] const char* toString(PersonaSpecialism specialism) noexcept;
+
 // Events the persona reacts to. These are meanings, not UI events: the app
 // decides what happened, the persona decides what, if anything, to say.
 enum class PersonaTrigger {
@@ -127,6 +139,13 @@ public:
     void setTone(ToneProfile tone) noexcept;
     [[nodiscard]] const ToneProfile& tone() const noexcept;
 
+    // The specialist field, which decides the domain paragraph in the prompt.
+    // Fixed for the session like the tone profile, because the paragraph is
+    // part of the cached prefix and a prompt that changed between turns would
+    // throw that cache away.
+    void setSpecialism(PersonaSpecialism specialism) noexcept;
+    [[nodiscard]] PersonaSpecialism specialism() const noexcept;
+
     void setState(PersonaState state) noexcept;
     [[nodiscard]] const PersonaState& state() const noexcept;
     /// Moves each dial by the given amount and clamps back into [0, 1]. This
@@ -139,6 +158,9 @@ public:
     // Built from the tone profile alone, never from the drifting dials, so it
     // is byte-identical on every turn.
     [[nodiscard]] std::string presenceLine() const;
+    /// The domain paragraph for the current specialism. Empty for General, so
+    /// a generalist Kestrel is not told to be something it is not.
+    [[nodiscard]] std::string specialismLine() const;
     /// presenceLine() plus the operating rules, as one prompt fragment.
     [[nodiscard]] std::string systemPromptFragment() const;
 
@@ -186,6 +208,7 @@ private:
     [[nodiscard]] static bool isStopWord(std::string_view word) noexcept;
 
     ToneProfile m_tone;
+    PersonaSpecialism m_specialism = PersonaSpecialism::Astronomy;
     PersonaState m_state;
     std::vector<std::string> m_recentUserMessages;
     std::size_t m_turnCount = 0;

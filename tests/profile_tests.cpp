@@ -88,6 +88,32 @@ void testRoundTripThroughTheStore() {
     }
 }
 
+void testConversationDeliveryMetadata() {
+    Profile profile = aFullProfile();
+    profile.activeConversationId = 2;
+    profile.conversations[0].messages.push_back({"tool_result", "workspace evidence", "complete", ""});
+    profile.conversations[0].messages.push_back({"assistant", "partial", "failed", "driver reset"});
+    profile.conversations[0].activity.push_back({"call", "workspace", "{}", false});
+    profile.trainingExamples.push_back({1, "load workspace", "", "<tool_call>{\"name\":\"workspace\",\"arguments\":{}}</tool_call>",
+        "2026-10-18", "tool_trace", "tool", "Qwen/Qwen3-4B-Base"});
+    Profile loaded;
+    std::string error;
+    check(Profile::fromJson(profile.toJson(), loaded, error), "delivery metadata parses: " + error);
+    check(loaded.activeConversationId == 2 && loaded.toJson() == profile.toJson(),
+          "selection, message states, failure notes and tool activity round-trip exactly");
+    check(Profile::fromJson(documentWithChecksumOf(
+        R"({"version":6,"conversations":[{"id":1,"messages":[{"role":"assistant","content":"old"}]}]})"), loaded, error)
+        && loaded.conversations[0].messages[0].status == "complete", "legacy messages default to complete");
+    for (const std::string& body : {
+        std::string(R"({"version":7,"activeConversationId":999999999999})"),
+        std::string(R"({"version":7,"conversations":[{"id":1,"messages":[{"status":"invented"}]}]})"),
+        std::string(R"({"version":7,"conversations":[{"id":1,"messages":[{"note":7}]}]})"),
+        std::string(R"({"version":7,"conversations":[{"id":1,"activity":[{"isError":"no"}]}]})")}) {
+        check(!Profile::fromJson(documentWithChecksumOf(body), loaded, error) && loaded.empty(),
+              "invalid delivery metadata refuses the whole profile");
+    }
+}
+
 void testNothingStoredIsAFirstRun() {
     InMemorySecretStore store;
     Profile loaded;
@@ -471,13 +497,18 @@ void testVersionThreeMemoryMetadataAndLegacyOptOut() {
     memory.updatedAt = "2026-10-16";
     memory.source = "conversation 2, user message 1";
     memory.sensitive = true;
+    memory.pinned = true;
+    memory.confirmations = 4;
+    memory.supersededBy = 8;
     profile.memories.push_back(memory);
     Profile loaded;
     std::string error;
     check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.loadedVersion == Profile::kCurrentVersion,
           "source-aware memory loads in the current profile format");
     check(loaded.memories.size() == 1 && loaded.memories.front().source == memory.source
-              && loaded.memories.front().updatedAt == memory.updatedAt && loaded.memories.front().sensitive,
+              && loaded.memories.front().updatedAt == memory.updatedAt && loaded.memories.front().sensitive
+              && loaded.memories.front().pinned && loaded.memories.front().confirmations == 4
+              && loaded.memories.front().supersededBy == 8,
           "source, update time, and sensitive status survive persistence");
     const std::string legacy = documentWithChecksumOf(R"({"version":2,"recallEnabled":false,"memories":[{"id":3,"kind":"fact","text":"legacy note","createdAt":"2026-10-12"}]})");
     check(Profile::fromJson(legacy, loaded, error) && !loaded.recallEnabled && loaded.loadedVersion == 2,
@@ -488,7 +519,12 @@ void testVersionThreeMemoryMetadataAndLegacyOptOut() {
             std::string(R"({"version":3,"memories":[{"id":-1,"kind":"fact","text":"bad"}]})"),
             std::string(R"({"version":3,"memories":[{"id":1,"kind":"episode","text":"bad","sensitive":"yes"}]})"),
             std::string(R"({"version":3,"memories":[{"id":1,"kind":"fact","text":"a"},{"id":1,"kind":"fact","text":"b"}]})"),
-            std::string(R"({"version":3,"memories":[{"id":1,"kind":"madeup","text":"bad"}]})")}) {
+            std::string(R"({"version":3,"memories":[{"id":1,"kind":"madeup","text":"bad"}]})"),
+            std::string(R"({"version":6,"memories":[{"id":1,"kind":"fact","text":"bad","confirmations":0}]})"),
+            std::string(R"({"version":6,"memories":[{"id":1,"kind":"fact","text":"bad","confirmations":1000001}]})"),
+            std::string(R"({"version":6,"memories":[{"id":1,"kind":"fact","text":"bad","pinned":"yes"}]})"),
+            std::string(R"({"version":6,"memories":[{"id":1,"kind":"fact","text":"bad","supersededBy":1}]})"),
+            std::string(R"({"version":6,"memories":[{"id":1,"kind":"fact","text":"bad","supersededBy":-1}]})")}) {
         check(!Profile::fromJson(documentWithChecksumOf(bad), loaded, error) && loaded.empty(),
               "invalid v3 metadata refuses the entire profile without partial loads");
     }
@@ -536,10 +572,25 @@ void testReviewedTrainingExamples() {
     profile.trainingExamples.push_back({1, "How should you greet me?", "Formal greeting", "Hey, good to see you.", "2026-10-16"});
     Profile loaded;
     std::string error;
-    check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.loadedVersion == 4,
-          "v4 reviewed training examples round-trip");
+    check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.loadedVersion == Profile::kCurrentVersion,
+          "reviewed training examples round-trip in the current profile version");
     check(loaded.trainingExamples.size() == 1 && loaded.trainingExamples.front().preferred == "Hey, good to see you."
               && loaded.toJson() == profile.toJson(), "reviewed corrections and existing profile fields are preserved");
+    profile.automaticLearningEnabled = true;
+    profile.behaviorInstructions = {"From now on keep answers short"};
+    profile.trainingExamples.front().source = "chat";
+    check(Profile::fromJson(profile.toJson(), loaded, error) && loaded.automaticLearningEnabled
+              && loaded.behaviorInstructions == profile.behaviorInstructions
+              && loaded.trainingExamples.front().source == "chat", "v5 persists opt-in, taught behavior, and chat example provenance");
+    check(Profile::fromJson(documentWithChecksumOf(R"({"version":4})"), loaded, error)
+              && !loaded.automaticLearningEnabled && loaded.behaviorInstructions.empty(),
+          "older profiles never silently opt into chat training");
+    for (const std::string& invalid : {
+        std::string(R"({"version":5,"automaticLearningEnabled":"yes"})"),
+        std::string(R"({"version":5,"behaviorInstructions":[7]})")}) {
+        check(!Profile::fromJson(documentWithChecksumOf(invalid), loaded, error) && loaded.empty(),
+              "malformed automatic-learning state is refused atomically");
+    }
     Profile onlyTraining;
     onlyTraining.trainingExamples = profile.trainingExamples;
     check(!onlyTraining.empty(), "reviewed examples alone make a profile nonempty");
@@ -560,6 +611,7 @@ void testReviewedTrainingExamples() {
 int main() {
     std::cout << "profile tests\n";
     testRoundTripThroughTheStore();
+    testConversationDeliveryMetadata();
     testNothingStoredIsAFirstRun();
     testChecksumCatchesAnAlteredDocument();
     testATruncatedDocumentIsRefused();

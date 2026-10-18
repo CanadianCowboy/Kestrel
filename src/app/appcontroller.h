@@ -38,6 +38,9 @@ class SpeechSynthesizer;
 class EchoCancelSession;
 class ListenSession;
 class UndermindClient;
+class McpServer;
+class AutomaticLearning;
+struct McpServerConfig;
 
 // How long a reply may wait for a voice to announce itself before the app stops
 // waiting and delivers it as text.
@@ -70,7 +73,13 @@ class AppController final : public QObject {
     Q_PROPERTY(ConversationModel* conversations READ conversations CONSTANT)
     Q_PROPERTY(int activeConversationId READ activeConversationId NOTIFY activeConversationChanged)
     Q_PROPERTY(QString conversationTitle READ conversationTitle NOTIFY activeConversationChanged)
+    Q_PROPERTY(QString conversationsFilePath READ conversationsFilePath CONSTANT)
+    Q_PROPERTY(QString conversationStorageError READ conversationStorageError NOTIFY conversationStorageChanged)
     Q_PROPERTY(bool generating READ generating NOTIFY generatingChanged)
+    Q_PROPERTY(bool toolRouterEnabled READ toolRouterEnabled WRITE setToolRouterEnabled NOTIFY toolRouterChanged)
+    Q_PROPERTY(bool forceToolRouter READ forceToolRouter WRITE setForceToolRouter NOTIFY toolRouterChanged)
+    Q_PROPERTY(QString instructModelPath READ instructModelPath NOTIFY toolRouterChanged)
+    Q_PROPERTY(QString generationStage READ generationStage NOTIFY toolRouterChanged)
     Q_PROPERTY(bool canRegenerate READ canRegenerate NOTIFY canRegenerateChanged)
     Q_PROPERTY(bool sidebarOpen READ sidebarOpen WRITE setSidebarOpen NOTIFY sidebarOpenChanged)
     Q_PROPERTY(QString searchQuery READ searchQuery WRITE setSearchQuery NOTIFY searchQueryChanged)
@@ -84,12 +93,23 @@ class AppController final : public QObject {
     Q_PROPERTY(QVariantList lastRecalledMemories READ lastRecalledMemories NOTIFY recallChanged)
     Q_PROPERTY(QVariantList trainingExamples READ trainingExamples NOTIFY learningChanged)
     Q_PROPERTY(QString learningNotice READ learningNotice NOTIFY learningChanged)
+    Q_PROPERTY(bool automaticLearningEnabled READ automaticLearningEnabled NOTIFY learningChanged)
+    Q_PROPERTY(QString automaticLearningStatus READ automaticLearningStatus NOTIFY learningChanged)
+    Q_PROPERTY(bool learningBusy READ learningBusy NOTIFY learningChanged)
+    Q_PROPERTY(QStringList learnedBehaviorInstructions READ learnedBehaviorInstructions NOTIFY learningChanged)
+    Q_PROPERTY(QString lastLearningEvaluation READ lastLearningEvaluation NOTIFY learningChanged)
     // Every tool call the model makes and what came back, newest last. Bounded,
     // and shown in the activity panel so tool use is visible rather than only
     // implied by a reply.
     Q_PROPERTY(QVariantList activityEntries READ activityEntries NOTIFY activityChanged)
     // Where the Undermind connection stands, for the activity panel.
     Q_PROPERTY(QString undermindStatus READ undermindStatus NOTIFY undermindChanged)
+    Q_PROPERTY(QVariantList mcpServers READ mcpServers NOTIFY mcpServersChanged)
+    Q_PROPERTY(bool localMcpRunning READ localMcpRunning NOTIFY localMcpChanged)
+    Q_PROPERTY(QString localMcpStatus READ localMcpStatus NOTIFY localMcpChanged)
+    Q_PROPERTY(QString localMcpEndpoint READ localMcpEndpoint NOTIFY localMcpChanged)
+    Q_PROPERTY(QString localMcpToken READ localMcpToken NOTIFY localMcpChanged)
+    Q_PROPERTY(bool mcpConversationAccess READ mcpConversationAccess WRITE setMcpConversationAccess NOTIFY localMcpChanged)
 
     // Runtime identity and live metrics.
     Q_PROPERTY(QString backendName READ backendName NOTIFY runtimeChanged)
@@ -123,6 +143,9 @@ class AppController final : public QObject {
     Q_PROPERTY(double presenceIntensity READ presenceIntensity NOTIFY presenceChanged)
     Q_PROPERTY(bool presenceSpeaking READ presenceSpeaking NOTIFY presenceChanged)
     Q_PROPERTY(QString personaMood READ personaMood NOTIFY presenceChanged)
+    // The field Kestrel is tuned for, shown with the mood. Fixed for the
+    // session because it is part of the cached prompt prefix.
+    Q_PROPERTY(QString specialism READ specialism CONSTANT)
     // The single status line shown under the composer: an activity whisper, or
     // an anticipatory line while one is still fresh.
     Q_PROPERTY(QString statusWhisper READ statusWhisper NOTIFY presenceChanged)
@@ -266,8 +289,7 @@ public:
     /// Returns the latest model-switch error, cleared after a successful switch.
     [[nodiscard]] QString modelError() const;
     [[nodiscard]] bool groqEnabled() const;
-    // Explicit cloud opt-in. An imported key is saved only in the OS keystore;
-    // environment credentials are session-only. Never scans the source tree.
+    // Compatibility refusal for old callers; Kestrel never reads cloud credentials.
     Q_INVOKABLE bool configureGroq(const QString& keyFileUrl = QString(),
                                   const QString& model = QStringLiteral("openai/gpt-oss-120b"));
     [[nodiscard]] bool generating() const noexcept;
@@ -299,6 +321,7 @@ public:
     [[nodiscard]] double presenceIntensity() const noexcept;
     [[nodiscard]] bool presenceSpeaking() const noexcept;
     [[nodiscard]] QString personaMood() const;
+    [[nodiscard]] QString specialism() const;
     [[nodiscard]] QString statusWhisper() const;
     [[nodiscard]] QString acknowledgement() const noexcept;
     [[nodiscard]] QString ambientThought() const;
@@ -424,6 +447,15 @@ public:
     Q_INVOKABLE QVariantMap latestTrainingTurn() const;
     [[nodiscard]] QVariantList trainingExamples() const;
     [[nodiscard]] QString learningNotice() const { return m_learningNotice; }
+    [[nodiscard]] bool automaticLearningEnabled() const { return m_automaticLearningEnabled; }
+    [[nodiscard]] QString automaticLearningStatus() const;
+    [[nodiscard]] QString lastLearningEvaluation() const;
+    [[nodiscard]] bool learningBusy() const;
+    Q_INVOKABLE bool setAutomaticLearningEnabled(bool enabled);
+    Q_INVOKABLE void resetLearnedBehavior();
+    // Explicit-owner timer, not IdlePersona work: opt-in covers local files,
+    // GPU training and adapter changes, never network or command tools.
+    void considerAutomaticLearning();
     Q_INVOKABLE bool rememberFact(const QString& text);
     Q_INVOKABLE bool rememberPrivateFact(const QString& text);
     Q_INVOKABLE bool editMemory(qlonglong id, const QString& text);
@@ -438,7 +470,29 @@ public:
     Q_INVOKABLE void connectUndermind();
     void autoConnectUndermind();
     [[nodiscard]] QString undermindStatus() const;
+
+    // Multi-server MCP client management (CIMD + RFC 9728/8414 OAuth or Bearer).
+    [[nodiscard]] QVariantList mcpServers() const;
+    Q_INVOKABLE bool addMcpServer(const QString& name, const QString& mcpUrl,
+                                  const QString& bearerToken = QString());
+    Q_INVOKABLE bool removeMcpServer(const QString& id);
+    Q_INVOKABLE void connectMcpServer(const QString& id);
+
+    // Kestrel's own loopback MCP server management.
+    void attachLocalMcpServer(McpServer* server);
+    [[nodiscard]] bool localMcpRunning() const;
+    [[nodiscard]] QString localMcpStatus() const;
+    [[nodiscard]] QString localMcpEndpoint() const;
+    [[nodiscard]] QString localMcpToken() const;
+    [[nodiscard]] bool mcpConversationAccess() const;
+    void setMcpConversationAccess(bool allowed);
+    Q_INVOKABLE bool startLocalMcpServer(int port = 47600);
+    Q_INVOKABLE void stopLocalMcpServer();
     Q_INVOKABLE void forgetMemory(qlonglong id);
+    Q_INVOKABLE bool pinMemory(qlonglong id, bool pinned);
+    Q_INVOKABLE bool supersedeMemory(qlonglong oldId, qlonglong replacementId);
+    [[nodiscard]] QStringList learnedBehaviorInstructions() const;
+    Q_INVOKABLE bool forgetBehaviorInstruction(int index);
     Q_INVOKABLE void clearMemories();
     Q_INVOKABLE QVariantList searchMemories(const QString& query) const;
     // The keystore recall is kept in. Without one, recall cannot be turned on,
@@ -447,6 +501,16 @@ public:
     [[nodiscard]] bool recallEnabled() const;
     [[nodiscard]] QVariantList recallMemories() const;
     [[nodiscard]] QString recallError() const;
+    [[nodiscard]] bool toolRouterEnabled() const { return m_toolRouterEnabled; }
+    void setToolRouterEnabled(bool enabled);
+    [[nodiscard]] bool forceToolRouter() const { return m_forceToolRouter; }
+    void setForceToolRouter(bool force);
+    [[nodiscard]] QString instructModelPath() const { return m_instructModelPath; }
+    [[nodiscard]] QString generationStage() const { return m_generationStage; }
+    Q_INVOKABLE bool configureInstructModel(const QString& url);
+    // Where the inspectable conversation log is mirrored on disk.
+    [[nodiscard]] QString conversationsFilePath() const;
+    [[nodiscard]] QString conversationStorageError() const { return m_conversationStorageError; }
     Q_INVOKABLE void regenerateLastResponse();
     Q_INVOKABLE void copyToClipboard(const QString& text) const;
     /// Loads a GGUF on a worker thread and switches the app onto it when ready. Takes the URL a
@@ -479,6 +543,8 @@ public:
 
 signals:
     void activeConversationChanged();
+    void conversationStorageChanged();
+    void toolRouterChanged();
     void generatingChanged();
     void canRegenerateChanged();
     void sidebarOpenChanged();
@@ -499,6 +565,8 @@ signals:
     void learningChanged();
     void activityChanged();
     void undermindChanged();
+    void mcpServersChanged();
+    void localMcpChanged();
     /// Notifies observers that audio availability or playback state changed.
     void ttsChanged();
     /// Notifies observers that listening state or the partial transcript changed.
@@ -513,6 +581,9 @@ private:
     void recordToolResult(const QString& name, const QString& text, bool isError);
     void recordActivity(const QString& kind, const QString& name, const QString& text, bool isError);
     void continueAfterTool();
+    /// Ends a turn whose tool loop stopped making progress, in the assistant row
+    /// the user is reading rather than in a fresh bubble after it.
+    void stopToolLoop(const QString& note);
 
     // The idle thought cycle, driven by m_idleTimer. Silent whenever the user
     // is present: a turn is running, the voice is live, or something is typed
@@ -694,6 +765,14 @@ private:
     QString m_recallError = QStringLiteral("Recall needs the system keystore, so Kestrel cannot store anything.");
     void loadRecall();
     bool persistRecall();
+    void persistConversations();
+    void loadConversationsFromMirror();
+    [[nodiscard]] std::vector<storage::StoredConversation> storedConversations() const;
+    void applyStoredConversations(const std::vector<storage::StoredConversation>& stored, int activeId = 0);
+    QTimer m_conversationSaveTimer;
+    bool m_historyReady = false;
+    bool m_historyWritable = true;
+    QString m_conversationStorageError;
     void captureUserMemory(const QString& text);
     bool storeMemoryText(const QString& text, core::MemoryKind kind, const QString& source,
                          bool approvedSensitive = false, qlonglong editId = 0);
@@ -712,6 +791,24 @@ private:
     QString m_memoryNotice;
     std::vector<storage::StoredTrainingExample> m_trainingExamples;
     QString m_learningNotice;
+    bool m_automaticLearningEnabled = false;
+    std::vector<std::string> m_behaviorInstructions;
+    AutomaticLearning* m_automaticLearning = nullptr;
+    QTimer m_learningTimer;
+    QElapsedTimer m_learningIdleClock;
+    QString m_lastLearningDigest;
+    QString m_lastToolLearningDigest;
+    QString m_learningStage = QStringLiteral("persona");
+    QString m_learningModelPath;
+    QString m_learningPreviousAdapter;
+    QString m_pendingLearnedAdapter;
+    bool m_learningReload = false;
+    void initializeAutomaticLearning();
+    void captureTeaching(const QString& text);
+    void captureLearningTurn();
+    bool appendLearningExample(const QString& prompt, const QString& preferred,
+                               const QString& rejected = QString(), bool teaching = false);
+    void refreshLearnedBehaviorPrompt();
     core::IdlePersona m_idle;
     // The permission boundary for anything the loop does on its own. Held by
     // value: it is small, and sharing one would let a tool grant itself a
@@ -727,12 +824,38 @@ private:
     core::McpDispatcher* m_agentTools = nullptr;
     bool m_mcpEndpointRunning = false;
     int m_toolRounds = 0;
+    quint64 m_toolTurnEpoch = 0;
+    bool m_toolRouterEnabled = false;
+    bool m_forceToolRouter = false;
+    bool m_routingStage = false;
+    bool m_stageModelLoading = false;
+    QString m_instructModelPath;
+    QString m_personaModelPath;
+    QString m_generationStage;
+    QString m_turnPrompt;
+    void queueTurnStage(bool routing);
+    void launchTurnStage(bool routing);
+    bool activateStageAdapter(bool routing);
+    void setGenerationStage(const QString& stage, const QString& reason);
+    // Fingerprint (name and arguments) of the last call this turn, so an
+    // identical repeat is not executed again. A small model that repeats a call
+    // will otherwise repeat it until the round cap on every turn.
+    std::string m_lastToolCall;
+    QString m_pendingToolTrainingPrompt;
+    QString m_pendingToolTrainingCall;
+    void captureSuccessfulToolTrace(bool isError, const QString& result);
     QVariantList m_activity;
     UndermindClient* m_undermind = nullptr;
+    std::vector<UndermindClient*> m_extraMcpServers;
+    McpServer* m_localMcpServer = nullptr;
+    QString m_localMcpError;
     void ensureUndermindClient();
     void registerUndermindTools(const QJsonArray& tools);
     void disableUndermindTools();
     void onUndermindStatusChanged();
+    void registerRemoteServerCapabilities(UndermindClient* client);
+    void disableRemoteServerCapabilities(const QString& serverId);
+    void registerBuiltInMcpCapabilities();
     // The text a permissioned tool produced, accumulated from its own tokens.
     // It cannot come out of the streaming path, which only keeps the active
     // request, and it cannot be read back off the transcript, whose last row

@@ -16,10 +16,21 @@ struct ModelToolCall {
     std::string argumentsJson;
 };
 
-// Returns the first complete tool call in `text`, or nullopt. A malformed or
-// unterminated call is not a call: it is left as ordinary text rather than
-// guessed at, so a model that is still writing never triggers a tool early.
+// Returns the first complete tool-call JSON payload in `text`, or nullopt.
+// Accepts a leading bare object or a tagged payload. Once the JSON object is
+// whole, a closing tag is optional (some models emit it as a special EOG token).
+// Incomplete or malformed JSON never triggers a tool early.
 [[nodiscard]] std::optional<ModelToolCall> findModelToolCall(std::string_view text);
+
+// True while a leading JSON object is incomplete (including leading whitespace).
+// Used to withhold potential tool calls without mistaking a nested or quoted
+// closing brace for the end of the object.
+[[nodiscard]] bool modelReplyNeedsMoreJson(std::string_view text);
+
+// Conservative local routing hint, not an authorization decision. Capability
+// questions and ordinary chat bypass the tool stage unless explicitly forced.
+[[nodiscard]] bool shouldRouteTools(std::string_view prompt, bool hasEnabledTools, bool force = false);
+[[nodiscard]] bool needsInstructSynthesis(std::string_view prompt, int toolRounds);
 
 struct WebSearchHit {
     std::string title;

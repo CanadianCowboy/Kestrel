@@ -125,6 +125,13 @@ ApplicationWindow {
         }
     }
 
+    FileDialog {
+        id: instructModelDialog
+        title: "Choose the optional instruct-tuned Qwen3 GGUF"
+        nameFilters: ["GGUF models (*.gguf)"]
+        onAccepted: appController.configureInstructModel(selectedFile.toString())
+    }
+
     Shortcut { sequence: "Ctrl+N"; onActivated: appController.newConversation() }
     Shortcut { sequence: "Ctrl+K"; onActivated: composer.forceActiveFocus() }
     // The memory panel and the runtime panel share the right-hand edge, so only
@@ -291,26 +298,51 @@ ApplicationWindow {
                             anchors.fill: parent
                             anchors.margins: 13
                             spacing: 7
-                            Text { text: appController.groqEnabled ? "CLOUD RUNTIME" : "LOCAL RUNTIME"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
+                            Text { text: "LOCAL RUNTIME"; color: window.muted; font.pixelSize: 10; font.letterSpacing: 1.4 }
                             Row {
                                 spacing: 8
                                 Rectangle { width: 7; height: 7; radius: 4; color: window.accent; anchors.verticalCenter: parent.verticalCenter }
                                 Text { text: appController.modelName; color: window.ink; font.pixelSize: 12; width: runtimeColumn.width - 20; elide: Text.ElideRight }
                             }
                             Text { text: appController.backendName; color: window.muted; font.pixelSize: 11 }
-                            Button {
-                                objectName: "groqSettingsButton"
-                                text: "Groq cloud…"
-                                onClicked: groqDialog.open()
-                            }
                             Row {
                                 spacing: 8
                                 visible: appController.canLoadModel
                                 Button {
                                     id: loadModelButton
-                                    text: appController.modelPath.length > 0 ? "Change model" : "Load model"
+                                    text: "Choose a different local model…"
                                     onClicked: modelDialog.open()
                                 }
+                            }
+                            CheckBox {
+                                objectName: "toolRouterToggle"
+                                text: "Two-stage tool router"
+                                checked: appController.toolRouterEnabled
+                                enabled: !appController.generating
+                                onToggled: appController.toolRouterEnabled = checked
+                            }
+                            Button {
+                                objectName: "chooseInstructButton"
+                                text: "Choose Instruct router GGUF…"
+                                enabled: !appController.generating
+                                onClicked: instructModelDialog.open()
+                            }
+                            CheckBox {
+                                objectName: "forceToolRouterToggle"
+                                text: "Force router on next turn"
+                                checked: appController.forceToolRouter
+                                enabled: appController.toolRouterEnabled
+                                onToggled: appController.forceToolRouter = checked
+                            }
+                            Text {
+                                objectName: "generationStageLabel"
+                                visible: appController.toolRouterEnabled && appController.generationStage.length > 0
+                                text: appController.generationStage
+                                textFormat: Text.PlainText
+                                color: window.accent
+                                width: parent.width
+                                wrapMode: Text.Wrap
+                                font.pixelSize: 11
                             }
                             Text {
                                 visible: appController.modelError.length > 0
@@ -320,6 +352,15 @@ ApplicationWindow {
                                 wrapMode: Text.Wrap
                                 // A plain Column gives no layout width, and
                                 // Text.Wrap cannot wrap without one.
+                                width: parent.width
+                            }
+                            Text {
+                                objectName: "conversationStorageErrorLabel"
+                                visible: appController.conversationStorageError.length > 0
+                                text: appController.conversationStorageError
+                                color: "#c08a95"
+                                font.pixelSize: 11
+                                wrapMode: Text.Wrap
                                 width: parent.width
                             }
                             Text {
@@ -400,6 +441,7 @@ ApplicationWindow {
                         ToolTip.visible: presenceHover.containsMouse
                         ToolTip.text: "Kestrel is " + appController.presenceState
                                       + " · " + appController.personaMood
+                                      + " · " + appController.specialism + " specialist"
                         ToolTip.delay: 400
                         MouseArea {
                             id: presenceHover
@@ -634,7 +676,8 @@ ApplicationWindow {
                                 }
                             }
                             Text {
-                                text: appController.statusWhisper
+                                text: appController.toolRouterEnabled && appController.generationStage.length > 0
+                                      ? appController.generationStage : appController.statusWhisper
                                 color: window.muted
                                 font.pixelSize: 11
                             }
@@ -1230,6 +1273,229 @@ ApplicationWindow {
                     }
                 }
 
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: localMcpCol.implicitHeight + 16
+                    radius: 10
+                    color: "#1b1e25"
+                    border.color: window.line
+                    ColumnLayout {
+                        id: localMcpCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Text {
+                                objectName: "localMcpStatusText"
+                                text: "Local MCP endpoint: " + appController.localMcpStatus
+                                color: window.ink
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                            Rectangle {
+                                visible: appController.localMcpRunning
+                                implicitWidth: 74
+                                implicitHeight: 24
+                                radius: 12
+                                color: "#1d2026"
+                                border.color: window.line
+                                Text { anchors.centerIn: parent; text: "Copy token"; color: window.ink; font.pixelSize: 10 }
+                                MouseArea {
+                                    objectName: "copyLocalMcpTokenButton"
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: appController.copyToClipboard(appController.localMcpToken)
+                                }
+                            }
+                            Rectangle {
+                                implicitWidth: 88
+                                implicitHeight: 24
+                                radius: 12
+                                color: "#1d2026"
+                                border.color: window.line
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: appController.localMcpRunning ? "Stop server" : "Start server"
+                                    color: window.accent
+                                    font.pixelSize: 10
+                                }
+                                MouseArea {
+                                    objectName: "toggleLocalMcpButton"
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        if (appController.localMcpRunning)
+                                            appController.stopLocalMcpServer()
+                                        else
+                                            appController.startLocalMcpServer(0)
+                                    }
+                                }
+                            }
+                        }
+                        TextField {
+                            objectName: "localMcpEndpointField"
+                            Layout.fillWidth: true
+                            visible: appController.localMcpRunning
+                            text: appController.localMcpEndpoint
+                            readOnly: true
+                            selectByMouse: true
+                            font.pixelSize: 11
+                            color: window.ink
+                            Accessible.name: "Local MCP endpoint URL"
+                            background: Rectangle { radius: 6; color: "#15171c"; border.color: window.line }
+                        }
+                        CheckBox {
+                            objectName: "mcpConversationAccessCheckBox"
+                            text: "Allow MCP to read conversations and non-sensitive memories"
+                            checked: appController.mcpConversationAccess
+                            onToggled: appController.mcpConversationAccess = checked
+                            Layout.fillWidth: true
+                            contentItem: Text {
+                                text: parent.text
+                                color: window.ink
+                                font.pixelSize: 10
+                                wrapMode: Text.WordWrap
+                                leftPadding: parent.indicator.width + parent.spacing
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: addServerCol.implicitHeight + 16
+                    radius: 10
+                    color: "#1b1e25"
+                    border.color: window.line
+                    ColumnLayout {
+                        id: addServerCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        spacing: 6
+                        Text {
+                            text: "Add MCP server for this session (CIMD OAuth or Bearer)"
+                            color: "#8b93a3"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            TextField {
+                                id: mcpServerNameInput
+                                objectName: "mcpServerNameInput"
+                                Layout.preferredWidth: 96
+                                placeholderText: "Name"
+                                font.pixelSize: 11
+                                color: window.ink
+                                background: Rectangle { radius: 6; color: "#15171c"; border.color: window.line }
+                            }
+                            TextField {
+                                id: mcpServerUrlInput
+                                objectName: "mcpServerUrlInput"
+                                Layout.fillWidth: true
+                                placeholderText: "https://mcp.example.com/mcp"
+                                font.pixelSize: 11
+                                color: window.ink
+                                background: Rectangle { radius: 6; color: "#15171c"; border.color: window.line }
+                            }
+                            Rectangle {
+                                implicitWidth: 52
+                                implicitHeight: 26
+                                radius: 13
+                                color: "#1d2026"
+                                border.color: window.line
+                                Text { anchors.centerIn: parent; text: "Add"; color: window.accent; font.pixelSize: 11 }
+                                MouseArea {
+                                    objectName: "addMcpServerButton"
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        if (appController.addMcpServer(mcpServerNameInput.text, mcpServerUrlInput.text, mcpBearerTokenInput.text)) {
+                                            mcpServerNameInput.text = ""
+                                            mcpServerUrlInput.text = ""
+                                            mcpBearerTokenInput.text = ""
+                                            mcpAddError.text = ""
+                                        } else {
+                                            mcpAddError.text = "Use a unique name and HTTPS URL (HTTP is allowed only for loopback). No credentials or fragments in the URL."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        TextField {
+                            id: mcpBearerTokenInput
+                            objectName: "mcpBearerTokenInput"
+                            Layout.fillWidth: true
+                            placeholderText: "Optional Bearer token (kept in memory for this session)"
+                            echoMode: TextInput.Password
+                            selectByMouse: true
+                            font.pixelSize: 11
+                            color: window.ink
+                            background: Rectangle { radius: 6; color: "#15171c"; border.color: window.line }
+                        }
+                        Text {
+                            id: mcpAddError
+                            objectName: "mcpAddErrorText"
+                            Layout.fillWidth: true
+                            visible: text.length > 0
+                            color: "#e59aa8"
+                            font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                        }
+                        Repeater {
+                            model: appController.mcpServers
+                            delegate: RowLayout {
+                                required property var modelData
+                                visible: modelData.removable
+                                Layout.fillWidth: true
+                                spacing: 6
+                                Text {
+                                    text: modelData.name + " · " + modelData.status
+                                    textFormat: Text.PlainText
+                                    color: "#8b93a3"
+                                    font.pixelSize: 10
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Rectangle {
+                                    implicitWidth: 64
+                                    implicitHeight: 22
+                                    radius: 11
+                                    color: "#1d2026"
+                                    border.color: window.line
+                                    Text { anchors.centerIn: parent; text: "Connect"; color: window.accent; font.pixelSize: 10 }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: appController.connectMcpServer(modelData.id)
+                                    }
+                                }
+                                Rectangle {
+                                    implicitWidth: 22
+                                    implicitHeight: 22
+                                    radius: 11
+                                    color: "#1d2026"
+                                    border.color: window.line
+                                    Text { anchors.centerIn: parent; text: "×"; color: window.ink; font.pixelSize: 11 }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: appController.removeMcpServer(modelData.id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Text {
                     Layout.fillWidth: true
                     text: "Tool calls appear here as the model makes them. Each shows the arguments it sent and the output it got back."
@@ -1493,6 +1759,9 @@ ApplicationWindow {
                             Text {
                                 Layout.fillWidth: true
                                 text: modelData.kind + (modelData.sensitive ? " · private/local-only" : "")
+                                    + (modelData.pinned ? " · pinned" : "")
+                                    + " · reinforced " + modelData.confirmations + "×"
+                                    + (modelData.supersededBy > 0 ? " · superseded by #" + modelData.supersededBy : "")
                                     + " · " + modelData.updatedAt + " · " + modelData.source
                                 textFormat: Text.PlainText
                                 wrapMode: Text.WordWrap
@@ -1522,6 +1791,28 @@ ApplicationWindow {
                                 onClicked: appController.editMemory(modelData.id, memoryEdit.text)
                             }
                             Button {
+                                objectName: "pinMemoryButton"
+                                text: modelData.pinned ? "Unpin" : "Pin important memory"
+                                enabled: modelData.supersededBy === 0
+                                onClicked: appController.pinMemory(modelData.id, !modelData.pinned)
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                TextField {
+                                    id: replacementMemoryId
+                                    Layout.fillWidth: true
+                                    objectName: "replacementMemoryIdField"
+                                    placeholderText: "Replacement memory ID"
+                                    validator: IntValidator { bottom: 1 }
+                                }
+                                Button {
+                                    objectName: "supersedeMemoryButton"
+                                    text: "Supersede"
+                                    enabled: replacementMemoryId.acceptableInput && modelData.supersededBy === 0
+                                    onClicked: appController.supersedeMemory(modelData.id, Number(replacementMemoryId.text))
+                                }
+                            }
+                            Button {
                                 objectName: "forgetMemoryButton"
                                 text: "Forget"
                                 implicitHeight: 26
@@ -1535,7 +1826,7 @@ ApplicationWindow {
 
                     Text {
                         Layout.fillWidth: true
-                        text: "Behavior learning · " + appController.trainingExamples.length + " reviewed examples"
+                        text: "Learning from chat · " + appController.trainingExamples.length + " local examples"
                         color: window.ink
                         font.pixelSize: 13
                         font.weight: Font.DemiBold
@@ -1543,11 +1834,80 @@ ApplicationWindow {
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: "Memory is not weight training. Review a prompt and the answer you wanted, then save explicitly. Keep private facts out: deleting an example cannot undo a trained adapter. No automatic training or uploads."
+                        text: "Teach Kestrel by chatting: ‘from now on, keep answers short’ or ‘when I ask for X, say Y’. With your one-time permission, ordinary conversations also become local training examples. Sensitive text is screened, never uploaded. Screening is not perfect; deleting chat cannot untrain weights. Local updates run automatically while you are away and are evaluated before activation."
                         color: window.muted
                         font.pixelSize: 11
                         wrapMode: Text.WordWrap
                     }
+                    CheckBox {
+                        objectName: "automaticLearningCheckBox"
+                        text: "Learn automatically from my conversations (local only)"
+                        checked: appController.automaticLearningEnabled
+                        onToggled: appController.setAutomaticLearningEnabled(checked)
+                        Layout.fillWidth: true
+                        contentItem: Text {
+                            text: parent.text
+                            color: window.ink
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                            leftPadding: parent.indicator.width + parent.spacing
+                        }
+                    }
+                    Text {
+                        objectName: "automaticLearningStatusText"
+                        Layout.fillWidth: true
+                        text: appController.automaticLearningStatus
+                        color: window.accent
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 11
+                    }
+                    Text {
+                        objectName: "lastLearningEvaluationText"
+                        Layout.fillWidth: true
+                        text: appController.lastLearningEvaluation
+                        visible: text.length > 0
+                        color: window.muted
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 11
+                    }
+                    Repeater {
+                        model: appController.learnedBehaviorInstructions
+                        delegate: RowLayout {
+                            required property string modelData
+                            required property int index
+                            Layout.fillWidth: true
+                            Text {
+                                Layout.fillWidth: true
+                                text: modelData
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: window.ink
+                                font.pixelSize: 11
+                            }
+                            Button {
+                                objectName: "forgetBehaviorInstructionButton"
+                                text: "Forget preference"
+                                onClicked: appController.forgetBehaviorInstruction(index)
+                            }
+                        }
+                    }
+                    Button {
+                        objectName: "resetLearnedBehaviorButton"
+                        text: "Reset learned behavior"
+                        onClicked: resetLearningDialog.open()
+                    }
+                    Button {
+                        id: advancedLearningToggle
+                        objectName: "advancedLearningToggle"
+                        property bool expanded: false
+                        text: expanded ? "Hide advanced review" : "Advanced review…"
+                        onClicked: expanded = !expanded
+                    }
+                    ColumnLayout {
+                    visible: advancedLearningToggle.expanded
+                    Layout.fillWidth: true
                     Button {
                         objectName: "reviewLatestTrainingButton"
                         text: "Review latest chat answer"
@@ -1619,7 +1979,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Text {
                                 Layout.fillWidth: true
-                                text: "#" + modelData.id + " · " + modelData.prompt + "\nPreferred: " + modelData.preferred
+                                text: "#" + modelData.id + " · " + modelData.source + " · " + modelData.prompt + "\nPreferred: " + modelData.preferred
                                 textFormat: Text.PlainText
                                 wrapMode: Text.WordWrap
                                 color: window.ink
@@ -1643,14 +2003,17 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Button {
                             objectName: "loadLoraAdapterButton"
+                            visible: false
                             text: "Load GGUF LoRA…"
                             onClicked: loraAdapterDialog.open()
                         }
                         Button {
                             objectName: "removeLoraAdapterButton"
-                            text: "Remove LoRA"
+                            text: "Roll back learned weights"
                             onClicked: appController.applyLoraAdapter("")
                         }
+                    }
+
                     }
 
                     // Clearing everything takes two presses, so a stray click
@@ -2426,60 +2789,17 @@ ApplicationWindow {
     }
 
     Dialog {
-        id: groqDialog
-        objectName: "groqSettingsDialog"
+        id: resetLearningDialog
+        title: "Reset learned behavior?"
+        modal: true
         anchors.centerIn: parent
         width: Math.min(440, window.width - 40)
-        modal: true
-        title: "Groq cloud inference"
-        standardButtons: Dialog.Close
-        padding: 20
-        background: Rectangle { radius: 16; color: window.panelRaised; border.color: window.line }
-        header: Text {
-            text: groqDialog.title
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: appController.resetLearnedBehavior()
+        contentItem: Text {
+            text: "Stop automatic learning, delete stored examples and taught preferences, and remove the active learned adapter. Previously exported files are not deleted."
+            wrapMode: Text.WordWrap
             color: window.ink
-            font.pixelSize: 16
-            padding: 20
-        }
-        ColumnLayout {
-            width: parent.width
-            spacing: 12
-            Text {
-                Layout.fillWidth: true
-                text: "Cloud chats send your conversation, Kestrel instructions, and tool results to Groq. Local models remain available via Load model. Idle warmup and background session summaries do not use Groq."
-                color: window.ink
-                wrapMode: Text.Wrap
-            }
-            ComboBox {
-                id: groqModel
-                Layout.fillWidth: true
-                model: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
-            }
-            Button {
-                objectName: "groqUseConfiguredButton"
-                text: "Use Groq with configured key"
-                onClicked: {
-                    if (appController.configureGroq("", groqModel.currentText))
-                        groqDialog.close()
-                }
-            }
-            Button {
-                text: "Import API key file…"
-                onClicked: groqKeyDialog.open()
-            }
-            Text {
-                Layout.fillWidth: true
-                text: "Imported keys are saved in your OS keystore, never in app settings. Alternatively set GROQ_API_KEY or GROQ_API_KEY_FILE for this session."
-                color: window.muted
-                wrapMode: Text.Wrap
-            }
-            Text {
-                Layout.fillWidth: true
-                visible: appController.modelError.length > 0
-                text: appController.modelError
-                color: "#c08a95"
-                wrapMode: Text.Wrap
-            }
         }
     }
 
@@ -2498,16 +2818,6 @@ ApplicationWindow {
         nameFilters: ["Training dataset (*.jsonl)"]
         defaultSuffix: "jsonl"
         onAccepted: appController.exportTrainingExamples(selectedFile.toString())
-    }
-
-    FileDialog {
-        id: groqKeyDialog
-        title: "Choose a plain-text Groq API key file"
-        nameFilters: ["Text files (*.txt *.kestrel-key)", "All files (*)"]
-        onAccepted: {
-            if (appController.configureGroq(selectedFile.toString(), groqModel.currentText))
-                groqDialog.close()
-        }
     }
 
     FileDialog {

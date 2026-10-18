@@ -55,6 +55,7 @@ void GenerationWorker::start(quint64 requestId,
                 }
             };
             bool succeeded = false;
+            bool stoppedForToolCall = false;
             QString failure = QStringLiteral("Backend returned without completion");
 
             // Emit on the worker thread. Receivers queue the signals to the UI;
@@ -63,19 +64,49 @@ void GenerationWorker::start(quint64 requestId,
             // across native token pieces rather than decoding each in isolation.
             m_backend->generate(
                 request,
-                [this, &written, &emitted, &sawCall, kOpenTag, emitSlice](std::string_view token) {
-                    if (m_cancelRequested.load(std::memory_order_acquire)) {
+                [this, &written, &emitted, &sawCall, &stoppedForToolCall, kOpenTag, emitSlice](std::string_view token) {
+                    if (m_cancelRequested.load(std::memory_order_acquire) || stoppedForToolCall) {
                         return;
                     }
                     written.append(token.data(), token.size());
+                    const auto checkCompleteCall = [this, &written, &emitted, &stoppedForToolCall]() {
+                        if (auto call = core::findModelToolCall(std::string_view(written).substr(emitted))) {
+                            // Stop the backend as soon as the tool call is whole so
+                            // the tool executes immediately instead of waiting for
+                            // trailing tokens the model would otherwise invent.
+                            std::lock_guard<std::mutex> lock(m_toolCallMutex);
+                            m_toolCall = std::move(call);
+                            stoppedForToolCall = true;
+                            m_backend->cancel();
+                            return true;
+                        }
+                        return false;
+                    };
                     if (sawCall) {
+                        checkCompleteCall();
                         return;
+                    }
+                    // A base model often writes the call as a bare JSON object
+                    // rather than in the tagged form. A reply that starts with
+                    // an object is held until the object closes, so it is either
+                    // executed or shown as the text it is: streaming it as prose
+                    // and then acting on it would show an answer that is later
+                    // replaced. Only the reply's first object is considered.
+                    if (emitted == 0) {
+                        if (checkCompleteCall()) {
+                            sawCall = true;
+                            return;
+                        }
+                        if (core::modelReplyNeedsMoreJson(written)) {
+                            return;
+                        }
                     }
                     const std::size_t open = written.find(kOpenTag, emitted);
                     if (open != std::string::npos) {
                         emitSlice(std::string_view(written).substr(emitted, open - emitted));
                         emitted = open;
                         sawCall = true;
+                        checkCompleteCall();
                         return;
                     }
                     std::size_t safe = written.size();
@@ -93,8 +124,18 @@ void GenerationWorker::start(quint64 requestId,
                     succeeded = success;
                     failure = QString::fromUtf8(error.data(), error.size());
                 });
-            if (sawCall) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(m_toolCallMutex);
+                m_toolCall.reset();
+                succeeded = false;
+                failure = QStringLiteral("Generation stopped");
+            } else if (stoppedForToolCall) {
+                succeeded = true;
+                failure.clear();
+            } else if (sawCall) {
                 if (auto call = core::findModelToolCall(std::string_view(written).substr(emitted))) {
+                    // Nothing after a call is shown, so a model that appends a
+                    // made-up result to its own call cannot present it as real.
                     std::lock_guard<std::mutex> lock(m_toolCallMutex);
                     m_toolCall = std::move(call);
                 }

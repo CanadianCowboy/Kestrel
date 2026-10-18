@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/conversation.h"
+#include "storage/profile.h"
 
 namespace kestrel::app {
 
@@ -32,6 +33,7 @@ struct ConversationEntry {
     core::Conversation conversation;
     std::vector<MessageExtra> extras;
     QDateTime updatedAt;
+    std::vector<storage::StoredActivity> activity;
 };
 
 } // namespace kestrel::app

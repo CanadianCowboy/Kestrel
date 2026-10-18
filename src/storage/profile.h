@@ -16,6 +16,15 @@ struct StoredMessage {
     // is not this program.
     std::string role;
     std::string content;
+    std::string status = "complete";
+    std::string note = {};
+};
+
+struct StoredActivity {
+    std::string kind;
+    std::string name;
+    std::string text;
+    bool isError = false;
 };
 
 // One conversation as it is kept between sessions.
@@ -28,6 +37,7 @@ struct StoredConversation {
     // reading the document.
     std::string updatedAt;
     std::vector<StoredMessage> messages;
+    std::vector<StoredActivity> activity;
 };
 
 // One thing Kestrel remembers across sessions, as it is kept.
@@ -42,15 +52,21 @@ struct StoredMemory {
     std::string updatedAt;
     std::string source = "manual";
     bool sensitive = false;
+    bool pinned = false;
+    std::int64_t confirmations = 1;
+    std::int64_t supersededBy = 0;
 };
 
-// Explicitly reviewed behavior examples, never harvested from memory or chats.
+// Local behavior examples: manually reviewed or captured after explicit chat-learning consent.
 struct StoredTrainingExample {
     std::int64_t id = 0;
     std::string prompt;
     std::string rejected;
     std::string preferred;
     std::string createdAt;
+    std::string source = "reviewed"; // reviewed, teaching, chat, or successful tool_trace
+    std::string adapterStage = "persona";
+    std::string baseModel = "Qwen/Qwen3-4B-Base";
 };
 
 // Everything Kestrel knows about you, in one document.
@@ -76,9 +92,9 @@ struct StoredTrainingExample {
 // something they can see in the file.
 class Profile {
 public:
-    // Version 4 adds separately reviewed training examples. Older readers must
-    // refuse it rather than silently dropping the learning dataset.
-    static constexpr std::int64_t kCurrentVersion = 4;
+    // Version 7 preserves message delivery metadata, tool activity and selection.
+    // Old readers must not silently discard these fields.
+    static constexpr std::int64_t kCurrentVersion = 7;
     // Reader metadata, not a stored field. Distinguishes a fresh profile from
     // an older profile whose explicit disabled state must remain disabled.
     std::int64_t loadedVersion = 0; // Zero means no stored document was found.
@@ -95,6 +111,7 @@ public:
     std::string systemPrompt;
 
     std::vector<StoredConversation> conversations;
+    int activeConversationId = 0;
 
     // Saved recall choice. The desktop initializes fresh secure profiles to on;
     // the parser defaults missing legacy choices to off to preserve opt-outs.
@@ -105,10 +122,14 @@ public:
     std::vector<StoredMemory> memories;
     // At most 1000 examples; each text field is limited to 4000 UTF-8 bytes.
     std::vector<StoredTrainingExample> trainingExamples;
+    bool automaticLearningEnabled = false;
+    std::vector<std::string> behaviorInstructions; // bounded, user-authored, screened
+
 
     [[nodiscard]] bool empty() const {
         return modelPath.empty() && systemPrompt.empty() && conversations.empty()
-            && !recallEnabled && memories.empty() && trainingExamples.empty();
+            && !recallEnabled && memories.empty() && trainingExamples.empty()
+            && !automaticLearningEnabled && behaviorInstructions.empty();
     }
 
     // Adds a conversation, or replaces the one with the same id, and returns its

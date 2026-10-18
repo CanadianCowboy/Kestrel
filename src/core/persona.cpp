@@ -71,6 +71,14 @@ const char* toString(PersonaActivity activity) noexcept {
     return "unknown";
 }
 
+const char* toString(PersonaSpecialism specialism) noexcept {
+    switch (specialism) {
+    case PersonaSpecialism::General: return "general";
+    case PersonaSpecialism::Astronomy: return "astronomy";
+    }
+    return "unknown";
+}
+
 const char* toString(PersonaTrigger trigger) noexcept {
     switch (trigger) {
     case PersonaTrigger::TurnCompleted: return "turn completed";
@@ -115,6 +123,14 @@ const ToneProfile& Persona::tone() const noexcept {
     return m_tone;
 }
 
+void Persona::setSpecialism(PersonaSpecialism specialism) noexcept {
+    m_specialism = specialism;
+}
+
+PersonaSpecialism Persona::specialism() const noexcept {
+    return m_specialism;
+}
+
 void Persona::setState(PersonaState state) noexcept {
     state.clamp();
     m_state = state;
@@ -154,10 +170,33 @@ PersonaMood Persona::mood() const noexcept {
     return moodFor(m_state);
 }
 
+std::string Persona::specialismLine() const {
+    // The domain half of the character, kept in its own function so the app can
+    // report it without parsing the prompt and so the training pipeline can
+    // name the same field. It is model-independent: it steers what the model
+    // attends to, and does not add facts the weights do not hold.
+    if (m_specialism == PersonaSpecialism::General) {
+        return {};
+    }
+    return "Your working field is astronomy and astrophysics, and it is the subject "
+           "you are expected to know deeply rather than generally: observational "
+           "astronomy, stellar and galactic astrophysics, cosmology, orbital "
+           "mechanics, and the instruments and data reduction that connect them. "
+           "Be exact about units, epochs, coordinate frames, and wavelength bands. "
+           "Say whether a quantity is bolometric or band-limited, whether a time is "
+           "UTC, TT, JD, MJD, or BJD_TDB, and whether a position is ICRS or "
+           "apparent. Keep measured values separate from model-dependent inference, "
+           "quote an uncertainty when it changes the answer, and never invent a "
+           "measurement, catalogue identifier, or citation. When a question is "
+           "outside this field, answer as a capable generalist and say where your "
+           "specialist confidence ends. ";
+}
+
 std::string Persona::presenceLine() const {
     // The one string that defines the character. It is built from the tone
-    // profile and nothing else, so it stays identical on every turn and the
-    // backend can keep its KV entries for it instead of re-decoding.
+    // profile and the specialism, and from nothing that drifts, so it stays
+    // identical on every turn and the backend can keep its KV entries for it
+    // instead of re-decoding.
     // Two models for the voice: a precise, reliable ship's computer officer
     // (exact, honest about what it knows, curious about people) and a capable
     // household steward (anticipates, handles the routine, keeps humour dry).
@@ -168,6 +207,7 @@ std::string Persona::presenceLine() const {
                        "memories, or experiences you do not have. "
                        "Find the people you work with genuinely interesting, and ask a "
                        "follow-up only when the answer would change what you do. ";
+    line += specialismLine();
     if (m_tone.confident) {
         line += "Be exact with facts, numbers, and names. State your confidence "
                 "plainly: say when you are certain, when you are inferring, and "
